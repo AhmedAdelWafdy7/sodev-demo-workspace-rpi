@@ -43,3 +43,54 @@ RPI_EXTRA_CONFIG:append = "\n# allow >600mA USB (needs 5A PSU) so the RP1 touch 
 # V3D GPU clock bounds for the VideoCore firmware DVFS:
 # busy ceiling 960MHz / idle floor 500MHz (native .maximize via firmware_clocks).
 RPI_EXTRA_CONFIG:append = "\n# V3D firmware DVFS bounds: busy max 960MHz / idle floor 500MHz (native .maximize via firmware_clocks)\nv3d_freq=960\nv3d_freq_min=500\n"
+
+# Pin the A76 clock to the turbo frequency, in the firmware.
+#
+# Xen/Arm disables cpufreq in EVERY guest, unconditionally, inside
+# xen_guest_init():
+#
+#   arch/arm/xen/enlighten.c:511-514  (arm64 shares this file via
+#                                      arch/arm64/xen/Makefile)
+#     /* Making sure board specific code will not set up ops for
+#      * cpu idle and cpu freq. */
+#     disable_cpuidle();
+#     disable_cpufreq();
+#
+# cpufreq_register_driver() then returns -ENODEV at its first check
+# (cpufreq_disabled()), which surfaces at boot as:
+#
+#   cpufreq-dt cpufreq-dt: failed register driver: -19
+#
+# This applies to DomD too: being the hardware domain does not help, because the
+# check is on "am I a Xen guest", not on privilege. So no in-guest governor can
+# ever exist on this board.
+#
+# Everything below cpufreq is healthy, which is what makes the symptom easy to
+# misread as a driver bug. Measured on the board:
+#   * fw-clk-arm advertises clk_max_rate = 2400000000 and is bound to cpu0
+#   * raspberrypi-clk probes and registers the raspberrypi-cpufreq device
+#     (drivers/clk/bcm/clk-raspberrypi.c)
+#   * raspberrypi-cpufreq binds and populates a complete OPP table --
+#     /sys/kernel/debug/opp/cpu{0,1}/ held 10 OPPs, 1.5 to 2.4 GHz in 100 MHz
+#     steps
+#   * only cpufreq-dt fails, and it fails with no driver-specific message
+# Nothing can consume that OPP table, so the firmware simply stays at its idle
+# floor arm_freq_min. Measured: fw-clk-arm clk_rate = 1500000000, i.e. 62.5% of
+# the 2.4 GHz this SoC is specified for, with no thermal or PSU reason
+# (thermal_zone0 was 57 C and the pwm-fan sat at level 2 of 4).
+#
+# Setting the clock in the firmware is therefore not a workaround but the only
+# available layer. min == max additionally removes DVFS jitter, which matters
+# because this board is used for real-time latency measurement.
+#
+# Verified after applying: clk_rate/clk_min_rate/clk_max_rate all 2400000000,
+# Dhrystone 21,505,376 -> 34,482,760 dps (1.60x, exactly the clock ratio) with
+# DMIPS/MHz unchanged at 8.16 -> 8.18, all five domains up, 61.7 C, fan 2/4.
+#
+# CAUTION, and the reason the numbers above are worth keeping here: with cpufreq
+# disabled the kernel cannot throttle the CPU at all. The thermal framework can
+# only drive the fan (cooling_device0 = pwm-fan); thermal_zone0's trip points are
+# 50/60/67.5/75 C "active" (fan steps) and 110 C "critical" (shutdown). The
+# firmware's own temp_limit (default 85 C) is the effective thermal guard, so
+# sustained full-load runs should record temperature.
+RPI_EXTRA_CONFIG:append = "\n# A76 clock pinned in firmware: Xen/Arm disables cpufreq in every guest\n# (arch/arm/xen/enlighten.c disable_cpufreq()), so no governor can raise it from\n# the 1.5 GHz idle floor. min == max also removes DVFS jitter for RT measurement.\narm_freq=2400\narm_freq_min=2400\n"

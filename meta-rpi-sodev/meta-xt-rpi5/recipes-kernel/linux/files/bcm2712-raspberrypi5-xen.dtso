@@ -257,6 +257,17 @@
 &firmwarekms { xen,passthrough; };
 
 /*
+ * HDMI audio DMA controller (/axi/dma@10600, SPI 86-91), which the DomD partial DT
+ * claims as dma40. Without this marker Xen keeps its SPIs for Dom0 and DomD dies
+ * during boot:
+ *   (XEN) IRQ 118 is already used by domain 0
+ *   (XEN) Panic on CPU 0: Failed to allocate requested IRQ 118
+ * The label exists in the base DTB's __symbols__ (dma40 = "/axi/dma@10600"), so
+ * `fdt apply` resolves it.
+ */
+&dma40       { xen,passthrough; };
+
+/*
  * HEVC decoder (BCM2712's only video decode block; there is no H.264 hardware on
  * this SoC -- bcm2712-rpi-5-b.dtb has 0 occurrences of vchiq against
  * bcm2711-rpi-4-b.dtb's 2, so bcm2835-codec has nothing to bind to here).

@@ -162,11 +162,6 @@ PRODUCT_MODEL := xenvm arm64 trout (Raspberry Pi 5)
 PRODUCT_COPY_FILES += \
     device/agl/common/init.xenvm-buried-eth0.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/init.xenvm-buried-eth0.rc
 
-# Settings.Global defaults for a fresh userdata: window/transition animations off (the
-# device model, not the GPU, pays for them). The overlay file carries the measurements
-# and the runtime equivalents for an existing /data.
-DEVICE_PACKAGE_OVERLAYS += device/agl/common/overlay
-
 # Shadow-AP Wi-Fi: simulated radios in this guest beaconing the SSIDs DomD really
 # sees, so the Settings Wi-Fi screen lists real access points instead of virt_wifi's
 # single synthetic "VirtWifi".
@@ -469,6 +464,36 @@ PRODUCT_PROPERTY_OVERRIDES += \
     debug.stagefright.c2-poolmask=0xf50000
 
 endif # XT_DOMA_HWDEC
+
+# ---------------------------------------------------------------------------
+# The shared overlay. Both files in it are board independent, so it lives in
+# device/agl/common/overlay; the Raspberry Pi 4 device carries the same two files
+# in its own repository. They are:
+#
+#   frameworks/base/packages/SettingsProvider/res/values/defaults.xml
+#     Defaults for a fresh userdata: in Settings.Global
+#     def_window_animation_scale and def_window_transition_scale (the device
+#     model, not the GPU, pays for the animations), in Settings.System
+#     def_screen_off_timeout at 30 min -- a dimmed HDMI panel has no backlight
+#     to dim, so it reads as a dead screen and swallows the first tap. All
+#     three values, their measurements and the runtime equivalents for an
+#     existing /data are in the overlay file itself.
+#
+#   frameworks/base/core/res/res/values/config.xml
+#     config_defaultDialer = com.android.car.dialer. AOSP leaves that string at
+#     com.android.dialer, a package an automotive build does not install, and
+#     PermissionController resolves the android.app.role.DIALER default holder from
+#     it -- so the role ends up with no holder, Telecom binds no InCallService, and
+#     an incoming HFP call rings in Telecom while the screen stays dark and silent.
+#     Measured and fixed on the board, 2026-09-21; the full evidence, including the
+#     Telecom log lines and the runtime experiment that confirmed it, is in
+#     device/agl/common/DEFAULT-DIALER.md.
+#
+# DEVICE_PACKAGE_OVERLAYS and PRODUCT_PACKAGE_OVERLAYS are separate lists and both
+# are applied, so the root epam adds to PRODUCT_PACKAGE_OVERLAYS in
+# aosp_xenvm_trout_common.mk still applies. Neither list touches a resource the
+# other one does, so their relative precedence does not matter here.
+DEVICE_PACKAGE_OVERLAYS += device/agl/common/overlay
 
 # Bluetooth off on a fresh userdata. A runtime overlay, not the one above: Car's own RRO
 # sets def_bluetooth_on=true and outranks any build-time overlay. The ordering that makes

@@ -671,6 +671,55 @@
 			xen,reg = <0x10 0x7c700000 0x0 0x1000 0x10 0x7c700000>;
 		};
 
+		/* ===== DMA40 (40-bit DMA controller): HDMI audio =====
+		 * vc4_hdmi_audio_init() bails out early ("'dmas' DT property is missing
+		 * or empty, no HDMI audio") unless the hdmi node carries a dmas phandle,
+		 * and it returns 0 so the display still probes -- which is why the
+		 * missing ASoC card went unnoticed for so long
+		 * (drivers/gpu/drm/vc4/vc4_hdmi.c).
+		 *
+		 * The host node is /axi/dma@10600. Its reg base 0x10600 is channel 6
+		 * (BCM2835_DMA_CHAN(n) = n << 8, counted from the 0x10000 base), so this
+		 * 0x600 window covers channels 6..11 and the six SPIs below are
+		 * dma6..dma11.
+		 *
+		 * brcm,dma-channel-mask is deliberately narrower than the host:
+		 *   host DTB file    0x7c0  (ch 6-10)  <- pre-fixup value, do NOT use
+		 *   host at runtime  0xf80  (ch 7-11)  <- firmware reserves ch6 for itself
+		 *   here             0x400  (ch10 only)
+		 * A passthrough DT should expose the minimum, and HDMI1 audio is the only
+		 * consumer in DomD. ch10 is also the channel that was verified on this
+		 * hardware, both bare metal and under Xen.
+		 *
+		 * REQUIRES the host DT overlay to mark this node xen,passthrough
+		 * (bcm2712-raspberrypi5-xen.dtso). Without it Xen keeps the IRQs for Dom0
+		 * and DomD dies at boot with:
+		 *   (XEN) IRQ 118 is already used by domain 0
+		 *   (XEN) Panic on CPU 0: Failed to allocate requested IRQ 118
+		 *
+		 * xen,reg is page-aligned down to 0x10000/0x1000, which covers
+		 * 0x10600+0x600.
+		 */
+		dma40: dma@1000010600 {
+			compatible = "brcm,bcm2712-dma";
+			reg = <0x10 0x00010600 0x0 0x600>;
+			interrupts = <0x0 0x56 0x4>,   /* GIC SPI 86 = dma6  */
+				     <0x0 0x57 0x4>,   /* GIC SPI 87 = dma7  */
+				     <0x0 0x58 0x4>,   /* GIC SPI 88 = dma8  */
+				     <0x0 0x59 0x4>,   /* GIC SPI 89 = dma9  */
+				     <0x0 0x5a 0x4>,   /* GIC SPI 90 = dma10 */
+				     <0x0 0x5b 0x4>;   /* GIC SPI 91 = dma11 */
+			interrupt-names = "dma6", "dma7", "dma8",
+					  "dma9", "dma10", "dma11";
+			interrupt-parent = <&gic>;
+			#dma-cells = <1>;
+			brcm,dma-channel-mask = <0x400>;
+			xen,path = "/axi/dma@10600";
+			xen,force-assign-without-iommu;
+			xen,reg = <0x10 0x00010000 0x0 0x1000 0x10 0x00010000>;
+			status = "okay";
+		};
+
 		/* ===== vc4 aggregate =====
 		 * The Linux drm/vc4 `bcm2712-vc6` driver walks HVS/V3D/HDMI with
 		 * for_each_child_of_node() to probe them, so they must sit directly
@@ -858,6 +907,38 @@
 					 <&dvp 1>, <&clk_27MHz>;
 				clock-names = "hdmi", "bvb", "audio", "cec";
 				resets = <&dvp 2>;
+				/*
+				 * MAI DREQ number. This is BCM2712 *silicon-revision
+				 * dependent*: the D0 stepping remaps it, and the firmware
+				 * applies that remap itself by auto-loading
+				 * overlays/bcm2712d0.dtbo on D0 boards. So the value baked
+				 * into bcm2712-rpi-5-b.dtb (17) is the C0 value and is only
+				 * ever seen before the fixup. We are a hand-written
+				 * passthrough DT loaded by u-boot, so that overlay never
+				 * reaches us -- carry the D0 value here.
+				 *
+				 * Measured on a Raspberry Pi 5 Model B Rev 1.1 (D0):
+				 *   dtc bcm2712-rpi-5-b.dtb   hdmi1 dmas = <.. 0x41fa0011> (17)
+				 *   /proc/device-tree runtime              0x41fa000d  (13)
+				 *   dtc overlays/bcm2712d0.dtbo  fragment@7 -> 0x41fa000d
+				 *
+				 * Getting this wrong is silent: the DMA channel goes ACTIVE
+				 * and then parks in DREQ_PAUSED forever, waiting on a DREQ
+				 * nobody raises. The ALSA card, the PCM and the MAI all look
+				 * healthy; only hw_ptr gives it away (frozen at 64 frames =
+				 * the single 512-byte MAI FIFO fill that got through).
+				 * Measured TI PER_MAP was 17 where bare metal used 13.
+				 * A C0 board needs 17 here instead. This tree already commits to
+				 * D0: TF-A is built with RPI5_PINCTRL_D0=1 (trusted-firmware-a_git.bb).
+				 *
+				 * 0x41fa000d = 13|(1<<30)|(1<<24)|(10<<16)|(15<<20)
+				 *
+				 * hdmi0 is left without dmas on purpose: only one DMA channel
+				 * is exposed (see brcm,dma-channel-mask on &dma40), and the
+				 * output DomA plays audio on is hdmi1 (HDMI-A-2).
+				 */
+				dmas = <&dma40 0x41fa000d>;
+				dma-names = "audio-rx";
 				/* list both downstream + upstream property names */
 				ddc = <&ddc1>;
 				ddc-i2c-bus = <&ddc1>;

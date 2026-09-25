@@ -195,7 +195,8 @@ ROOTFS_POSTPROCESS_COMMAND:append:raspberrypi5 = \
 # WHAT THIS BUYS. It gives DomD the driver and the userspace. The DT side is in
 # this layer: bcm2712-raspberrypi5-xen.dtso marks &hevc_dec xen,passthrough and the
 # DomD partial DT carries the codec@800000 node, so rpi-hevc-dec binds and DomD gets
-# /dev/videoN plus /dev/mediaN.
+# /dev/videoN plus /dev/mediaN. (&dma40, marked in the same overlay, is HDMI audio's
+# DMA engine, not the decoder's.)
 #
 # Even then it does not by itself make the guest able to use the block:
 # rpi-hevc-dec is a STATELESS V4L2 decoder and virtio-media has no media-device

@@ -484,7 +484,8 @@ parameters:
                 - [XT_DOMA_HWDEC, "%{XT_DOMA_HWDEC}"]
                 # [V4H-style DomA gate] meta-xt-doma is always in `layers` (like the
                 # V4H prod-devel-rcar4 yaml); ENABLE_ANDROID=no masks ALL its recipes
-                # instead (%{XT_DOMA_BBMASK} = " meta-xt-common/meta-xt-doma/"), the
+                # instead (%{XT_DOMA_BBMASK} = " meta-xt-common/meta-xt-doma/" plus the
+                # board layer's bbappends on those recipes, see the parameter), the
                 # same mechanism as V4H's `BBMASK doma.bb*`. =yes expands to "".
                 - [BBMASK:append, "%{XT_DOMA_BBMASK}"]
                 # Required by the shared meta-xt-rpi5 linux-raspberrypi bbappend: its
@@ -751,7 +752,11 @@ parameters:
       default: true
       overrides:
         variables:
-          XT_DOMA_BBMASK: " meta-xt-common/meta-xt-doma/"
+          # Two paths: meta-xt-rpi5 carries a bbappend on the masked
+          # xt-xen-cfg-doma recipe (DomA's 1920x1080 display), and a bbappend
+          # whose recipe has been masked is a hard bitbake error, so the same
+          # gate masks it too.
+          XT_DOMA_BBMASK: " meta-xt-common/meta-xt-doma/ meta-xt-rpi5/recipes-extended/xt-xen-cfg-doma/"
     "yes":
       overrides:
         variables:
