@@ -84,6 +84,9 @@ variables:
   # line, and the GPU parameter). "" (default) = keep the venus backend the Vulkan
   # stack needs; --gpu=gl sets "venus", which is the pre-Venus pure-GL virglrenderer.
   XT_VIRGL_VENUS_REMOVE: ""
+  # What XT_DOMA_HWDEC is on the vulkan lane (see the GPU parameter). A Dom0
+  # flavour whose DomD DT carries no decoder for DomA overrides it with "false".
+  XT_DOMA_HWDEC_VULKAN: "true"
   # Informational/unused: the shipping DomU is built by the AGL bitbake
   # (agl-cluster-demo-flutter-guest); this workspace only harvests its kernel Image
   # (see build_target below). The full DomU gfx image (rpi5-image-domu-gfx) moved to
@@ -387,6 +390,16 @@ parameters:
           # %{YOCTOS_WORK_DIR}/ prefix (else it doubled to yocto/yocto/build-domu/...).
           # Resolves (after the join) to yocto/build-domu/.../Image.
           DOM0_DOMU_KERNEL_DEP: "%{DOMU_BUILD_DIR}/tmp/deploy/images/%{DOMU_MACHINE}/Image"
+          # No hardware decode for DomA in this flavour. It is this tree's
+          # choice for the flavour on this board, which README.md's --dom0
+          # row records. What is known about it: nothing in DomD's HEVC
+          # node depends on SCMI (its clock is firmware clock 11 over the
+          # mailbox, which this flavour's DomD DT keeps), and the flavour's
+          # board run of 2026-08-18 did not cover decode. domd-vc4.bb strips
+          # the decoder and its IOMMU out of DomD's DT here, and this value
+          # keeps the virtio-media device and the codec2 HAL out of DomA (see
+          # XT_DOMA_HWDEC in the GPU parameter).
+          XT_DOMA_HWDEC_VULKAN: "false"
         components:
           # Linux thin control domain body (the former base dom0 body).
           dom0:
@@ -446,11 +459,29 @@ parameters:
                 # makes.
                 - [DISTRO_FEATURES:append, "%{XT_DOM0_VENUS_FEATURE}"]
                 - [PREFERRED_VERSION_qemu, "%{XT_DOM0_QEMU_VERSION}"]
+                # rpidistro-ffmpeg, accepted and selected as in the domd conf (see
+                # there, and README.md), and as there not keyed on the lane. This
+                # Dom0's image does not install qemu, but xen-tools RRECOMMENDS it, so
+                # this build makes the qemu named above, and on the vulkan lane that
+                # is 10.0.2, which DEPENDS on rpidistro-ffmpeg on raspberrypi5.
+                # Without these three lines the build stops at "Nothing PROVIDES
+                # 'rpidistro-ffmpeg'".
+                - [LICENSE_FLAGS_ACCEPTED:append:raspberrypi5, " commercial_rpidistro-ffmpeg"]
+                - [PREFERRED_PROVIDER_ffmpeg:raspberrypi5, "rpidistro-ffmpeg"]
+                - [PREFERRED_PROVIDER_libav:raspberrypi5, "rpidistro-ffmpeg"]
                 # [GPU gate] Substituted into the virtio-gpu-gl-pci line of
                 # domu.cfg/doma.cfg by xt-xen-cfg-domu / xt-xen-cfg-doma. "", which is
                 # what --gpu=gl sets it to, leaves the configs with none of the Venus
                 # options; the default lane substitutes hostmem/blob/venus options.
                 - [XT_VENUS_GPU_OPTS, "%{XT_VENUS_GPU_OPTS}"]
+                # [GPU gate] Whether DomA's cfg carries a virtio-media device, i.e.
+                # whether the guest gets the /dev/videoN its codec2 HAL opens. Needed
+                # here as well as in the domd component for the same reason BOARD_RAM
+                # is: in the linux flavour it is DOM0's copy of doma.cfg that
+                # `xl create` reads. Same GPU parameter that sets it on the AOSP side,
+                # because the decoder IS a virtio-media device and only the qemu
+                # 10.0.2 device model has one.
+                - [XT_DOMA_HWDEC, "%{XT_DOMA_HWDEC}"]
                 # [V4H-style DomA gate] meta-xt-doma is always in `layers` (like the
                 # V4H prod-devel-rcar4 yaml); ENABLE_ANDROID=no masks ALL its recipes
                 # instead (%{XT_DOMA_BBMASK} = " meta-xt-common/meta-xt-doma/"), the
@@ -902,6 +933,13 @@ parameters:
           XT_DOM0_QEMU_VERSION: "7.0.0"
           XT_VENUS_GPU_OPTS: ""
           XT_VIRGL_VENUS_REMOVE: "venus"
+          # The guest's hardware-decode path is not built on this lane, and that is a
+          # hard dependency rather than a policy: the decoder the guest talks to is a
+          # virtio-media device, which only the qemu 10.0.2 device model has, and this
+          # lane builds qemu 7.0.0-xt. With XT_DOMA_HWDEC=true here, AOSP would install
+          # the c2 HAL and its seccomp policy for a device that is not on the
+          # bus, and the failure would appear as a codec bug in the guest.
+          XT_DOMA_HWDEC: "false"
     "vulkan":
       default: true
       overrides:
@@ -968,6 +1006,19 @@ parameters:
           # this to "venus" (see PACKAGECONFIG:remove:pn-virglrenderer in the
           # domd conf).
           XT_VIRGL_VENUS_REMOVE: ""
+          # Build the guest's hardware-decode path. Inside the AAOS
+          # device's `ifeq ($(XT_DOMA_HWDEC),true)`: the c2 HAL service and
+          # its plugin store, media_codecs_c2.xml, the extended seccomp
+          # policy, the ro.vendor.v4l2_codec2.* properties,
+          # media.c2.hal.selection=hidl and debug.stagefright.c2-poolmask.
+          # On every lane:
+          # the soong namespace for external/v4l2_codec2, which installs
+          # nothing, and the hal_codec2_default sepolicy, which only matters
+          # for a binary the gl lane does not install.
+          # It is tied to this lane because the decoder is a virtio-media
+          # device and only the qemu 10.0.2 device model provides one.
+          # XT_DOMA_HWDEC_VULKAN is where a Dom0 flavour turns it off.
+          XT_DOMA_HWDEC: "%{XT_DOMA_HWDEC_VULKAN}"
         components:
           domd:
             builder:
@@ -1211,6 +1262,18 @@ components:
         - [PREFERRED_PROVIDER_u-boot-default-script, "xt-rpi-u-boot-scr"]
         - [UART_BOOTLOADER, "1"]
         - [KERNEL_IMAGETYPE_UBOOT, "Image"]
+        # rpidistro-ffmpeg (meta-raspberrypi) declares LICENSE_FLAGS = "commercial".
+        # Accepting a licence flag is the builder's decision, which the Yocto manual
+        # places in local.conf; this list is written to build-domd/conf/moulin.conf,
+        # which local.conf requires. Raspberry Pi OS installs the same FFmpeg fork by
+        # default in its desktop image, and this build accepts it by default too.
+        # Only this recipe is accepted: a bare "commercial" would also switch Mesa's
+        # VIDEO_CODECS from all_free to all. See README.md.
+        - [LICENSE_FLAGS_ACCEPTED:append:raspberrypi5, " commercial_rpidistro-ffmpeg"]
+        # The recipe also PROVIDES ffmpeg and libav, as poky's ffmpeg does; only this
+        # fork has the v4l2request hwaccel that DomA's HEVC path needs.
+        - [PREFERRED_PROVIDER_ffmpeg:raspberrypi5, "rpidistro-ffmpeg"]
+        - [PREFERRED_PROVIDER_libav:raspberrypi5, "rpidistro-ffmpeg"]
         - [DISTRO_FEATURES:append, " xen"]
         # V4H domd-v4h needs: wayland/opengl (weston REQUIRED_DISTRO_FEATURES=wayland
         # + mesa/virglrenderer GL), enable_virtio (gates the qemu-system-aarch64 +
@@ -1245,6 +1308,12 @@ components:
         # --gpu=gl sets it to, leaves the configs with none of the Venus options;
         # the default lane substitutes the hostmem/blob/venus options.
         - [XT_VENUS_GPU_OPTS, "%{XT_VENUS_GPU_OPTS}"]
+        # [GPU gate] Whether DomA's cfg carries a virtio-media device. This build
+        # produces the doma.cfg `xl create` reads in the zephyr flavour, and the
+        # device model that has to accept it. Tied to the same parameter as the AOSP
+        # side so the two halves cannot disagree: with the device absent and the c2
+        # HAL installed, init crash-loops a HAL that has no /dev/videoN to open.
+        - [XT_DOMA_HWDEC, "%{XT_DOMA_HWDEC}"]
         - [BBMASK:append, "%{XT_DOMA_BBMASK}"]
       build_target: "%{XT_DOMD_IMAGE}"
       layers:
@@ -1537,6 +1606,10 @@ components:
         # meta-xt-doma/stage-doma-kernel.sh for where each variable ends up.
         - "TARGET_PREBUILT_KERNEL=%{ANDROID_KERNEL_STAGE_DIR}/Image"
         - "TARGET_PREBUILT_MODULES_DIR=%{ANDROID_KERNEL_STAGE_DIR}/"
+        # Set by the GPU parameter: false on gl, XT_DOMA_HWDEC_VULKAN on vulkan
+        # (false with the linux Dom0, true with the zephyr one). The AAOS
+        # device wraps its hardware-decode additions in `ifeq ($(XT_DOMA_HWDEC),true)`.
+        - "XT_DOMA_HWDEC=%{XT_DOMA_HWDEC}"
       lunch_target: "%{ANDROID_LUNCH_TARGET}"
       target_images:
         - "out/target/product/%{ANDROID_DEVICE}/boot.img"

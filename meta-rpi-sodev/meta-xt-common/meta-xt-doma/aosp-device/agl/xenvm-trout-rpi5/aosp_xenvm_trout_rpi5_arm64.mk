@@ -5,8 +5,9 @@
 # DomA is a virtio guest, so almost nothing here is board-specific and the Raspberry
 # Pi 4 variant is deliberately close to this file. Diff the two when changing either;
 # the differences that should exist are chiefly the names, the CPU variant (which
-# lives in the BoardConfig), the paths to the board's own files, and whatever each
-# board's hardware lanes need on their own.
+# lives in the BoardConfig), the paths to the board's own files, and the
+# hardware-decode lane -- HEVC here, H.264 there -- plus whatever else each lane
+# needs on its own (the RPi4's CAPTURE buffer budget, for instance).
 #
 # The guest is the upstream product plus what this file adds below. The
 # identity is this variant's own, so that it gets its own PRODUCT_DEVICE (and
@@ -351,6 +352,123 @@ PRODUCT_PACKAGES += \
 PRODUCT_VENDOR_PROPERTIES += \
     bluetooth.sco.managed_by_audio=true \
     bluetooth.hfp.software_datapath.enabled=true
+
+# ---------------------------------------------------------------------------
+# WHY PRODUCT_SOONG_NAMESPACES for external/v4l2_codec2. Its root Android.bp
+# opens with a bare `soong_namespace {}`, which hides every module in the project
+# from the build graph until a product opts in. Without this line
+# `m libv4l2_codec2_common ...` fails with `unknown target` for all six modules
+# -- that is namespace invisibility, NOT an android17 source incompatibility.
+# external/v4l2_codec2/README.md names this exact line as step 1 of the official
+# integration recipe.
+#
+# Declaring a namespace only makes modules visible; it installs nothing, so this
+# line alone leaves the image byte-for-byte unaffected.
+PRODUCT_SOONG_NAMESPACES += external/v4l2_codec2
+
+# ---------------------------------------------------------------------------
+# DomA HARDWARE DECODE (HEVC), BEHIND A BUILD SWITCH.
+#
+# THIS IS THE HEVC LANE, NOT THE RPi4 H.264 ONE. Do not treat the two products'
+# blocks as copies of each other:
+#
+#   RPi4  bcm2835-codec over VCHIQ, a STATEFUL H.264 decoder. qemu proxies
+#         /dev/video10 almost directly and the codec2 entry is c2.v4l2.avc.decoder.
+#   RPi5  BCM2712 has NO vchiq node at all (measured: zero occurrences in the
+#         shipped bcm2712-rpi-5-b.dtb against two in bcm2711-rpi-4-b.dtb), so
+#         bcm2835-codec cannot bind and H.264 hardware decode is absent, not
+#         unported. The only decode block is codec@800000 / rpi-hevc-dec, which is
+#         STATELESS: it registers a media device and wants a request fd per frame,
+#         neither of which virtio-media can carry, and v4l2_codec2 has no
+#         stateless support. The qemu virtio-media device model's decoder mode
+#         (0217-v10) therefore presents a STATEFUL HEVC decoder to the guest and
+#         drives the stateless side with libavcodec in DomD, so the codec2 entry is
+#         c2.v4l2.hevc.decoder and nothing in v4l2_codec2 is HEVC- or
+#         stateless-specific.
+#
+# Everything here is gated on XT_DOMA_HWDEC=true, which rpi5-sodev.yaml sets on
+# the vulkan lane with the zephyr Dom0 only, for the same reason as on the RPi4:
+# the C2 service ships a VINTF fragment declaring android.hardware.media.c2@1.2,
+# and declaring a HAL that cannot start (no /dev/videoN in DomA without the
+# virtio-media device) leaves init crash-looping a service and VINTF advertising
+# a HAL the device does not have.
+ifeq ($(XT_DOMA_HWDEC),true)
+
+# The V4L2 codec2 service and the plugin store it loads.
+PRODUCT_PACKAGES += \
+    android.hardware.media.c2@1.2-service-v4l2 \
+    libc2plugin_store
+
+# The extended seccomp policy MUST be installed under the name
+# android.hardware.media.c2-extended-seccomp_policy (confirmed on the RPi4 board,
+# 2026-09-01): codec2's service.cpp opens that fixed path under
+# /vendor/etc/seccomp_policy/, so under the name codec2.vendor.ext.policy the
+# extended policy is never read and the V4L2 ioctls are killed by seccomp. No
+# SELinux denial is emitted, so the cause is invisible.
+# Codec2InfoBuilder reads media_codecs_c2.xml to describe vendor C2 components.
+# Decoders only, HEVC only, up to 1920x1088: the file itself says why.
+PRODUCT_COPY_FILES += \
+    device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/media_codecs_c2.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_c2.xml \
+    device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/codec2.vendor.ext.policy:$(TARGET_COPY_OUT_VENDOR)/etc/seccomp_policy/android.hardware.media.c2-extended-seccomp_policy
+
+# WHY prefer_rgba=true is spelled out here although it is v4l2_codec2's default.
+#
+# Both places that read it, DecodeInterface (the pixel format the component
+# advertises) and V4L2Decoder's preferRgbOutput() (the format it asks the
+# device for), take ro.vendor.v4l2_codec2.prefer_rgba with true as the default,
+# so this line changes nothing the decoder does; it names the choice where the
+# product is defined. It is load bearing for this stack, not a preference: the
+# guest's GL driver has no GL_EXT_YUV_target, so a YUV capture buffer cannot
+# become a texture -- see the kPreferredRgbFourccs list in V4L2Decoder.cpp and
+# the paragraphs above it.
+PRODUCT_VENDOR_PROPERTIES += \
+    ro.vendor.v4l2_codec2.decode_concurrent_instances=8 \
+    ro.vendor.v4l2_codec2.encode_concurrent_instances=0 \
+    ro.vendor.v4l2_codec2.prefer_rgba=true
+
+# WHY media.c2.hal.selection=hidl, AND WHY WITHOUT IT NOTHING ABOVE IS REACHABLE.
+# external/v4l2_codec2's service publishes a HIDL-only VINTF fragment
+# (<hal format="hidl">, @1.2::IComponentStore/default), but the framework decides
+# which transport to enumerate before it reads any manifest:
+# frameworks/av/media/codec2/hal/common/HalSelection.cpp:31-64 can select AIDL
+# only when the aidl_hal aconfig flag is enabled or the vendor API level is
+# 202404 or later -- and the flag IS enabled, state: ENABLED in
+# build/release/aconfig/trunk_staging/com.android.media.codec.flags -- and then
+# takes media.c2.hal.selection, whose default is hidl. cuttlefish sets it to
+# aidl with ?=, so the inherited value is aidl, and with AIDL selected
+# Codec2Client::CacheServiceNames() (hal/client/client.cpp:2755) walks
+# AServiceManager_forEachDeclaredInstance() over AIDL instances only and never
+# reaches the HIDL branch. Codec2InfoBuilder then gets no traits for this store
+# and media_codecs_c2.xml above describes a codec nobody offers.
+#
+# MEASURED ON THE RPi4, which reached this state first: the image contained every
+# hardware-decode artifact and used none of them, and c2.v4l2.avc.decoder did not
+# appear even with the virtio-media device. Nothing about that is board-specific --
+# the service, the fragment and the flag are all shared -- so this board needs
+# the same line even though the codec behind it is HEVC rather than H.264.
+#
+# hidl rather than converting the service to AIDL because the device is
+# target-level 7 and compatibility_matrix.7.xml declares media.c2 as HIDL only;
+# an AIDL fragment makes checkUnusedHals fail the build. Converting is the right
+# long-term move and belongs with a target-level bump.
+#
+# THIS DOES NOT COST THE SOFTWARE CODECS.
+# frameworks/av/media/module/codecserviceregistrant/CodecServiceRegistrant.cpp
+# registers the real platform store on the HIDL "software" instance and only a
+# null store on the AIDL one, and mediaserver's HIDL software manifest entry is
+# max-level 8, so it stays valid at target-level 7.
+#
+# Inside the gate on purpose: a build without the decoder keeps the aidl
+# cuttlefish sets.
+PRODUCT_VENDOR_PROPERTIES += \
+    media.c2.hal.selection=hidl
+
+# Codec2.0 poolMask. 0xf50000 selects ION for linear buffers, which is what
+# external/v4l2_codec2/README.md specifies for the ION case.
+PRODUCT_PROPERTY_OVERRIDES += \
+    debug.stagefright.c2-poolmask=0xf50000
+
+endif # XT_DOMA_HWDEC
 
 # Bluetooth off on a fresh userdata. A runtime overlay, not the one above: Car's own RRO
 # sets def_bluetooth_on=true and outranks any build-time overlay. The ordering that makes

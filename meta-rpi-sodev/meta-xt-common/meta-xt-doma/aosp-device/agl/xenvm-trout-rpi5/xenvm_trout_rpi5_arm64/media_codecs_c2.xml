@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Codec2 components provided by external/v4l2_codec2, for the DomA
+     hardware-decode path on this board.
+
+     DECODERS ONLY, AND HEVC ONLY. The RPi4 file has one H.264 entry because
+     VideoCore decodes H.264 there; this SoC has no H.264 hardware.
+
+     BCM2712 has no VCHIQ node at all. Measured by decompiling the shipped DTBs:
+     zero occurrences in bcm2712-rpi-5-b.dtb against two in
+     bcm2711-rpi-4-b.dtb, where brcm,bcm2711-vchiq sits at
+     /soc/mailbox@7e00b840. bcm2835-codec reaches VideoCore's H.264 decoder only
+     over VCHIQ and has no DT node of its own, so on this SoC it has nothing to
+     bind to: H.264 hardware decode is not unported here, it is absent.
+
+     What this SoC does have is codec@800000, brcm,bcm2712-hevc-dec, driven by
+     rpi-hevc-dec. So the RPi4 file's single avc entry becomes a single hevc
+     entry.
+
+     WHY THERE IS AN ENTRY AT ALL, GIVEN THE DRIVER IS STATELESS. rpi-hevc-dec
+     wants a media device and a request fd per frame, which virtio-media cannot
+     carry, and Android's v4l2_codec2 has no stateless support. qemu patch 0217
+     therefore presents a STATEFUL HEVC decoder to the guest and drives the
+     stateless side with libavcodec in DomD. From this file's point of view the
+     device is an ordinary stateful decoder, which is why the entry looks
+     unremarkable.
+
+     No VP8/VP9/AV1: the template in external/v4l2_codec2/README.md lists them
+     and none has hardware here.
+
+     No encoders: this block decodes only, and the device model proxies one
+     decode path.
+
+     No .secure variant: it needs Widevine and a secure allocator, neither of
+     which exists on this product.
+
+     max size 1920x1088, as in the RPi4 file, although BCM2712's HEVC block is
+     rated for 4K. This path is not: decoder mode hands the guest RGBA, and a
+     4K RGBA frame (33,177,600 bytes) needs more scatter-gather entries than the
+     guest driver's 64 KiB shadow buffer holds (virtio-media patch 0009). On the
+     board (2026-09-24) a 4K stream made the decoder ask for 25 such buffers,
+     VIDIOC_QBUF failed, DomD ran out of CMA and DomA stopped. Claiming 4K would
+     let the framework hand the decoder a stream that ends that way.
+
+     HOW THE NUMBERS BELOW WERE DERIVED.
+
+     blocks-per-second is the ARITHMETIC MAXIMUM, exactly as in the RPi4 file:
+     1920x1088 in 16x16 blocks is 120 x 68 = 8160, times 60 = 489600.
+
+     performance-point-1920x1080 is 30. Measured on the board (2026-09-24)
+     with AOSP's codec tool on a 1080p stream, the decode alone ran at 57 fps
+     and at 45 fps with the display, so 30 describes the decoder; playback in
+     an app (VideoView) showed 15-19 frames a second on the same day.
+
+     NEITHER NUMBER REACHES WEBVIEW (measured 2026-08-30 on the RPi4, which
+     ships the same WebView). The shipped WebView 145.0.7632.218 references
+     getVideoCapabilities, getSupportedWidths, isSizeSupported and
+     isFeatureSupported in its dex, but NOT areSizeAndRateSupported and NOT
+     getSupportedPerformancePoints, and neither appears in
+     libwebviewchromium.so. Chromium selects on size and features alone, so
+     blocks-per-second and the performance point cannot cap what a page
+     playing video in a WebView asks for. performance-point is a pure
+     information API in the framework too: every reference to
+     getSupportedPerformancePoints() is a getter, a JNI read-out or the
+     interface declaration, never codec selection.
+
+     NOTE for whoever edits this file: an XML comment may not contain two
+     consecutive hyphens. It is worse than a build break: MediaCodecsXmlParser
+     reports BAD_VALUE,
+     combineStatus() does NOT downgrade that to OK, and Codec2InfoBuilder.cpp:503
+     then returns without registering ANY Codec2 component. A stray double hyphen
+     makes the hardware decoder vanish from MediaCodecList entirely.
+-->
+<MediaCodecs>
+   <Decoders>
+       <MediaCodec name="c2.v4l2.hevc.decoder" type="video/hevc" >
+           <Limit name="size" min="64x64" max="1920x1088" />
+           <Limit name="alignment" value="2x2" />
+           <Limit name="block-size" value="16x16" />
+           <Limit name="blocks-per-second" min="1" max="489600" />
+           <Limit name="bitrate" range="1-120000000" />
+           <Limit name="concurrent-instances" max="8" />
+           <Limit name="performance-point-1920x1080" range="30-30" />
+           <Feature name="adaptive-playback" />
+       </MediaCodec>
+   </Decoders>
+</MediaCodecs>

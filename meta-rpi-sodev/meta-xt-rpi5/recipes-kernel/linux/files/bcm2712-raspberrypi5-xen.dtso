@@ -255,3 +255,19 @@
 &pixelvalve0 { xen,passthrough; };
 &pixelvalve1 { xen,passthrough; };
 &firmwarekms { xen,passthrough; };
+
+/*
+ * HEVC decoder (BCM2712's only video decode block; there is no H.264 hardware on
+ * this SoC -- bcm2712-rpi-5-b.dtb has 0 occurrences of vchiq against
+ * bcm2711-rpi-4-b.dtb's 2, so bcm2835-codec has nothing to bind to here).
+ *
+ * Without this Xen keeps codec@800000's SPI 98 (abs IRQ 130) and its two MMIO
+ * ranges for Dom0, and DomD's rpi-hevc-dec cannot claim them.
+ *
+ * This label CAN be used here, unlike the RP1/PCIe nodes above: the base DTB
+ * __symbols__ really does carry hevc_dec = "/axi/codec@800000" (verified by
+ * decompiling the shipped bcm2712-rpi-5-b.dtb), so `fdt apply` resolves it and
+ * the GPU markers above are not dropped -- which is the failure mode an
+ * unresolvable label causes.
+ */
+&hevc_dec    { xen,passthrough; };

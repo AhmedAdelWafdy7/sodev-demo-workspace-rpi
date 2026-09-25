@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Extra syscalls the V4L2 codec2 service needs on top of
+# android.hardware.media.c2-default-seccomp_policy, per
+# external/v4l2_codec2/README.md.
+#
+# The README's list is written for 32-bit ABIs (mmap2, fstat64, _llseek...).
+# This product is arm64 only (TARGET_ARCH_VARIANT armv8-a, cortex-a76), so the
+# 64-bit names are used and the 32-bit-only entries are omitted -- listing a
+# syscall that does not exist on the ABI makes minijail reject the whole policy.
+epoll_create1: 1
+epoll_ctl: 1
+epoll_pwait: 1
+eventfd2: 1
+getcwd: 1
+getdents64: 1
+pselect6: 1
+statfs: 1
+sysinfo: 1

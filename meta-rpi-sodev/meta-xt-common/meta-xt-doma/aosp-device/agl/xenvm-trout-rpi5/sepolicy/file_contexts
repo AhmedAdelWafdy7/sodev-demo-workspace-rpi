@@ -24,3 +24,17 @@
 # default already has the rules it needs for that type (22 references in the built
 # vendor_sepolicy.cil), so the apex hostapd works with no policy of its own.
 /data/vendor/wifi/shadow(/.*)?   u:object_r:hostapd_data_file:s0
+
+# The v4l2 Codec2 HAL. Without this line the binary stays vendor_file and init
+# cannot exec it at all (neverallow init ...:file execute_no_trans), so the
+# service never starts and the whole hardware-decode path is dead regardless of
+# whether a decoder is behind it. See sepolicy/hal_codec2_default.te.
+#
+# The name carries the -64 suffix because soong appends it: the module is
+# android.hardware.media.c2@1.2-service-v4l2 and what lands in the image is
+# android.hardware.media.c2@1.2-service-v4l2-64. Matching without the suffix
+# labels nothing, which is the same silent failure as having no line here.
+#
+# Regex-escaped because '@' and '.' are literal here and file_contexts entries
+# are regexes.
+/vendor/bin/hw/android\.hardware\.media\.c2@1\.2-service-v4l2-64  u:object_r:hal_codec2_default_exec:s0

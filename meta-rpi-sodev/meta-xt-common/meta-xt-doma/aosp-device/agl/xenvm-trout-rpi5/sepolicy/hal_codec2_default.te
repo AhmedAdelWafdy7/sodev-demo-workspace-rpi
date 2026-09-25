@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Domain for the v4l2 Codec2 HAL, external/v4l2_codec2's
+# android.hardware.media.c2@1.2-service-v4l2-64. It is the DomA half of the
+# hardware-decode path.
+#
+# THE SAME RULES AS THE RPi4 FILE, AND THAT IS CORRECT HERE even though the decoder
+# behind it is a different one. What this domain has to reach is /dev/video*, and
+# on both boards that node is whatever qemu's virtio-media device exports, not
+# local hardware. Only the far side of the device model differs:
+#
+#     RPi4   virtio-media -> DomD /dev/video10 -> bcm2835-codec (H.264, stateful)
+#     RPi5   virtio-media -> qemu's own stateful HEVC shim (patch 0217), which
+#            drives rpi-hevc-dec (stateless) with libavcodec inside DomD
+#
+# From SELinux's point of view those are the same object with the same label.
+#
+# WHY THIS FILE HAD TO BE WRITTEN AT ALL. Nothing in the tree labelled the
+# service binary, so it stayed vendor_file, and
+#
+#     system/sepolicy/private/init.te
+#       neverallow init { file_type fs_type }:file execute_no_trans;
+#
+# means init cannot exec an unlabelled binary without a domain to transition
+# into. The service therefore could not start -- in EITHER Xen config, with or
+# without a decoder behind it. Found on the RPi4 first; nothing about it was
+# board-specific, so this board had the same defect.
+#
+# WHY IT IS NOT INSIDE THE XT_DOMA_HWDEC GATE, unlike the rest of the
+# hardware-decode wiring. A domain and an exec label with no binary to apply them
+# to are dead weight, not a hazard, whereas gating them would mean the neverallow
+# surface only gets exercised on hwdec builds -- and inventing a domain is where
+# this product's sepolicy risk lives (see the note on doma-wifi-relay in
+# file_contexts). Keeping it unconditional means every build
+# type-checks the same policy.
+#
+# WHAT THE ATTRIBUTE ALREADY GIVES US, so this file stays short:
+# system/sepolicy/private/hal_codec2.te grants hal_codec2_server the binder calls
+# in both directions, hal_codec2_hwservice and hal_codec2_service access, the
+# media_variant and codec2_config properties, and the graphics/camera fd use
+# rules. hal_server_domain() below joins this domain to hal_codec2_server, so
+# none of that is repeated here.
+type hal_codec2_default, domain;
+hal_server_domain(hal_codec2_default, hal_codec2)
+
+type hal_codec2_default_exec, exec_type, vendor_file_type, file_type;
+init_daemon_domain(hal_codec2_default)
+
+# The decoder itself. On this board /dev/video* is NOT local hardware: it is
+# whatever qemu's virtio-media device exports, so the node exists only when DomA
+# was created with the virtio-media device in its config (which on this board carries
+# decoder=hevc rather than a v4l2-device path, because the qemu side synthesises
+# the stateful decoder instead of proxying one). video_device is the platform
+# label for /dev/video[0-9]* (system/sepolicy/private/file_contexts).
+#
+# Note that V4L2ComponentStore::Create() probes these nodes at service start to
+# decide which codecs to advertise, so a denial here does not look like a
+# permission error to the framework -- it looks like "no hardware decoder", and
+# the codec silently does not appear. If HW decode is missing on hardware, read
+# the avc log before anything else:
+#     logcat -d | grep -E 'avc: denied.*hal_codec2|haveDevice'
+allow hal_codec2_default video_device:chr_file rw_file_perms;
+
+# --- 2026-09-01: the three denials measured on the RPi4 board ---------------
+# All three were observed while the build is PERMISSIVE
+# (androidboot.selinux=permissive + enforcing=0 in
+# device/epam/aosp-xenvm-trout/xenvm_trout_arm64/BoardConfig.mk), which means
+# they did not break anything yet. They WILL break hardware decode the moment
+# the build goes enforcing, so they are allowed now while the evidence is fresh.
+# The denials quoted below are verbatim from a board log, 2026-09-01.
+
+# avc: denied { call } scontext=hal_codec2_default tcontext=hal_graphics_allocator_default tclass=binder
+#
+# The decoder allocates its own output buffers through gralloc. The platform
+# grants this binder call to the hal_graphics_allocator_CLIENT attribute
+# (system/sepolicy/private/hal_graphics_allocator.te), not to individual
+# domains, and hal_server_domain() above only joins hal_codec2_server. So the
+# fix is to join the client attribute -- writing a bare allow rule for
+# hal_graphics_allocator_default would work today and rot the moment the
+# platform renames the type.
+hal_client_domain(hal_codec2_default, hal_graphics_allocator)
+
+# avc: denied { ioctl } path="/dev/dri/renderD128" ioctlcmd=0x642e tcontext=gpu_device tclass=chr_file
+#
+# 0x642e is DRM_IOCTL_PRIME_FD_TO_HANDLE: importing the gralloc dmabuf so it can
+# be described to the decoder. gpu_device has no ioctl allow-list anywhere in
+# system/sepolicy (no allowxperm/neverallowxperm on it), so a plain allow is
+# sufficient and no allowxperm is needed -- adding one would in fact be the
+# thing that starts restricting it.
+allow hal_codec2_default gpu_device:chr_file rw_file_perms;
+
+# avc: denied { getattr } path="/dev/dma_heap/system-uncached" tcontext=... tclass=chr_file
+#
+# dmabuf_system_heap_device is the label of the /dev/dma_heap/system* NODES
+# (system/sepolicy/private/file_contexts); dmabuf_heap_device labels the
+# DIRECTORY and is a different type -- and the directory is already granted to
+# every domain by public/domain.te, which is why only the chr_file rule is
+# missing. r_file_perms covers getattr. Same shape as the platform's own
+# mediacodec domain (system/sepolicy/vendor/mediacodec.te).
+allow hal_codec2_default dmabuf_system_heap_device:chr_file r_file_perms;

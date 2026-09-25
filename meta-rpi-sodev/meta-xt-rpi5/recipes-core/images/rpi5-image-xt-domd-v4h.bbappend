@@ -180,3 +180,65 @@ brcmfmac_generic_fw_names() {
 # Only with the firmware installed; without it there is nothing to link.
 ROOTFS_POSTPROCESS_COMMAND:append:raspberrypi5 = \
     "${@' brcmfmac_generic_fw_names;' if d.getVar('DOMD_WIFI_FW') else ''}"
+
+# ---------------------------------------------------------------------------
+# HEVC hardware decode in DomD (codec@800000, driver rpi-hevc-dec).
+#
+# WHY THIS IS NOT THE PI 4 STANZA UNDER A NEW NAME. On BCM2711 the decoder is
+# reached through VCHIQ/MMAL and bcm2835-codec, and it does H.264. Neither
+# applies here: BCM2712 has no vchiq node -- measured, zero hits in the shipped
+# bcm2712-rpi-5-b.dtb against two in bcm2711-rpi-4-b.dtb -- and codec@800000 is
+# an HEVC-only block with its own memory-mapped registers. The two boards share
+# nothing but the words "hardware decode", so the Pi 4's DOMD_HWDEC_PACKAGES must
+# not be copied here.
+#
+# WHAT THIS BUYS. It gives DomD the driver and the userspace. The DT side is in
+# this layer: bcm2712-raspberrypi5-xen.dtso marks &hevc_dec xen,passthrough and the
+# DomD partial DT carries the codec@800000 node, so rpi-hevc-dec binds and DomD gets
+# /dev/videoN plus /dev/mediaN.
+#
+# Even then it does not by itself make the guest able to use the block:
+# rpi-hevc-dec is a STATELESS V4L2 decoder and virtio-media has no media-device
+# or request-fd concept, which is why the device model synthesises a stateful
+# decoder and drives this one through libavcodec.
+#
+# WHY videodev AND videobuf2 ARE LISTED EXPLICITLY. CONFIG_VIDEO_DEV ends up =m
+# (Kconfig derives it from CONFIG_MEDIA_SUPPORT=m rather than it being in
+# bcm2712_defconfig), and the rootfs had NONE of the V4L2 module packages --
+# measured: zero hits for videodev, videobuf2, v4l2 or hevc in the 2026-08-27
+# manifest -- even though the .ko files were built. Relying on RRECOMMENDS is
+# what produced that state.
+#
+# ffmpeg resolves to rpidistro-ffmpeg here (PREFERRED_PROVIDER in the DomD
+# configuration of rpi5-sodev.yaml), which is the only ffmpeg that can drive this
+# decoder: poky's has no v4l2-request knob and upstream FFmpeg has no v4l2request
+# hwaccel at all.
+# It brings three things nothing else in the tree provides:
+#   - the stateless HEVC hwaccel: media device and request fd handling,
+#     /dev/mediaN discovery, generation-specific HEVC control layouts
+#   - HEVC parsing, POC and reference-picture-set management from libavcodec
+#     proper -- the genuinely hard part, and the reason this is a dependency
+#     rather than a hand-rolled parser
+#   - COL128/SAND detiling with an AArch64 NEON implementation, gated on the
+#     `sand` PACKAGECONFIG this layer's rpidistro-ffmpeg bbappend switches back on
+# It is a runtime dependency and not only a bring-up tool: the device model links
+# libavcodec, so these libraries have to be in the DomD rootfs regardless.
+#
+# v4l-utils is here for v4l2-ctl, which is how the decoder is judged on hardware:
+# --all must show V4L2_PIX_FMT_HEVC_SLICE on OUTPUT and the COL128 formats on
+# CAPTURE, and --list-ctrls must show the V4L2_CID_STATELESS_HEVC_* controls.
+# Without it the only evidence is dmesg, which cannot tell "bound" from "usable".
+DOMD_HEVC_PACKAGES = ""
+DOMD_HEVC_PACKAGES:raspberrypi5 = " \
+    kernel-module-rpi-hevc-dec \
+    kernel-module-videodev \
+    kernel-module-mc \
+    kernel-module-videobuf2-common \
+    kernel-module-videobuf2-v4l2 \
+    kernel-module-videobuf2-dma-contig \
+    kernel-module-videobuf2-memops \
+    kernel-module-v4l2-mem2mem \
+    v4l-utils \
+    ffmpeg \
+    "
+IMAGE_INSTALL:append = " ${DOMD_HEVC_PACKAGES}"

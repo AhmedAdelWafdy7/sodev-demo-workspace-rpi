@@ -314,6 +314,9 @@ fdt set /soc@107c000000/gpio@7d508500 xen,passthrough
 echo "passthrough: /soc/pinctrl@7d504100 (pinmux: sd2 + uart0 pins -> DomD)"
 fdt set /soc@107c000000/pinctrl@7d504100 xen,passthrough
 
+echo "passthrough: /axi/codec (HEVC decoder -> DomD)"
+fdt set /axi/codec@800000 xen,passthrough
+
 # ------------------------------------------------------------------
 # Wi-Fi SDIO -> DomD
 # ------------------------------------------------------------------

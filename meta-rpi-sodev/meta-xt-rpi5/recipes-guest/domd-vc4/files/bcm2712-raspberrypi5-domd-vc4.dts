@@ -448,6 +448,128 @@
 			xen,reg = <0x10 0x5000 0x0 0x1000 0x10 0x5000>;
 		};
 
+		/* SODEV-LINUX-DOM0-SD-STRIP-BEGIN: domd-vc4.bb strips the HEVC decoder and
+		 * its IOMMU for DOM0_OS=linux as well. That flavour gives DomA no hardware
+		 * decoder (rpi5-sodev.yaml's linux flavour sets XT_DOMA_HWDEC_VULKAN to
+		 * false and says why), so DomD has no user for the block. Nothing outside
+		 * this pair refers to hevc_dec or
+		 * iommu2.
+		 */
+		/* ===== HEVC decoder (rpi-hevc-dec) =====
+		 * Beside the IOMMUs, as codec@800000 sits directly under /axi on the
+		 * host, and not inside the gpu node, whose children are vc4's.
+		 *
+		 * BCM2712's only video decode block. There is NO H.264 hardware on this SoC:
+		 * the shipped bcm2712-rpi-5-b.dtb has 0 occurrences of vchiq (against
+		 * bcm2711-rpi-4-b.dtb's 2) and bcm2835-codec reaches the VideoCore H.264
+		 * decoder only over VCHIQ, so that driver has nothing to bind to here. HEVC is
+		 * a separate, directly addressable block, which is why this node exists.
+		 *
+		 * Driver: drivers/media/platform/raspberrypi/hevc_dec (module rpi-hevc-dec,
+		 * CONFIG_VIDEO_RPI_HEVC_DEC=m in bcm2712_defconfig:1025). It is a STATELESS
+		 * V4L2 decoder -- media_device_register() at hevc_d.c:281 means it also creates
+		 * /dev/mediaN -- and DomA cannot consume it directly: virtio-media has no
+		 * media-device or request-fd concept, so the device model presents a
+		 * stateful decoder and drives this one through libavcodec (qemu patch
+		 * 0217). This node only gives DomD the hardware.
+		 *
+		 * ALL THREE PROPERTY GROUPS ARE LOAD-BEARING. hevc_d_hw_probe returns the error
+		 * unchanged if any of them fails, so a missing one is a silent no-device:
+		 *   reg/reg-names  devm_platform_ioremap_resource_byname("hevc"/"intc"),
+		 *                  hevc_d_hw.c:391,387
+		 *   clocks         devm_clk_get(dev, NULL) at hevc_d_hw.c:395 -- a hard
+		 *                  failure, not a warning. RPI_FIRMWARE_HEVC_CLK_ID = 11
+		 *                  (raspberrypi-firmware.h, the enum starts at EMMC = 1) and
+		 *                  clk-raspberrypi.c:32,147 does export it. firmware_clocks
+		 *                  rather than a fixed-clock because raspberrypi-clk probes on
+		 *                  this board now (see the v3d note in the gpu node); if
+		 *                  that regresses, the HVS pattern (<&clk_*>) is the
+		 *                  fallback, since the driver takes its real rate from the
+		 *                  mailbox (rpi_firmware_clk_get_max_rate, hevc_d_hw.c:361)
+		 *                  and not from this clk at all.
+		 *   interrupts     platform_get_irq(pdev, 0), hevc_d_hw.c:407. SPI 98 -> abs
+		 *                  IRQ 130.
+		 *
+		 * rpi_firmware_find_node() needs the mailbox, which this DT already passes
+		 * through (mbox-bus/mailbox@107c013880) -- that is why no new firmware
+		 * plumbing appears here.
+		 */
+		hevc_dec: codec@1000800000 {
+			compatible = "brcm,bcm2712-hevc-dec",
+				     "raspberrypi,hevc-dec";
+			reg = <0x10 0x00800000 0x0 0x10000>,
+			      <0x10 0x00840000 0x0 0x01000>;
+			reg-names = "hevc", "intc";
+			clocks = <&firmware_clocks 11>;   /* RPI_FIRMWARE_HEVC_CLK_ID */
+			clock-names = "hevc";
+			interrupts = <0x0 0x62 0x4>;      /* GIC SPI 98 -> abs IRQ 130 */
+			interrupt-parent = <&gic>;
+			/* iommus = <&iommu2>;  -- DELIBERATELY NOT SET. See below.
+			 *
+			 * The host node is behind iommu@5100, but in a Xen guest this property
+			 * makes the decoder unprobeable. Measured:
+			 *   bcm2712-iommu 1000005100.iommu: IOVA aperture 0xa00000000..0xb00000000
+			 *   platform 1000800000.codec: bcm2712_iommu_attach_dev: MMU 1000005100.iommu
+			 *   ... WARNING at dma_set_mask+0x10c, lr hevc_d_probe+0x13c
+			 *   rpi-hevc-dec 1000800000.codec: Failed dma_set_mask_and_coherent
+			 *   rpi-hevc-dec 1000800000.codec: probe ... failed with error -5
+			 *
+			 * The WARN is dma_supported()'s WARN_ON(ops && use_dma_iommu(dev)): the two
+			 * DMA paths are mutually exclusive, and a Xen guest already has one. Xen
+			 * installs xen_swiotlb_dma_ops on EVERY device in a direct-mapped domain, so
+			 * as soon as the IOMMU also claims the device dma_supported() refuses and
+			 * dma_set_mask_and_coherent() returns -EIO. hevc_d_probe() treats that as
+			 * fatal, so there is no /dev/video* at all and nothing for qemu's
+			 * virtio-media v4l2-device= to proxy.
+			 *
+			 * Why this is not a problem for the GPU, which keeps its iommus (see
+			 * <&iommu4> on the gpu node): vc4 never calls dma_set_mask_and_coherent, so
+			 * it never reaches the check. The collision is latent there too.
+			 *
+			 * Dropping the property puts the decoder on the plain (xen-swiotlb) path.
+			 * That is consistent with xen,force-assign-without-iommu just below -- Xen
+			 * is not programming an IOMMU for this device either way -- and DomD is
+			 * direct-mapped, so its DMA addresses are real physical addresses. All of
+			 * DomD's static-mem banks end at 0x1c0000000 (7 GiB), well inside the
+			 * DMA_BIT_MASK(36) the driver asks for.
+			 *
+			 * IF THE DECODER PROBES BUT PRODUCES GARBAGE, that is the signal that the
+			 * block cannot reach those addresses without the MMU, and the fix moves to
+			 * the kernel: stop arch_setup_dma_ops()/xen_setup_dma_ops() from installing
+			 * swiotlb ops on a device that has an IOMMU, which is the real upstream bug
+			 * here. Do not simply put this property back.
+			 */
+			xen,path = "/axi/codec@800000";
+			xen,force-assign-without-iommu;
+			/* Both reg blocks are already page-aligned and a whole number of
+			 * pages (0x800000/0x10000 = 16, 0x840000/0x1000 = 1), so unlike
+			 * v3d's sms block no rounding is needed. */
+			xen,reg = <0x10 0x00800000 0x0 0x10000 0x10 0x00800000>,
+				  <0x10 0x00840000 0x0 0x01000 0x10 0x00840000>;
+			status = "okay";
+		};
+
+		/* iommu2 (0x5100) is the IOMMU the HEVC decoder sits behind: the host
+		 * codec@800000 has iommus = <&iommu2>, verified by resolving phandle 0x49 in
+		 * the decompiled bcm2712-rpi-5-b.dtb to iommu@5100. The decoder node above
+		 * does not reference it; what the node is here for is DomD's bcm2712-iommu
+		 * driver, whose probe (bcm2712_iommu_init) puts this MMU into a known state:
+		 * enabled, translating only its IOVA aperture, which starts at 0xa00000000,
+		 * and passing every lower address through unchanged. DomD's memory ends at
+		 * 0x1c0000000, so the decoder's DMA reaches it untranslated. Same treatment
+		 * as iommuc above -- 0x5100 is in the 0x5000 page that iommu4's xen,reg
+		 * already maps, so this stays a plain node with no passthrough properties of
+		 * its own, which is what avoids a double map (overlap -22). aperture-size is
+		 * the host node's value. */
+		iommu2: iommu@1000005100 {
+			compatible = "brcm,bcm2712-iommu";
+			reg = <0x10 0x5100 0x0 0x80>;
+			cache = <&iommuc>;
+			aperture-size = <0x1 0x00000000>;
+			#iommu-cells = <0x0>;
+		};
+		/* SODEV-LINUX-DOM0-SD-STRIP-END */
+
 		/* ===== Display interrupt controller (L2 intc) =====
 		 * source: bcm2712.dtsi disp_intr: interrupt-controller@7c502000
 		 * GIC SPI 97 LEVEL_HIGH, #interrupt-cells = <1>
