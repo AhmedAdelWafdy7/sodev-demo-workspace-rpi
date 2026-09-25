@@ -1,0 +1,53 @@
+From a92c3c33bd0d79ed7672fb4393cab536e7199b78 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 22 Sep 2026 18:31:44 +0900
+Subject: [PATCH] xen-virtual-device: distribute virtio-media with DomA's
+ kernel
+
+virtio-media's ddk_module builds against this kernel_build, but
+xen_virtual_device_aarch64_external_modules had an empty srcs list, so
+nothing referenced it. Without this entry the module is compiled and
+then dropped: the dist stays at 41 modules and virtio-media.ko has to
+be placed on the guest by hand, which is not reproducible from a build.
+
+This group feeds merged_kernel_uapi_headers and kernel_modules_install,
+so adding to it changes DomA's kernel artefacts -- that is the intent,
+since the hardware-decode path needs the module inside the image the
+guest boots.
+
+The target lives in virtio-media rather than here because a ddk_module
+has to be declared next to its sources; only the reference is this
+repo's.
+
+Depends-on: I64bbaa6483eb75733e00d3913107814cfea6c5b9 ("virtio-media: add a ddk_module target for DomA's kernel")
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [needs the xen_aarch64/virtio-media target that
+ only this BSP's virtio-media 0001 adds]
+---
+ BUILD.bazel | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD.bazel b/BUILD.bazel
+index ceca6db..99015ea 100644
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -274,7 +274,17 @@ kernel_build(
+ 
+ kernel_module_group(
+     name = "xen_virtual_device_aarch64_external_modules",
+-    srcs = [],
++    srcs = [
++        # virtio-media, for the DomA hardware-decode path. Built against this
++        # kernel_build (not cuttlefish's) by the xen_aarch64/virtio-media target
++        # in //common-modules/virtio-media/driver.
++        #
++        # This group feeds merged_kernel_uapi_headers and kernel_modules_install,
++        # so adding to it CHANGES DomA's kernel artefacts -- which is the point:
++        # without it the module is built but never distributed, and it has to be
++        # placed on the guest by hand.
++        "//common-modules/virtio-media/driver:xen_aarch64/virtio-media",
++    ],
+ )
+ 
+ merged_kernel_uapi_headers(

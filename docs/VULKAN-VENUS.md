@@ -20,18 +20,20 @@ This is the authoritative list of what that means:
 | DomD rootfs | `mesa-vulkan-drivers`, `vulkan-loader` and `vulkan-tools` installed explicitly | no `vulkan-tools`; the V3DV ICD and the loader arrive only through weston's Vulkan renderer |
 | DomD virglrenderer | venus + `render-server` + `minigbm_allocation`, 6 product patches | oe-core's stock build, no venus, no patches |
 | guest cfg (`domu.cfg`/`doma.cfg`) | `hostmem=256M,blob=true,venus=true` on `virtio-gpu-gl-pci`; in `doma.cfg` the Venus `qemu_envs` (`VIRGL_EXTERNAL_GBM`, `V3DV_MAX_BO_CACHE_SIZE`, `VKR_DEVICE_HEAP_MIB`); the options and renames only qemu 10 takes | none of these |
-| Xen + libxl | `4.22-0007/0008/0009` (p2m direction, 0xc0000000/768 MiB window, 256 MiB slices); DomD kernel `0014` + gntdev-dmabuf | the same series without them; no `0014`, no gntdev-dmabuf |
+| Xen + libxl | `4.22-0007/0008/0009/0010` (p2m direction, 0xc0000000/768 MiB window, 256 MiB slices, one SPI per virtio-pci slot); DomD kernel `0014` + gntdev-dmabuf | the same series without them; no `0014`, no gntdev-dmabuf |
 | rpi4 4 GiB SKU memory | DomD 1408 MiB / DomA 2176 MiB | DomD 1024 MiB / DomA 2560 MiB (the 8 GiB SKU and the Pi 5 are the same in both lanes) |
 | AGL cluster rootfs | four conf lines + the `meta-agl-venus` layer; cluster on the Vulkan (Impeller) embedder | neither; cluster on the shipped OpenGL embedder |
+| DomA hardware decode | `XT_DOMA_HWDEC` is the board yaml's `XT_DOMA_HWDEC_VULKAN`, `true` except with the Raspberry Pi 5's linux Dom0: DomA's device model gets the virtio-media decoder and the AAOS device its c2 HAL settings | `XT_DOMA_HWDEC=false`: not built, because virtio-media exists only in qemu 10.0.2 |
 
 Two things `--gpu=gl` deliberately does NOT revert. **DomD's mesa is 26.2.2 in both
 lanes** -- the pin is a v3dv submit-path fix that both lanes' weston benefits from
 (section 7e), so splitting the host GL/Vulkan driver by lane would mean shipping two
-of them for no gain. And **DomA's AOSP-side settings do not follow the lane**:
-this tree applies them to the AOSP tree whatever `--gpu` says (section 6), so a
-DomA built here still asks for Vulkan compositing on a `--gpu=gl` DomD, whose
+of them for no gain. And **DomA's AOSP-side Vulkan settings do not follow the
+lane**: this tree applies them to the AOSP tree whatever `--gpu` says (section 6),
+so a DomA built here still asks for Vulkan compositing on a `--gpu=gl` DomD, whose
 device model has no venus. That pairing has not been measured; a pre-Venus DomA
-needs those settings reverted.
+needs those settings reverted. (Its hardware-decode settings do follow the lane,
+through `XT_DOMA_HWDEC`, as the table says.)
 
 The diagnostics this work was done with are one more switch away,
 `./build.sh --devel`, and are in `meta-rpi-sodev-devel`. One of them is a

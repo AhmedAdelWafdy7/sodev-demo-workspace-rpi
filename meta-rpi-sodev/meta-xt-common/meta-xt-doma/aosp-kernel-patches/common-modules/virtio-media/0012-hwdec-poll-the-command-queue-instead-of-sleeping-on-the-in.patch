@@ -1,0 +1,220 @@
+From 5c2891d3ff7db764d55e2c5345549ea47a9cd2e3 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 5 Sep 2026 18:58:41 +0900
+Subject: [PATCH] virtio-media: poll the command queue instead of sleeping on
+ the interrupt
+
+Wait for a command's completion by spinning on the used ring instead of
+sleeping on the virtqueue interrupt. VRING_AVAIL_F_NO_INTERRUPT is set
+before the kick, the used ring is polled until the deadline, and the
+wait falls back to the interrupt once it expires.
+
+  - poll_us is a read-only (0444) module parameter, set when the module
+    loads. The interrupt is disarmed before the kick and re-armed only
+    when a poll times out, so a value changed between commands could
+    leave the next command sleeping with the interrupt off.
+  - done is paired release/acquire with resp_len, so the completion a
+    poller observes is ordered against the response it then reads.
+  - The default is 500 us. A command completes in 50-70 us measured on
+    the board, 2026-09-05, so a longer spin only burns CPU while the
+    device is stalled; 4000 us also panicked the guest inside the first
+    playback with a Xen-injected data abort in vp_interrupt. poll_us=0
+    keeps the stock interrupt behaviour.
+
+Change-Id: I3e6c7f7abffd87e6f3c446a33f2203817a4bd291
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [Xen/Arm latency workaround: polls the used ring
+ instead of sleeping on the virtqueue interrupt]
+---
+ driver/virtio_media.h        |  11 ++++
+ driver/virtio_media_driver.c | 101 +++++++++++++++++++++++++++++++++--
+ 2 files changed, 109 insertions(+), 3 deletions(-)
+
+diff --git a/driver/virtio_media.h b/driver/virtio_media.h
+index 52809d4..7b94b1f 100644
+--- a/driver/virtio_media.h
++++ b/driver/virtio_media.h
+@@ -40,6 +40,8 @@ extern bool virtio_media_allow_userptr;
+  *        other responses are handled by @struct virtio_media_session
+  * @vlock: serializes access to the command queue.
+  * @wq: waitqueue for host responses on the command queue.
++ * @cmdq_lock: serializes virtqueue_get_buf() on @commandq between its
++ *             callback and the polling waiter in virtio_media_kick_command().
+  */
+ struct virtio_media {
+ 	struct v4l2_device v4l2_dev;
+@@ -71,6 +73,15 @@ struct virtio_media {
+ 
+ 	struct mutex vlock; /* serializes command queue access */
+ 	wait_queue_head_t wq;
++	/*
++	 * Serializes virtqueue_get_buf() on the command queue between the
++	 * interrupt callback and the polling waiter in
++	 * virtio_media_kick_command(). Needed because an interrupt raised for
++	 * the event queue also runs the command queue callback when used
++	 * buffers are pending, even with the command queue's callbacks
++	 * disabled.
++	 */
++	spinlock_t cmdq_lock;
+ };
+ 
+ static inline struct virtio_media *
+diff --git a/driver/virtio_media_driver.c b/driver/virtio_media_driver.c
+index 36acfa5..050f099 100644
+--- a/driver/virtio_media_driver.c
++++ b/driver/virtio_media_driver.c
+@@ -65,6 +65,25 @@ module_param_named(driver_name, virtio_media_driver_name, charp, 0660);
+ bool virtio_media_allow_userptr;
+ module_param_named(allow_userptr, virtio_media_allow_userptr, bool, 0660);
+ 
++/*
++ * Poll the command queue for up to this many microseconds after a kick before
++ * sleeping on the interrupt. 0 restores the interrupt-only behaviour.
++ *
++ * Why: on Xen every guest MMIO is an ioreq answered on qemu's main loop, and
++ * every virtio-pci interrupt (INTx: no MSI-X without an ITS on this GICv2
++ * platform) costs the guest another MMIO round trip to read the ISR register.
++ * Measured on RPi4 DomA (2026-09-05): a QBUF is 5-6 ms of wall time with
++ * ~5 media commands per frame, and the decode->present pipeline tops out at
++ * 30-40 fps while CPU, GPU and vCPU count are all shown not to be the limit.
++ * With VRING_AVAIL_F_NO_INTERRUPT set before the kick the device skips the
++ * interrupt entirely and the waiter observes the used ring directly, so each
++ * command saves the interrupt injection plus one ISR read round trip.
++ */
++static unsigned int poll_us = 500;
++module_param(poll_us, uint, 0444);
++MODULE_PARM_DESC(poll_us,
++		 "Poll the command queue this many microseconds before sleeping on the interrupt (0 = interrupt only)");
++
+ /*
+  * Log every event the device sends us.
+  *
+@@ -257,13 +276,17 @@ struct virtio_media_cmd_callback_param {
+  */
+ static void commandq_callback(struct virtqueue *queue)
+ {
++	struct virtio_media *vv = queue->vdev->priv;
+ 	unsigned int len;
+ 	struct virtio_media_cmd_callback_param *param;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&vv->cmdq_lock, flags);
+ process_bufs:
+ 	while ((param = virtqueue_get_buf(queue, &len))) {
+-		param->done = true;
+ 		param->resp_len = len;
++		/* Publish resp_len before done: the waiter reads them in order. */
++		smp_store_release(&param->done, true);
+ 		wake_up(&param->vv->wq);
+ 	}
+ 
+@@ -271,6 +294,63 @@ process_bufs:
+ 		virtqueue_disable_cb(queue);
+ 		goto process_bufs;
+ 	}
++	spin_unlock_irqrestore(&vv->cmdq_lock, flags);
++}
++
++/**
++ * virtio_media_poll_command - wait for a command by polling the used ring.
++ * @vv: virtio-media device in use.
++ * @cb_param: token of the command that was just kicked.
++ * @budget_us: how long to poll before re-arming the interrupt, in us.
++ *
++ * Returns true when the command completed while polling. On false the
++ * command queue interrupt has been re-armed and the caller must sleep.
++ */
++static bool virtio_media_poll_command(struct virtio_media *vv,
++				      struct virtio_media_cmd_callback_param *cb_param,
++				      unsigned int budget_us)
++{
++	const u64 deadline = ktime_get_ns() + (u64)budget_us * NSEC_PER_USEC;
++	struct virtio_media_cmd_callback_param *param;
++	unsigned long flags;
++	unsigned int len;
++
++	for (;;) {
++		spin_lock_irqsave(&vv->cmdq_lock, flags);
++		param = virtqueue_get_buf(vv->commandq, &len);
++		if (param) {
++			/* Commands are serialized by vlock: this can only be ours. */
++			param->resp_len = len;
++			/* Publish resp_len before done. */
++			smp_store_release(&param->done, true);
++		}
++		spin_unlock_irqrestore(&vv->cmdq_lock, flags);
++		/* Pairs with the release of done. */
++		if (smp_load_acquire(&cb_param->done))
++			return true;
++		if (ktime_get_ns() >= deadline)
++			break;
++		cpu_relax();
++	}
++
++	/*
++	 * Re-arm the interrupt. If the response landed in the meantime,
++	 * virtqueue_enable_cb() says so and we take it here rather than
++	 * waiting for an interrupt that will never come.
++	 */
++	spin_lock_irqsave(&vv->cmdq_lock, flags);
++	if (!virtqueue_enable_cb(vv->commandq)) {
++		param = virtqueue_get_buf(vv->commandq, &len);
++		if (param) {
++			param->resp_len = len;
++			/* Publish resp_len before done. */
++			smp_store_release(&param->done, true);
++		}
++	}
++	spin_unlock_irqrestore(&vv->cmdq_lock, flags);
++
++	/* Pairs with the release of done. */
++	return smp_load_acquire(&cb_param->done);
+ }
+ 
+ /**
+@@ -294,6 +374,7 @@ static int virtio_media_kick_command(struct virtio_media *vv,
+ 		.resp_len = 0,
+ 	};
+ 	struct virtio_media_resp_header *resp_header;
++	const unsigned int budget_us = poll_us;
+ 	int ret;
+ 
+ 	ret = virtqueue_add_sgs(vv->commandq, sgs, out_sgs, in_sgs, &cb_param,
+@@ -304,13 +385,26 @@ static int virtio_media_kick_command(struct virtio_media *vv,
+ 		return ret;
+ 	}
+ 
++	/*
++	 * Ask the device not to interrupt: the waiter polls the used ring
++	 * first (see poll_us). Must precede the kick so the flag is visible
++	 * when the device completes the command.
++	 */
++	if (budget_us)
++		virtqueue_disable_cb(vv->commandq);
++
+ 	if (!virtqueue_kick(vv->commandq)) {
+ 		v4l2_err(&vv->v4l2_dev, "failed to kick command virtqueue\n");
++		if (budget_us)
++			virtqueue_enable_cb(vv->commandq);
+ 		return -EINVAL;
+ 	}
+ 
+-	/* Wait for the response. */
+-	ret = wait_event_timeout(vv->wq, cb_param.done, 5 * HZ);
++	/* Wait for the response: poll first, then sleep on the interrupt. */
++	if (budget_us && virtio_media_poll_command(vv, &cb_param, budget_us))
++		ret = 1;
++	else
++		ret = wait_event_timeout(vv->wq, cb_param.done, 5 * HZ);
+ 	if (ret == 0) {
+ 		v4l2_err(&vv->v4l2_dev,
+ 			 "timed out waiting for response to command\n");
+@@ -959,6 +1053,7 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
+ 	mutex_init(&vv->sessions_lock);
+ 	mutex_init(&vv->events_lock);
+ 	mutex_init(&vv->vlock);
++	spin_lock_init(&vv->cmdq_lock);
+ 
+ 	vv->virtio_dev = virtio_dev;
+ 	virtio_dev->priv = vv;

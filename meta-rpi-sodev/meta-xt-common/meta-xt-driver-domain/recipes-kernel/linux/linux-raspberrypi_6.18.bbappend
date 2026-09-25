@@ -72,6 +72,25 @@ SRC_URI:append = " ${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
     'file://0014-xen-gntdev-return-a-dma-buf-s-frame-numbers-to-users.patch \
      file://venus-gntdev-dmabuf.cfg', '', d)}"
 
+# 0015 is the DomD kernel half of DomA's hardware decode, and it pairs with qemu
+# patch 0227-v10 (the device model asking for non-coherent host buffers). vb2
+# dma-contig MMAP buffers are coherent (Normal-NC on arm64) by default, and a CPU
+# reading a decoded frame out of one runs at bus speed: measured 678 MB/s against
+# 3469 MB/s for cached memory on a Raspberry Pi 4, i.e. 1.4 ms instead of 0.3 ms
+# for a 942 KB frame. The device model copies every frame, so it pays that per
+# frame. Setting allow_cache_hints lets REQBUFS accept
+# V4L2_MEMORY_FLAG_NON_COHERENT; nothing changes for callers that do not pass it.
+#
+# Not board-specific in this bbappend's sense even though only BCM2711 has the
+# driver: bcm2835-codec is built for both boards' DomD and simply never binds on
+# BCM2712, which has no vchiq node.
+#
+# Numbered 0015 because 0013 and 0014 are taken by this bbappend's own
+# brcmstb-l2 and gntdev patches.
+SRC_URI:append = " \
+    file://0015-bcm2835-codec-allow-cache-hints-on-both-queues.patch \
+"
+
 # rpi5-0004: V4H Xen patchset for the Dom0/DomD kernel. The base meta-xt-rpi5
 # linux-raspberrypi_6.12.bbappend (pristine) does NOT carry these; they were
 # being applied by editing the base bbappend directly. Moved here so meta-xt-rpi5

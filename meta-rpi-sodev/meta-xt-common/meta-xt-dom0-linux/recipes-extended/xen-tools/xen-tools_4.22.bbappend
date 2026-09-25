@@ -1,7 +1,8 @@
 # ============================================================================
 # Xen 4.22 + 28-patch shared series + 5 toolstack-only patches = 33 fetched,
-# plus the two the Vulkan lane adds (4.22-0008 shared, 4.22-0009 toolstack-only)
-# = 35 in the default lane, 33 with --gpu=gl
+# plus the three the Vulkan lane adds (4.22-0008, which the hypervisor takes
+# too, and the libxl-only 4.22-0009 and 4.22-0010) = 36 in the default lane,
+# 33 with --gpu=gl
 # ============================================================================
 # Attaches to xen-tools_4.22.bb (PV "4.22+stable", SRCREV d45d5687f1, branch
 # stable-4.22) instead of the xen-troops fork _git recipe. Selected by
@@ -36,11 +37,12 @@
 # "SRC_URI = ${XEN_URL}" reset that used to wipe them never runs; upstream
 # xen-tools.inc supplies them from meta-virtualization's files/.
 
-# --- [Venus] the two toolstack patches the Vulkan lane adds ---
+# --- [Venus] the three toolstack patches the Vulkan lane adds ---
 #
 # Gated on the venus DISTRO_FEATURE, like the hypervisor pair, so the `--gpu=gl`
 # lane's libxl is the pre-Venus series, with none of these. Vulkan is the
-# default, so a plain build DOES get these two.
+# default, so a plain build DOES get all three (4.22-0010 is described next to
+# the SRC_URI line below).
 #
 # 4.22-0009 is toolstack-only (libxl) and therefore lives in ./files rather than
 # the shared dir: it hands the guest's prefetchable virtio-PCI region out in
@@ -64,7 +66,7 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # the hypervisor xen_4.22.bbappend point at -- the two SRC_URI lists name the
 # same 28 files, plus 4.22-0008 which the Venus lane adds to both. Only the
 # toolstack-only patches -- the project's 0001-qemu_envs / 0059 / 0061 / 0062 /
-# 0063 and the Venus lane's 4.22-0009 -- and the systemd unit are in
+# 0063 and the Venus lane's 4.22-0009 / 4.22-0010 -- and the systemd unit are in
 # ./files here. The interim recipe's pre-patches are not: meta-xt-domx's
 # xen-tools_4.22.bb takes two from meta-virtualization's files/ and its refreshed
 # tests-vpci one from its own files/.
@@ -108,11 +110,26 @@ SRC_URI:append = " \
     file://4.22-0005-build-honour-external-toolchain-vars.patch \
 "
 
-# [Venus] gated so a --gpu=gl build's toolstack carries no additions from us.
+# [Venus / qemu 10.0.2 lane] gated so a --gpu=gl build's toolstack carries no
+# additions from us.
 # 4.22-0008 first: 4.22-0009 reads the constants it moves.
+#
+# 4.22-0010 is in the same gate although it is not a Venus change: it hands out
+# one SPI per virtio-pci slot, which the guest DT and the device model have to
+# agree on. The device-model half is qemu's 0215 + 0122, and those only exist in
+# the 10.0.2 recipe -- the gl lane builds qemu 7.0.0-xt, whose Arm Xen machine
+# wires the four INTA-D lines. Gating it with the others is therefore what keeps
+# the two halves together; ungating it would give a gl-lane guest a DT declaring
+# sixteen lines against a device model that has four.
+#
+# The hardware decoder needs 4.22-0010 (virtio-media lands at slot 09.0, which at
+# four or eight lines folds onto virtio-blk), and it needs virtio-media, which is
+# a 10.0.2-only device. So hardware decode implies this lane too -- there is no
+# --gpu=gl configuration that has it.
 SRC_URI:append = " ${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
     'file://4.22-0008-arm-move-the-guest-virtio-pci-prefetch-window.patch \
-     file://4.22-0009-libxl-arm-give-a-virtio-pci-host-a-256M-prefetchable-.patch', '', d)}"
+     file://4.22-0009-libxl-arm-give-a-virtio-pci-host-a-256M-prefetchable-.patch \
+     file://4.22-0010-libxl-arm-one-SPI-per-virtio-pci-slot.patch', '', d)}"
 
 # --- project toolstack feature patches (verified: all 5 apply CLEAN on 4.22) ---
 # qemu_envs   : pass WAYLAND_DISPLAY/XDG_RUNTIME_DIR/SDL_VIDEODRIVER/WMCLASS to

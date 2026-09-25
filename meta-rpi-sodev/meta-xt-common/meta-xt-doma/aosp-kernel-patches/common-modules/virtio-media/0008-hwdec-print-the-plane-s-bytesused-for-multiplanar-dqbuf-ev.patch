@@ -1,0 +1,64 @@
+From 1272fc0cbaca460c07e24635553a9531f5f2de49 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 3 Sep 2026 15:58:09 +0900
+Subject: [PATCH] virtio-media: print the plane's bytesused for multiplanar
+ dqbuf events
+
+event_trace printed buffer.bytesused, which is meaningless for a
+multiplanar buffer -- the value lives in planes[0].bytesused. So every
+capture completion read as "bytesused 0", which is exactly what an
+empty frame looks like, while the device model was in fact delivering
+full frames (measured on the board, 2026-09-03):
+
+  before: EVT_DQBUF session 2505 type 9 index 24 bytesused 0
+  after:  EVT_DQBUF session 2519 type 9 index 0 bytesused 41472
+          flags 0x4001
+
+41472 is the negotiated sizeimage, and 0x4001 is MAPPED |
+TIMESTAMP_COPY -- nothing wrong with either. Print whichever field the
+buffer type defines, and the flags too, since a returned buffer's ERROR
+or LAST bit is the next thing one wants to know.
+
+Change-Id: Ib10e08b9bae3c7ea3cde567f80225ec6c863c222
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [diagnostic instrumentation]
+---
+ driver/virtio_media_driver.c | 23 +++++++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/driver/virtio_media_driver.c b/driver/virtio_media_driver.c
+index 0b7ce56..c32883a 100644
+--- a/driver/virtio_media_driver.c
++++ b/driver/virtio_media_driver.c
+@@ -566,11 +566,26 @@ process_bufs:
+ 				break;
+ 			}
+ 			dqbuf_evt = (struct virtio_media_event_dqbuf *)evt;
+-			if (event_trace)
+-				pr_info("virtio-media: EVT_DQBUF session %u type %u index %u bytesused %u\n",
++			if (event_trace) {
++				/*
++				 * For a multiplanar buffer the length lives in
++				 * planes[0].bytesused, and buffer.bytesused is
++				 * meaningless. Printing the latter reads 0 for
++				 * every frame and makes a working decode look
++				 * like it is returning empty buffers. Print
++				 * whichever field the buffer type actually
++				 * defines.
++				 */
++				u32 used = V4L2_TYPE_IS_MULTIPLANAR(
++						   dqbuf_evt->buffer.type) ?
++						   dqbuf_evt->planes[0].bytesused :
++						   dqbuf_evt->buffer.bytesused;
++
++				pr_info("virtio-media: EVT_DQBUF session %u type %u index %u bytesused %u flags 0x%x\n",
+ 					evt->session_id, dqbuf_evt->buffer.type,
+-					dqbuf_evt->buffer.index,
+-					dqbuf_evt->buffer.bytesused);
++					dqbuf_evt->buffer.index, used,
++					dqbuf_evt->buffer.flags);
++			}
+ 			virtio_media_process_dqbuf_event(vv, session,
+ 							 dqbuf_evt);
+ 			break;

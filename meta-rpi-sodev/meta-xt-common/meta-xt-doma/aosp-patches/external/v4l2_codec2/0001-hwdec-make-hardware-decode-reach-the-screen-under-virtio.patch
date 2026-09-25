@@ -1,0 +1,1698 @@
+From 631f865a3823778684be7e90513e4f2996bc0a56 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 22 Sep 2026 17:09:15 +0900
+Subject: [PATCH] v4l2_codec2: make hardware decode reach the screen under
+ virtio
+
+Adapts the component to a decoder presented by a device model rather
+than by a real driver, and fixes the two reasons a correctly decoded
+frame was never visible.
+
+  * Ask the device for an RGBA capture format. The guest GL here is
+    virgl on V3D and does not export GL_EXT_YUV_target, so an NV12
+    EGLImage can never be sampled -- measured on hardware, the
+    extension is simply absent from the compositor's list.
+
+  * Pass the gralloc buffer's virgl resource id with each CAPTURE
+    buffer, in v4l2_buffer.reserved2, so that the device model writes
+    the decoded frame straight into the resource the compositor
+    samples. The guest does not transfer the frame itself, and a
+    gralloc lock would not do it either: that runs a transfer FROM the
+    host first and discards what the decoder wrote.
+
+The resource id comes from a virtgpu render node this component opens
+itself. Every use of its GEM handles is made under one lock, because
+the node and its handle cache are shared by all decoders in the
+process.
+
+Around those two:
+
+  * QUERYBUF is skipped on the DMABUF queues, whose plane lengths come
+    from the format instead, and a buffer is queued with at most one
+    fd per V4L2 plane.
+  * Capture formats are tried in this component's order of preference,
+    and the frame pool is allocated with the negotiated format and the
+    device's stride. The pixel format is declared
+    (C2StreamPixelFormatInfo), and debug.v4l2codec2.output_delay can
+    lower the H.264/HEVC output delay.
+  * On a resolution change the CAPTURE queue is released before S_FMT.
+  * Only the codecs a V4L2 device is present for are registered, and
+    the service joins group camera, which owns /dev/video*.
+  * Empty works are accepted and reported, output frames that arrive
+    after a flush are dropped, and a block with a new id re-points a
+    free V4L2 slot.
+  * The frame pool keeps one graphic block fetched ahead, identifies a
+    block without pool data by its dmabuf, and reports a failed fetch
+    to the client instead of stalling: to the request waiting for it,
+    or, for a fetch made ahead, to the next request.
+  * The initial EOS buffer is RGBA when prefer_rgba is set, with a
+    usage the gralloc accepts.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device's
+ reserved2 resource-id channel (qemu 0228) and on a guest GL without
+ GL_EXT_YUV_target]
+---
+ common/VideoTypes.cpp                         |   2 +
+ .../include/v4l2_codec2/common/VideoTypes.h   |   6 +
+ components/DecodeComponent.cpp                | 102 +++-
+ components/DecodeInterface.cpp                |  63 ++-
+ components/VideoFrame.cpp                     | 125 +++++
+ components/VideoFramePool.cpp                 | 221 +++++++--
+ .../v4l2_codec2/components/DecodeComponent.h  |   3 +
+ .../v4l2_codec2/components/DecodeInterface.h  |   3 +
+ .../v4l2_codec2/components/VideoFrame.h       |  16 +
+ .../v4l2_codec2/components/VideoFramePool.h   |  36 +-
+ ...d.hardware.media.c2@1.2-service-v4l2-32.rc |   9 +-
+ ...d.hardware.media.c2@1.2-service-v4l2-64.rc |   9 +-
+ v4l2/V4L2ComponentStore.cpp                   | 109 ++++-
+ v4l2/V4L2Decoder.cpp                          | 438 ++++++++++++++++--
+ v4l2/V4L2Device.cpp                           |  35 +-
+ v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h   |   8 +
+ v4l2/include/v4l2_codec2/v4l2/V4L2Device.h    |   4 +
+ 17 files changed, 1076 insertions(+), 113 deletions(-)
+
+diff --git a/common/VideoTypes.cpp b/common/VideoTypes.cpp
+index 61feb06..7f7929d 100644
+--- a/common/VideoTypes.cpp
++++ b/common/VideoTypes.cpp
+@@ -95,6 +95,8 @@ const char* HalPixelFormatToString(HalPixelFormat format) {
+         return "YV12";
+     case HalPixelFormat::NV12:
+         return "NV12";
++    case HalPixelFormat::RGBA_8888:
++        return "RGBA_8888";
+     }
+ }
+ 
+diff --git a/common/include/v4l2_codec2/common/VideoTypes.h b/common/include/v4l2_codec2/common/VideoTypes.h
+index 54786e8..8cdd82d 100644
+--- a/common/include/v4l2_codec2/common/VideoTypes.h
++++ b/common/include/v4l2_codec2/common/VideoTypes.h
+@@ -36,6 +36,12 @@ enum class HalPixelFormat : int32_t {
+     YV12 = static_cast<int32_t>(HPixelFormat::YV12),
+     // NV12 is not defined at PixelFormat, follow the convention to use fourcc value.
+     NV12 = 0x3231564e,
++    // RGBA is here so a decoder can hand the client frames the GPU can
++    // sample unconditionally. On a guest whose GL driver has no
++    // GL_EXT_YUV_target -- Mesa/virgl on RPi4 under Xen, measured 2026-09-03 --
++    // an NV12 buffer cannot be turned into a texture at all, while
++    // bcm2835-codec can do the YUV-to-RGB itself and emit AB24.
++    RGBA_8888 = static_cast<int32_t>(HPixelFormat::RGBA_8888),
+ };
+ const char* HalPixelFormatToString(HalPixelFormat format);
+ 
+diff --git a/components/DecodeComponent.cpp b/components/DecodeComponent.cpp
+index 00880d7..5d0400f 100644
+--- a/components/DecodeComponent.cpp
++++ b/components/DecodeComponent.cpp
+@@ -355,16 +355,31 @@ void DecodeComponent::queueTask(std::unique_ptr<C2Work> work) {
+     work->worklets.front()->output.buffers.clear();
+     work->worklets.front()->output.ordinal = work->input.ordinal;
+     if (work->input.buffers.empty()) {
+-        // Client may queue a work with no input buffer for either it's EOS or empty CSD, otherwise
+-        // every work must have one input buffer.
+-        if ((work->input.flags & C2FrameData::FLAG_END_OF_STREAM) == 0 &&
+-            (work->input.flags & C2FrameData::FLAG_CODEC_CONFIG) == 0) {
+-            ALOGE("Invalid work: work with no input buffer should be EOS or CSD.");
+-            reportError(C2_BAD_VALUE);
+-            return;
+-        }
+-
+-        // Emplace a nullptr to unify the check for work done.
++        // AN EMPTY WORK WITH NO FLAGS IS LEGAL, AND REJECTING IT KILLS THE
++        // WHOLE COMPONENT.
++        //
++        // Upstream requires FLAG_END_OF_STREAM or FLAG_CODEC_CONFIG here and
++        // calls reportError(C2_BAD_VALUE) otherwise. reportError() latches
++        // ComponentState::ERROR, so every later queue() returns C2_BAD_STATE
++        // and the client cannot recover -- one stray empty work takes the
++        // component down for good.
++        //
++        // Codec2 does not promise that an empty work carries a flag. A client
++        // may queue one to move the timeline along without data, and AOSP's own
++        // software decoders accept it and return it with no output. VTS is the
++        // conformance test and does exactly that: DecodeTestEmptyBuffersInserted
++        // inserts a zero-byte frame every 5th frame and an empty CSD every 20th,
++        // and decodeNFrames() pushes no input buffer at all when the size is
++        // zero (buffers.clear() followed by `if (size)`). Frames 5, 10, 15 ...
++        // are therefore empty AND unflagged. Measured on RPi4 2026-09-03:
++        //
++        //   DecodeComponent: Invalid work: work with no input buffer should be
++        //                    EOS or CSD.
++        //   VTS: component->queue(&items) Which is: BAD_STATE
++        //
++        // So take any empty work. The structural checks above (one worklet, at
++        // most one input buffer) still reject a genuinely malformed work, so
++        // nothing is being waved through.
+         ALOGV("Got a work with no input buffer! Emplace a nullptr inside.");
+         work->input.buffers.emplace_back(nullptr);
+     }
+@@ -412,8 +427,34 @@ void DecodeComponent::pumpPendingWorks() {
+             mIsDraining = true;
+         }
+ 
+-        // Directly report the empty CSD work as finished.
+-        if (isCSDWork && isEmptyWork) reportWorkIfFinished(bitstreamId);
++        // EVERY EMPTY WORK HAS TO BE REPORTED HERE, NOT ONLY THE CSD ONES.
++        //
++        // An empty work never reaches the decoder, so nothing else will ever
++        // complete it: it would sit in mWorksAtDecoder forever, the client's
++        // C2Work object would never come back, and the client would starve.
++        // That is what VTS reports as "Wait for generating C2Work exceeded
++        // timeout" -- so accepting empty works in queueTask() without this
++        // would have turned one failure signature into another.
++        //
++        // EOS is the exception: its work is completed by onDrainDone() once the
++        // drain started just above finishes, so reporting it here as well would
++        // report the same work twice.
++        //
++        // FLAG_DROP_FRAME is how this file already says "this work produces no
++        // output", and it is what makes isWorkDone() accept the work: that
++        // predicate needs outputReturned || ignoreOutput, and an empty work has
++        // neither an output buffer nor FLAG_CODEC_CONFIG to lean on. The flag
++        // does not reach the client -- reportWorkIfFinished() clears it before
++        // reporting, so the client sees a work with neither flags nor output
++        // buffer, which the C2 framework already reads as "no corresponding
++        // output" and immediately returns to the pool.
++        if (isEmptyWork && !isEOSWork) {
++            auto it = mWorksAtDecoder.find(bitstreamId);
++            if (it != mWorksAtDecoder.end()) {
++                it->second->worklets.front()->output.flags = C2FrameData::FLAG_DROP_FRAME;
++            }
++            reportWorkIfFinished(bitstreamId);
++        }
+     }
+ }
+ 
+@@ -517,8 +558,41 @@ void DecodeComponent::onOutputFrameReady(std::unique_ptr<VideoFrame> frame) {
+     const int32_t bitstreamId = frame->getBitstreamId();
+     auto it = mWorksAtDecoder.find(bitstreamId);
+     if (it == mWorksAtDecoder.end()) {
+-        ALOGE("Work with bitstreamId=%d not found, already abandoned?", bitstreamId);
+-        reportError(C2_CORRUPTED);
++        // Drop it. This is not an error.
++        //
++        // flushTask() empties mWorksAtDecoder through reportAbandonedWorks() after
++        // mDecoder->flush(). The decoder's in-flight output still arrives after that
++        // (in this setup DQBUF comes through a virtio-media event, so there is a wide
++        // window for it to cross with STREAMOFF).
++        // So an output frame with no matching work right after a flush is not an
++        // anomaly, it is the expected race.
++        //
++        // Upstream calls reportError(C2_CORRUPTED) here, so a single seek drives
++        // the component into Error and playback stops. Measured sequence
++        // (2026-09-03, looping a local clip = seek-to-0):
++        //   V4L2Decoder: Set state Draining => Idle        <- flush
++        //   CCodecBufferChannel: flushed work; ignored
++        //   V4L2Decoder: Set state Idle => Decoding        <- resumed
++        //   DecodeComponent: Work with bitstreamId=238 not found, already abandoned?
++        //   DecodeComponent: reportError(error=14)         <- first symptom
++        //   DecodeComponent: Could not queue at state: ERROR
++        //   SurfaceUtils: disconnecting from surface
++        //   BufferQueueProducer: dequeueBuffer: BufferQueue has no connected producer
++        //   C2BqBuffer: cannot dequeue buffer -19
++        //   VideoFramePool: Failed to fetch block, err=22
++        // Everything after the report is fallout from it, not the cause.
++        //
++        // There is nothing this side can do about an unknown bitstreamId
++        // (bitstreamId is timestamp.tv_sec, so a driver returning a strange
++        //  timestamp produces the same shape, and even then dropping the frame is
++        //  the only thing that can be done).
++        // Just count them, keeping the first few and every 100th after that.
++        mStaleOutputFrames++;
++        if (mStaleOutputFrames <= 8 || mStaleOutputFrames % 100 == 0) {
++            ALOGW("Dropping output frame with unknown bitstreamId=%d (work already abandoned; "
++                  "%zu so far). Expected right after a flush/seek.",
++                  bitstreamId, mStaleOutputFrames);
++        }
+         return;
+     }
+     C2Work* work = it->second.get();
+diff --git a/components/DecodeInterface.cpp b/components/DecodeInterface.cpp
+index 53689bd..ded81a1 100644
+--- a/components/DecodeInterface.cpp
++++ b/components/DecodeInterface.cpp
+@@ -10,6 +10,7 @@
+ #include <C2PlatformSupport.h>
+ #include <SimpleC2Interface.h>
+ #include <android/hardware/graphics/common/1.0/types.h>
++#include <cutils/properties.h>
+ #include <log/log.h>
+ #include <media/stagefright/foundation/MediaDefs.h>
+ 
+@@ -303,6 +304,43 @@ DecodeInterface::DecodeInterface(const std::string& name,
+                          .withSetter(SizeSetter)
+                          .build());
+ 
++    // DECLARE THE PIXEL FORMAT, OR THE ONLY TEST THAT MEASURES DECODING
++    // SILENTLY MEASURES NOTHING.
++    //
++    // VTS configures C2StreamPixelFormatInfo::output before every decode and
++    // bails out if config() does not return C2_OK with no failures:
++    //
++    //   uint32_t format = HAL_PIXEL_FORMAT_YCBCR_420_888;
++    //   if (!configPixelFormat(format)) {
++    //       std::cout << "[   WARN   ] Test Skipped PixelFormat not configured\n";
++    //       return;
++    //   }
++    //
++    // Without this parameter that config fails, so on RPi4 2026-09-03 all 16
++    // Codec2VideoDecDecodeTest cases returned before touching a frame -- and
++    // reported "[ OK ]". 16 of 26 passes were vacuous, checksum verification
++    // included. AOSP's software decoders declare it, which is why VTS exercises
++    // them properly and not this one.
++    //
++    // One value only: the format V4L2Decoder negotiates. With
++    // ro.vendor.v4l2_codec2.prefer_rgba (default true, read with the same
++    // default as preferRgbOutput() in V4L2Decoder.cpp) the decoder asks the
++    // device for AB24 and hands the client RGBA buffers -- this guest's GL
++    // driver has no GL_EXT_YUV_target, so a YUV buffer cannot become a texture
++    // (see kPreferredRgbFourccs there). Otherwise it is YCBCR_420_888.
++    // Advertising anything else would be a format the client acts on and the
++    // decoder does not produce.
++    const uint32_t pixelFormat = static_cast<uint32_t>(
++            property_get_bool("ro.vendor.v4l2_codec2.prefer_rgba", true)
++                    ? HalPixelFormat::RGBA_8888
++                    : HalPixelFormat::YCBCR_420_888);
++    addParameter(
++            DefineParam(mPixelFormat, C2_PARAMKEY_PIXEL_FORMAT)
++                    .withDefault(new C2StreamPixelFormatInfo::output(0u, pixelFormat))
++                    .withFields({C2F(mPixelFormat, value).oneOf({pixelFormat})})
++                    .withSetter(Setter<C2StreamPixelFormatInfo::output>::StrictValueWithNoDeps)
++                    .build());
++
+     addParameter(
+             DefineParam(mMaxInputSize, C2_PARAMKEY_INPUT_MAX_BUFFER_SIZE)
+                     .withDefault(new C2StreamMaxBufferSizeInfo::input(0u, kInputBufferSizeFor1080p))
+@@ -425,15 +463,36 @@ c2_status_t DecodeInterface::queryColorAspects(
+ }
+ 
+ uint32_t DecodeInterface::getOutputDelay(VideoCodec codec) {
++    // debug.v4l2codec2.output_delay=N (1..16) overrides the H.264/HEVC value below.
++    //
++    // WHY. The output delay is the dominant term of the CAPTURE buffer count:
++    // V4L2DecodeComponent's getMinNumOutputBuffers() is delay + 4 + 3 + 2, so the
++    // default 16 makes 25 buffers. bcm2835-codec itself needs 1. On the RPi4
++    // DomD the 1080p NV12 capture buffer is 3.1 MB (order-10 CMA), 25 of them
++    // are 78 MB against ~45 MB of free CMA, and the allocation starves DomD
++    // (measured 2026-09-05, twice). 16 is the H.264 DPB worst case; the H.264
++    // streams measured in a WebView reordered by 2-4 frames, so a delay of 4
++    // (13 buffers, 40 MB) keeps 1080p inside the CMA budget. A stream that
++    // reorders deeper than the configured delay makes CCodec time out
++    // ("previous call to queue exceeded timeout") instead of stalling silently,
++    // which is the reason this stays a property and not a new default. Read
++    // once per process, when the first component instance asks; a change
++    // takes effect when the service restarts.
++    static const int32_t sOverride = [] {
++        int32_t v = property_get_int32("debug.v4l2codec2.output_delay", 0);
++        if (v < 1 || v > 16) return 0;
++        ALOGI("output_delay override for H.264/HEVC: %d", v);
++        return v;
++    }();
+     switch (codec) {
+     case VideoCodec::H264:
+         // Due to frame reordering an H264 decoder might need multiple additional input frames to be
+         // queued before being able to output the associated decoded buffers. We need to tell the
+         // codec2 framework that it should not stop queuing new work items until the maximum number
+         // of frame reordering is reached, to avoid stalling the decoder.
+-        return 16;
++        return sOverride ? sOverride : 16;
+     case VideoCodec::HEVC:
+-        return 16;
++        return sOverride ? sOverride : 16;
+     case VideoCodec::VP8:
+         // The decoder might held a few frames as a reference for decoding. Since Android T
+         // the Codec2 is more prone to timeout the component if one is not producing frames. This
+diff --git a/components/VideoFrame.cpp b/components/VideoFrame.cpp
+index b7481ad..9d195f7 100644
+--- a/components/VideoFrame.cpp
++++ b/components/VideoFrame.cpp
+@@ -7,11 +7,49 @@
+ 
+ #include <v4l2_codec2/components/VideoFrame.h>
+ 
++#include <drm/drm.h>
++#include <drm/virtgpu_drm.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++
++#include <mutex>
++#include <unordered_map>
++
+ #include <C2AllocatorGralloc.h>
+ #include <log/log.h>
+ 
+ namespace android {
+ 
++namespace {
++
++// dmabuf inode -> virtgpu GEM handle on virtgpuFd().
++//
++// A VideoFrame is rebuilt on every fetch (VideoFramePool::getVideoFrameTask()
++// calls VideoFrame::Create()), so holding this on the object would not be a
++// cache. The pool holds at most 25 blocks at a time, so the map is bounded.
++// It is keyed by the inode and not the fd number: an fd number can change
++// through dup, but the same dmabuf has the same inode. Without the cache every
++// lookup costs three ioctls (PRIME_FD_TO_HANDLE, RESOURCE_INFO, GEM_CLOSE);
++// with it, one.
++//
++// Every use of a handle -- the import, RESOURCE_INFO and GEM_CLOSE -- is made
++// under gHandleMutex. The render node and this cache are shared by every
++// decoder in the process, and clearHandleCache() closes every handle in it, so
++// a handle used outside the lock could be closed, and its number reused for
++// another buffer, before the ioctl that uses it.
++//
++// A dmabuf's inode number is unique for the life of the kernel, so an entry
++// never names another buffer. But each cached handle holds a reference to its
++// buffer, so clearHandleCache() is called whenever a pool is torn down on
++// stream stop / DRC, and the freed pool's buffers go with it.
++std::mutex gHandleMutex;
++std::unordered_map<ino_t, uint32_t> gHandleCache;
++
++}  // namespace
++
+ // static
+ std::unique_ptr<VideoFrame> VideoFrame::Create(std::shared_ptr<C2GraphicBlock> block) {
+     if (!block) return nullptr;
+@@ -34,6 +72,93 @@ const std::vector<int>& VideoFrame::getFDs() const {
+     return mFds;
+ }
+ 
++namespace {
++
++// The virtio-gpu render node. One fd per process is enough.
++int virtgpuFd() {
++    static const int sFd = []() -> int {
++        const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
++        if (fd < 0) {
++            ALOGE("open(/dev/dri/renderD128) failed: %s", strerror(errno));
++        }
++        return fd;
++    }();
++    return sFd;
++}
++
++// Return the virtgpu GEM handle for a dmabuf fd (cached). Call with
++// gHandleMutex held. Returns false on failure.
++bool handleForFdLocked(int drmFd, int fd, uint32_t* out) {
++    struct stat st = {};
++    const bool haveIno = (fstat(fd, &st) == 0);
++
++    if (haveIno) {
++        const auto it = gHandleCache.find(st.st_ino);
++        if (it != gHandleCache.end()) {
++            *out = it->second;
++            return true;
++        }
++    }
++
++    struct drm_prime_handle prime = {};
++    prime.fd = fd;
++    if (ioctl(drmFd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &prime) != 0) {
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            ALOGE("PRIME_FD_TO_HANDLE(fd=%d) failed: %s", fd, strerror(errno));
++        }
++        return false;
++    }
++    *out = prime.handle;
++    if (haveIno) {
++        gHandleCache.emplace(st.st_ino, prime.handle);
++    }
++    return true;
++}
++
++}  // namespace
++
++uint32_t VideoFrame::virglResourceId() {
++    const int drmFd = virtgpuFd();
++    if (drmFd < 0 || mFds.empty()) return 0;
++
++    std::lock_guard<std::mutex> lock(gHandleMutex);
++    uint32_t handle = 0;
++    if (!handleForFdLocked(drmFd, mFds[0], &handle)) return 0;
++
++    struct drm_virtgpu_resource_info info = {};
++    info.bo_handle = handle;
++    if (ioctl(drmFd, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, &info) != 0) {
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            ALOGE("%s(): RESOURCE_INFO(handle=%u) failed: %s", __func__, handle,
++                  strerror(errno));
++        }
++        return 0;
++    }
++    return info.res_handle;
++}
++
++// static
++void VideoFrame::clearHandleCache() {
++    const int drmFd = virtgpuFd();
++    std::lock_guard<std::mutex> lock(gHandleMutex);
++    if (drmFd >= 0) {
++        for (const auto& [ino, handle] : gHandleCache) {
++            (void)ino;
++            struct drm_gem_close close_req = {};
++            close_req.handle = handle;
++            ioctl(drmFd, DRM_IOCTL_GEM_CLOSE, &close_req);
++        }
++    }
++    if (!gHandleCache.empty()) {
++        ALOGI("%s(): released %zu cached virtgpu handle(s)", __func__, gHandleCache.size());
++    }
++    gHandleCache.clear();
++}
++
+ void VideoFrame::setVisibleRect(const Rect& visibleRect) {
+     mVisibleRect = visibleRect;
+ }
+diff --git a/components/VideoFramePool.cpp b/components/VideoFramePool.cpp
+index 9927acf..85fd7f1 100644
+--- a/components/VideoFramePool.cpp
++++ b/components/VideoFramePool.cpp
+@@ -48,6 +48,49 @@ std::optional<uint32_t> VideoFramePool::getBufferIdFromGraphicBlock(C2BlockPool&
+     case V4L2AllocatorId::SECURE_LINEAR: {
+         std::shared_ptr<_C2BlockPoolData> blockPoolData =
+                 _C2BlockFactory::GetGraphicBlockPoolData(block);
++        // GetGraphicBlockPoolData() RETURNS nullptr FOR A BLOCK THAT CARRIES
++        // NO POOL DATA, AND UPSTREAM'S getType() BELOW DEREFERENCES IT BLIND.
++        //
++        // The branch already knows this block might not be bufferpool-backed --
++        // that is exactly what the next check reports -- but a block with no
++        // pool data at all reaches the same place and segfaults instead.
++        //
++        // Measured on RPi4 2026-09-03, the first time a decode got as far as
++        // allocating real output buffers (once SOURCE_CHANGE reached the guest
++        // and the DRC reordering let S_FMT through):
++        //
++        //   Need 25 output buffers. coded size: 176x144
++        //   (CAPTURE_MPLANE)Queue 9: got 25 buffers
++        //   F DEBUG: tid ... name: VideoFramePoolF
++        //   signal 11 (SIGSEGV), code 1 (SEGV_MAPERR)
++        //   #00 VideoFramePool::getBufferIdFromGraphicBlock(...)+208
++        //   #01 VideoFramePool::getVideoFrameTask()+512
++        if (!blockPoolData) {
++            // FALL BACK TO THE DMABUF'S OWN IDENTITY RATHER THAN GIVING UP.
++            //
++            // A block from a plain C2BasicGraphicBlockPool carries no pool
++            // data, and its allocator id is still GRALLOC, so it lands here.
++            // That is not an error case -- it is what a client which never
++            // called createBlockPool() hands the component, and VTS's
++            // non-surface mode is exactly that client. Refusing it makes
++            // every VTS video-decode test unrunnable while real playback
++            // (which goes through BUFFERQUEUE) works, so the decoder looks
++            // broken in the one place it is measured.
++            //
++            // All this id has to be is a stable per-buffer identity: it keys
++            // mBlockIdToV4L2Id and mFrameAtDevice in V4L2Decoder. The dmabuf
++            // inode is exactly that, and the BUFFERQUEUE branch above already
++            // uses it for the same purpose.
++            auto dmabufId = android::getDmabufId(block.handle()->data[0]);
++            if (!dmabufId) {
++                ALOGE("Obtained C2GraphicBlock has neither pool data nor a "
++                      "usable dmabuf id.");
++                return std::nullopt;
++            }
++            ALOGV("%s(): no pool data; using dmabuf id %u", __func__,
++                  static_cast<uint32_t>(*dmabufId));
++            return dmabufId.value();
++        }
+         if (blockPoolData->getType() != _C2BlockPoolData::TYPE_BUFFERPOOL) {
+             ALOGE("Obtained C2GraphicBlock is not bufferpool-backed.");
+             return std::nullopt;
+@@ -137,16 +180,9 @@ void VideoFramePool::destroyTask() {
+     mFetchWeakThisFactory.InvalidateWeakPtrs();
+ }
+ 
+-bool VideoFramePool::shouldDropBuffer(uint32_t bufferId) {
+-    if (mBuffers.size() < mMaxBufferCount) {
+-        return false;
+-    }
+ 
+-    if (mBuffers.find(bufferId) != mBuffers.end()) {
+-        return false;
+-    }
+-
+-    return true;
++bool VideoFramePool::needMoreFetchesLocked() {
++    return mPrefetched.size() + mFetchesInFlight < mPrefetchDepth;
+ }
+ 
+ bool VideoFramePool::getVideoFrame(GetVideoFrameCB cb) {
+@@ -158,8 +194,39 @@ bool VideoFramePool::getVideoFrame(GetVideoFrameCB cb) {
+     }
+ 
+     mOutputCb = std::move(cb);
+-    mFetchTaskRunner->PostTask(
+-            FROM_HERE, ::base::BindOnce(&VideoFramePool::getVideoFrameTask, mFetchWeakThis));
++
++    std::optional<FrameWithBlockId> ready;
++    bool failed = false;
++    bool fetch = false;
++    {
++        std::lock_guard<std::mutex> lock(mPrefetchLock);
++        if (!mPrefetched.empty()) {
++            ready = std::move(mPrefetched.front());
++            mPrefetched.pop_front();
++        } else if (mPrefetchFailed) {
++            // A prefetch failed while nobody was waiting; this request gets
++            // the failure (see getVideoFrameTask()).
++            mPrefetchFailed = false;
++            failed = true;
++        } else {
++            mWaiting++;
++        }
++        fetch = !failed && needMoreFetchesLocked();
++        if (fetch) mFetchesInFlight++;
++    }
++
++    // Keep the pipeline full whether or not this request was served locally.
++    if (fetch) {
++        mFetchTaskRunner->PostTask(
++                FROM_HERE, ::base::BindOnce(&VideoFramePool::getVideoFrameTask, mFetchWeakThis));
++    }
++    // Deliver on the client sequence, exactly as the fetch thread would, so the
++    // caller sees the same asynchronous contract as before.
++    if (ready || failed) {
++        mClientTaskRunner->PostTask(FROM_HERE,
++                                    ::base::BindOnce(&VideoFramePool::onVideoFrameReady,
++                                                     mClientWeakThis, std::move(ready)));
++    }
+     return true;
+ }
+ 
+@@ -180,10 +247,12 @@ void VideoFramePool::getVideoFrameTask() {
+ 
+     // Variables used to exponential backoff retry when buffer fetching times out.
+     constexpr size_t kFetchRetryDelayInit = 256;   // Initial delay: 256us
+-    constexpr size_t kFetchRetryDelayMax = 16384;  // Max delay: 16ms (1 frame at 60fps)
++    constexpr size_t kFetchRetryDelayMax = 4096;   // Max delay: 4ms
+     constexpr size_t kFenceWaitTimeoutNs = 16000000;  // 16ms (1 frame at 60fps)
+-    static size_t sNumRetries = 0;
+-    static size_t sDelay = kFetchRetryDelayInit;
++    // Per-pool backoff state: a function-local static would be shared by every
++    // VideoFramePool in the process, so one instance's backoff would carry over
++    // to the next one.
++    if (mFetchDelayUs == 0) mFetchDelayUs = kFetchRetryDelayInit;
+ 
+     C2Fence fence;
+     std::shared_ptr<C2GraphicBlock> block;
+@@ -205,6 +274,10 @@ void VideoFramePool::getVideoFrameTask() {
+         err = fence.wait(kFenceWaitTimeoutNs);
+         if (err == C2_OK) {
+             ALOGV("%s(): fence wait succeded, retrying now", __func__);
++            // The wait succeeded, so the queue is moving again: drop the
++            // backoff instead of carrying it into the retry.
++            mFetchDelayUs = kFetchRetryDelayInit;
++            mFetchRetries = 0;
+             mFetchTaskRunner->PostTask(
+                     FROM_HERE,
+                     ::base::BindOnce(&VideoFramePool::getVideoFrameTask, mFetchWeakThis));
+@@ -225,34 +298,92 @@ void VideoFramePool::getVideoFrameTask() {
+         if (bufferId) {
+             ALOGV("%s(): Got buffer with id = %u", __func__, *bufferId);
+ 
+-            if (shouldDropBuffer(*bufferId)) {
+-                // We drop buffer, since we got more then needed.
+-                ALOGV("%s(): Dropping allocated buffer with id = %u", __func__, *bufferId);
+-                bufferId = std::nullopt;
+-                block.reset();
+-                err = C2_TIMED_OUT;
+-            }
++            // DO NOT DROP A BLOCK JUST BECAUSE ITS ID IS NEW.
++            //
++            // Upstream calls shouldDropBuffer() here, which says yes once
++            // mBuffers -- every id ever seen, never erased -- reaches
++            // mMaxBufferCount and the id is not in it. The caller turns that
++            // into C2_TIMED_OUT, which re-posts this task with a backoff and
++            // NO retry limit, so with a pool whose ids never repeat every
++            // fetch from then on is dropped: a livelock in which the decoder
++            // never gets another output buffer, the works it holds never
++            // complete, and the client runs out of C2Work objects. Measured on
++            // RPi4 2026-09-03 as 21 of 24 VTS failures, all reported as "Wait
++            // for generating C2Work exceeded timeout" with nothing in any log.
++            //
++            // The invariant that matters -- never more simultaneously mapped
++            // blocks than there are V4L2 buffers -- belongs to V4L2Decoder,
++            // which enforces it directly by re-pointing a free V4L2 slot at an
++            // unseen block. So keep mBuffers bounded (it is only used to
++            // recognise ids we have seen) and hand the block over.
++            if (mBuffers.size() >= mMaxBufferCount && mBuffers.find(*bufferId) == mBuffers.end())
++                mBuffers.erase(mBuffers.begin());
+         }
+     }
+ 
+     if (err == C2_TIMED_OUT || err == C2_BLOCKING) {
+-        ALOGV("%s(): fetchGraphicBlock() timeout, waiting %zuus (%zu retry)", __func__, sDelay,
+-              sNumRetries + 1);
++        ALOGV("%s(): fetchGraphicBlock() timeout, waiting %zuus (%zu retry)", __func__,
++              mFetchDelayUs, mFetchRetries + 1);
+         mFetchTaskRunner->PostDelayedTask(
+                 FROM_HERE, ::base::BindOnce(&VideoFramePool::getVideoFrameTask, mFetchWeakThis),
+-                ::base::TimeDelta::FromMicroseconds(sDelay));
++                ::base::TimeDelta::FromMicroseconds(mFetchDelayUs));
+ 
+-        sDelay = std::min(sDelay * 4, kFetchRetryDelayMax);  // Exponential backoff
+-        sNumRetries++;
++        mFetchDelayUs = std::min(mFetchDelayUs * 4, kFetchRetryDelayMax);  // Exponential backoff
++        mFetchRetries++;
+         return;
+     }
+ 
+     // Reset to the default value.
+-    sNumRetries = 0;
+-    sDelay = kFetchRetryDelayInit;
++    mFetchRetries = 0;
++    mFetchDelayUs = kFetchRetryDelayInit;
+ 
+     if (err != C2_OK) {
++        // TELL THE CLIENT. RETURNING HERE IS A SILENT STALL.
++        //
++        // getVideoFrame() refuses a new request while one is in flight, and
++        // "in flight" is cleared by onVideoFrameReady(). Returning without
++        // posting it leaves the pool permanently busy: V4L2Decoder's
++        // tryFetchVideoFrame() asks once more, is told a callback is already
++        // running, and never asks again. The decoder then holds works that can
++        // never complete and the client runs out of C2Work objects -- reported
++        // by VTS as "Wait for generating C2Work exceeded timeout", with this
++        // ALOGE as the only clue and no connection drawn to it.
++        //
++        // Posting nullopt is the contract the success path already uses for a
++        // partial failure ("Otherwise exit the loop so a nullopt is passed to
++        // the client" below), and V4L2Decoder::onVideoFrameReady() turns it
++        // into onError(), so the client gets a real error instead of a
++        // timeout. It is posted only while a request waits: a failed prefetch
++        // has no mOutputCb to run, so it is kept in mPrefetchFailed and the
++        // next getVideoFrame() posts it.
++        //
++        // Measured on RPi4 2026-09-03. Every one of the 13 remaining VTS
++        // timeouts was the .secure instance, and all of them were this:
++        //   minigbm: Failed to allocate. Unsupported combination:
++        //            pixel format:YCBCR_420_888, usage:CPU_READ_NEVER |
++        //            CPU_WRITE_NEVER | PROTECTED | VIDEO_DECODER (0x404000)
++        //   C2AllocatorGralloc: failed transaction: allocate
++        //   VideoFramePool: getVideoFrameTask(): Failed to fetch block, err=14
++        // There is no protected memory on this platform, so the secure
++        // decoder cannot allocate output buffers at all -- a separate problem,
++        // but it should surface as an error and not as a hang.
+         ALOGE("%s(): Failed to fetch block, err=%d", __func__, err);
++        bool serve = false;
++        {
++            std::lock_guard<std::mutex> lock(mPrefetchLock);
++            if (mFetchesInFlight) mFetchesInFlight--;
++            if (mWaiting) {
++                mWaiting--;
++                serve = true;
++            } else {
++                mPrefetchFailed = true;
++            }
++        }
++        if (serve) {
++            mClientTaskRunner->PostTask(
++                    FROM_HERE, ::base::BindOnce(&VideoFramePool::onVideoFrameReady,
++                                                mClientWeakThis, std::nullopt));
++        }
+         return;
+     }
+ 
+@@ -269,9 +400,37 @@ void VideoFramePool::getVideoFrameTask() {
+         ALOGE("%s(): Failed to generate VideoFrame or get the buffer id.", __func__);
+     }
+ 
+-    mClientTaskRunner->PostTask(
+-            FROM_HERE, ::base::BindOnce(&VideoFramePool::onVideoFrameReady, mClientWeakThis,
+-                                        std::move(frameWithBlockId)));
++    bool serve = true;
++    bool fetch = false;
++    {
++        std::lock_guard<std::mutex> lock(mPrefetchLock);
++        if (mFetchesInFlight) mFetchesInFlight--;
++        if (mWaiting) {
++            mWaiting--;
++        } else if (frameWithBlockId) {
++            // Nobody is waiting: keep the block ready for the next request.
++            mPrefetched.push_back(std::move(*frameWithBlockId));
++            frameWithBlockId.reset();
++            serve = false;
++        } else {
++            // Nobody is waiting for this failure either: keep it for the next
++            // request, which turns nullopt into an error instead of a silent
++            // stall, and fetch nothing more until then.
++            mPrefetchFailed = true;
++            serve = false;
++        }
++        fetch = !mPrefetchFailed && needMoreFetchesLocked();
++        if (fetch) mFetchesInFlight++;
++    }
++    if (fetch) {
++        mFetchTaskRunner->PostTask(
++                FROM_HERE, ::base::BindOnce(&VideoFramePool::getVideoFrameTask, mFetchWeakThis));
++    }
++    if (serve) {
++        mClientTaskRunner->PostTask(
++                FROM_HERE, ::base::BindOnce(&VideoFramePool::onVideoFrameReady, mClientWeakThis,
++                                            std::move(frameWithBlockId)));
++    }
+ }
+ 
+ void VideoFramePool::onVideoFrameReady(std::optional<FrameWithBlockId> frameWithBlockId) {
+diff --git a/components/include/v4l2_codec2/components/DecodeComponent.h b/components/include/v4l2_codec2/components/DecodeComponent.h
+index 27905c7..c0935f2 100644
+--- a/components/include/v4l2_codec2/components/DecodeComponent.h
++++ b/components/include/v4l2_codec2/components/DecodeComponent.h
+@@ -108,6 +108,9 @@ protected:
+     // The works whose input buffers are sent to |mDecoder|. The key is the
+     // bitstream ID of work's input buffer.
+     std::map<int32_t, std::unique_ptr<C2Work>> mWorksAtDecoder;
++    // Number of output frames that arrived right after a flush and were dropped.
++    // Not an anomaly, but if it keeps growing the flush/DQBUF race is wider than expected.
++    size_t mStaleOutputFrames = 0;
+     // The bitstream ID of the works that output frames have been returned from |mDecoder|.
+     // The order is display order.
+     std::queue<int32_t> mOutputBitstreamIds;
+diff --git a/components/include/v4l2_codec2/components/DecodeInterface.h b/components/include/v4l2_codec2/components/DecodeInterface.h
+index 7e513c5..1ba85dd 100644
+--- a/components/include/v4l2_codec2/components/DecodeInterface.h
++++ b/components/include/v4l2_codec2/components/DecodeInterface.h
+@@ -79,6 +79,9 @@ private:
+     std::shared_ptr<C2StreamProfileLevelInfo::input> mProfileLevel;
+     // Decoded video size for output.
+     std::shared_ptr<C2StreamPictureSizeInfo::output> mSize;
++    // HAL pixel format of the decoded frames: RGBA_8888 or YCBCR_420_888,
++    // whichever V4L2Decoder negotiates (ro.vendor.v4l2_codec2.prefer_rgba).
++    std::shared_ptr<C2StreamPixelFormatInfo::output> mPixelFormat;
+     // Maximum size of one input buffer.
+     std::shared_ptr<C2StreamMaxBufferSizeInfo::input> mMaxInputSize;
+     // The suggested usage of input buffer allocator ID.
+diff --git a/components/include/v4l2_codec2/components/VideoFrame.h b/components/include/v4l2_codec2/components/VideoFrame.h
+index b5d7b99..d944201 100644
+--- a/components/include/v4l2_codec2/components/VideoFrame.h
++++ b/components/include/v4l2_codec2/components/VideoFrame.h
+@@ -35,6 +35,22 @@ public:
+     // Get the read-only C2GraphicBlock, should be called after calling setVisibleRect().
+     C2ConstGraphicBlock getGraphicBlock();
+ 
++    // The virgl resource id behind this dmabuf (res_handle from
++    // DRM_IOCTL_VIRTGPU_RESOURCE_INFO). 0 means it could not be obtained.
++    //
++    // It is carried in v4l2_buffer.reserved2 on QBUF. The virtio-media device
++    // model writes the decode result from its host buffer straight into this
++    // resource on DQBUF, so the guest does not transfer the frame itself. The
++    // guest pages are not updated (any CPU read path sees stale contents).
++    uint32_t virglResourceId();
++
++    // Drop the dmabuf inode -> virtgpu GEM handle cache.
++    //
++    // MUST be called whenever a pool is torn down on stream stop / DRC: each
++    // cached handle holds a reference to its buffer, so the old pool's buffers
++    // stay allocated until it is called.
++    static void clearHandleCache();
++
+ private:
+     VideoFrame(std::shared_ptr<C2GraphicBlock> block, std::vector<int> fds);
+ 
+diff --git a/components/include/v4l2_codec2/components/VideoFramePool.h b/components/include/v4l2_codec2/components/VideoFramePool.h
+index 6bebc37..074ff60 100644
+--- a/components/include/v4l2_codec2/components/VideoFramePool.h
++++ b/components/include/v4l2_codec2/components/VideoFramePool.h
+@@ -6,7 +6,9 @@
+ #define ANDROID_V4L2_CODEC2_COMPONENTS_VIDEO_FRAME_POOL_H
+ 
+ #include <atomic>
++#include <deque>
+ #include <memory>
++#include <mutex>
+ #include <optional>
+ #include <queue>
+ 
+@@ -60,14 +62,44 @@ private:
+     void getVideoFrameTask();
+     void onVideoFrameReady(std::optional<FrameWithBlockId> frameWithBlockId);
+ 
+-    // Returns true if a buffer shall not be handed to client.
+-    bool shouldDropBuffer(uint32_t bufferId);
+ 
+     static std::optional<uint32_t> getBufferIdFromGraphicBlock(C2BlockPool& blockPool,
+                                                                const C2Block2D& block);
+ 
++    // Post another getVideoFrameTask() if the pipeline is shallower than
++    // mPrefetchDepth. Call with mPrefetchLock held; it only counts, and the
++    // caller posts outside the lock.
++    bool needMoreFetchesLocked();
++
+     std::shared_ptr<C2BlockPool> mBlockPool;
+ 
++    // ---- graphic block prefetch ----
++    //
++    // Without this the pool keeps exactly one fetch in flight: getVideoFrame()
++    // refuses a request while mOutputCb is set, so every output frame pays a
++    // full BufferQueue round trip (client thread -> fetch thread ->
++    // fetchGraphicBlock() -> back) in series with the decode. Measured on RPi4
++    // 2026-09-06: the V4L2 CAPTURE queue was empty 36-61% of the wall clock
++    // while the hardware decoder had nothing to write into.
++    //
++    // The fetch thread keeps up to mPrefetchDepth blocks ready, so a request
++    // that arrives while a block is ready is served without any BufferQueue
++    // round trip. Blocks held here occupy BufferQueue slots, so the depth is 1.
++    std::mutex mPrefetchLock;
++    std::deque<FrameWithBlockId> mPrefetched;
++    // Client requests that arrived with no prefetched block ready.
++    size_t mWaiting = 0;
++    // A fetch failed while no request was waiting; the next getVideoFrame()
++    // reports it to the client.
++    bool mPrefetchFailed = false;
++    // getVideoFrameTask() calls posted and not yet finished (a retry that
++    // re-posts itself stays counted, it is still the same fetch).
++    size_t mFetchesInFlight = 0;
++    size_t mPrefetchDepth = 1;
++    // Exponential backoff state for getVideoFrameTask(), per pool.
++    size_t mFetchDelayUs = 0;
++    size_t mFetchRetries = 0;
++
+     // Holds the number of maximum amount of buffers that VideoFramePool
+     // should provide to client.
+     size_t mMaxBufferCount;
+diff --git a/service/android.hardware.media.c2@1.2-service-v4l2-32.rc b/service/android.hardware.media.c2@1.2-service-v4l2-32.rc
+index 4fe0ccb..55bdf34 100644
+--- a/service/android.hardware.media.c2@1.2-service-v4l2-32.rc
++++ b/service/android.hardware.media.c2@1.2-service-v4l2-32.rc
+@@ -1,7 +1,14 @@
+ service android-hardware-media-c2-v4l2-hal-1-2 /vendor/bin/hw/android.hardware.media.c2@1.2-service-v4l2-32
+     class hal
+     user media
+-    group mediadrm drmrpc
++    # Why camera is added (confirmed on the RPi4 board, 2026-09-01):
++    # ueventd makes /dev/video* 0660 system:camera. This service runs as
++    # user media, so without the camera group it cannot open the V4L2 devices
++    # (at the DAC level). SELinux emits no avc denial, so the cause is invisible:
++    # V4L2ComponentStore's probe reported decoder H264 as absent and not a single
++    # HW decode component was registered.
++    # Verified by measurement: chmod 0666 /dev/video* makes it present.
++    group mediadrm drmrpc camera
+     ioprio rt 4
+     task_profiles ProcessCapacityHigh
+     setenv MESA_GLSL_CACHE_DISABLE 1
+diff --git a/service/android.hardware.media.c2@1.2-service-v4l2-64.rc b/service/android.hardware.media.c2@1.2-service-v4l2-64.rc
+index 9869c6b..3e17f64 100644
+--- a/service/android.hardware.media.c2@1.2-service-v4l2-64.rc
++++ b/service/android.hardware.media.c2@1.2-service-v4l2-64.rc
+@@ -1,7 +1,14 @@
+ service android-hardware-media-c2-v4l2-hal-1-2 /vendor/bin/hw/android.hardware.media.c2@1.2-service-v4l2-64
+     class hal
+     user media
+-    group mediadrm drmrpc
++    # Why camera is added (confirmed on the RPi4 board, 2026-09-01):
++    # ueventd makes /dev/video* 0660 system:camera. This service runs as
++    # user media, so without the camera group it cannot open the V4L2 devices
++    # (at the DAC level). SELinux emits no avc denial, so the cause is invisible:
++    # V4L2ComponentStore's probe reported decoder H264 as absent and not a single
++    # HW decode component was registered.
++    # Verified by measurement: chmod 0666 /dev/video* makes it present.
++    group mediadrm drmrpc camera
+     ioprio rt 4
+     task_profiles ProcessCapacityHigh
+     setenv MESA_GLSL_CACHE_DISABLE 1
+diff --git a/v4l2/V4L2ComponentStore.cpp b/v4l2/V4L2ComponentStore.cpp
+index 927a4c0..48a0d6c 100644
+--- a/v4l2/V4L2ComponentStore.cpp
++++ b/v4l2/V4L2ComponentStore.cpp
+@@ -20,8 +20,45 @@
+ #include <v4l2_codec2/components/ComponentStore.h>
+ #include <v4l2_codec2/v4l2/V4L2ComponentCommon.h>
+ #include <v4l2_codec2/v4l2/V4L2ComponentFactory.h>
++#include <v4l2_codec2/v4l2/V4L2Device.h>
+ 
+ namespace android {
++namespace {
++
++// LOCAL CHANGE for this product.
++//
++// Upstream registers all eleven components below unconditionally: neither this
++// function nor ComponentStore::getTraits() ever looks at a device, so the store
++// advertises c2.v4l2.avc.decoder even when there is no V4L2 decoder at all.
++//
++// That is fine on a board whose decoder is soldered on, and wrong here. This is
++// a Xen guest (DomA) with no video hardware of its own: /dev/video* appears only
++// when the device model exports one, and whether it does is decided by the
++// config DomA is created from --
++//
++//     no virtio-media device in the config   -> no /dev/video*
++//     virtio-media-pci in the config         -> /dev/video* appears
++//
++// -- so one image legitimately runs both ways. Advertising a hardware decoder
++// on a boot without the device would have the framework select
++// c2.v4l2.avc.decoder and fail inside V4L2Decoder::start() instead of using a
++// software decoder.
++//
++// So ask the device before claiming the codec. Registering nothing is safe:
++// ComponentStore::listComponents() just walks its (then empty) declaration map,
++// and Codec2InfoBuilder starts from the traits it gets back, so an empty store
++// contributes no entry to the codec list and playback falls to software.
++bool haveDevice(V4L2Device::Type type, VideoCodec codec, const char* codecName) {
++    const bool ok = !V4L2Device::getSupportedProfiles(
++                             type, {V4L2Device::videoCodecToPixFmt(codec)})
++                             .empty();
++    ALOGI("%s(): %s %s: %s", __func__,
++          type == V4L2Device::Type::kDecoder ? "decoder" : "encoder", codecName,
++          ok ? "present" : "absent");
++    return ok;
++}
++
++}  // namespace
+ 
+ // static
+ std::shared_ptr<C2ComponentStore> V4L2ComponentStore::Create() {
+@@ -36,26 +73,58 @@ std::shared_ptr<C2ComponentStore> V4L2ComponentStore::Create() {
+ 
+     auto builder = ComponentStore::Builder("android.componentStore.v4l2");
+ 
+-    builder.encoder(V4L2ComponentName::kH264Encoder, VideoCodec::H264,
+-                    &V4L2ComponentFactory::create);
+-    builder.encoder(V4L2ComponentName::kVP8Encoder, VideoCodec::VP8, &V4L2ComponentFactory::create);
+-    builder.encoder(V4L2ComponentName::kVP9Encoder, VideoCodec::VP9, &V4L2ComponentFactory::create);
+-
+-    builder.decoder(V4L2ComponentName::kH264Decoder, VideoCodec::H264,
+-                    &V4L2ComponentFactory::create);
+-    builder.decoder(V4L2ComponentName::kVP8Decoder, VideoCodec::VP8, &V4L2ComponentFactory::create);
+-    builder.decoder(V4L2ComponentName::kVP9Decoder, VideoCodec::VP9, &V4L2ComponentFactory::create);
+-    builder.decoder(V4L2ComponentName::kHEVCDecoder, VideoCodec::HEVC,
+-                    &V4L2ComponentFactory::create);
+-
+-    builder.decoder(V4L2ComponentName::kH264SecureDecoder, VideoCodec::H264,
+-                    &V4L2ComponentFactory::create);
+-    builder.decoder(V4L2ComponentName::kVP8SecureDecoder, VideoCodec::VP8,
+-                    &V4L2ComponentFactory::create);
+-    builder.decoder(V4L2ComponentName::kVP9SecureDecoder, VideoCodec::VP9,
+-                    &V4L2ComponentFactory::create);
+-    builder.decoder(V4L2ComponentName::kHEVCSecureDecoder, VideoCodec::HEVC,
+-                    &V4L2ComponentFactory::create);
++    // Each probe enumerates /dev/video*, opens each node and asks it for the
++    // profiles it supports for this pixel format (V4L2Device.cpp
++    // getSupportedProfiles). It runs once, at C2 service start.
++    const bool encH264 = haveDevice(V4L2Device::Type::kEncoder, VideoCodec::H264, "H264");
++    const bool encVP8 = haveDevice(V4L2Device::Type::kEncoder, VideoCodec::VP8, "VP8");
++    const bool encVP9 = haveDevice(V4L2Device::Type::kEncoder, VideoCodec::VP9, "VP9");
++    const bool decH264 = haveDevice(V4L2Device::Type::kDecoder, VideoCodec::H264, "H264");
++    const bool decVP8 = haveDevice(V4L2Device::Type::kDecoder, VideoCodec::VP8, "VP8");
++    const bool decVP9 = haveDevice(V4L2Device::Type::kDecoder, VideoCodec::VP9, "VP9");
++    const bool decHEVC = haveDevice(V4L2Device::Type::kDecoder, VideoCodec::HEVC, "HEVC");
++
++    if (encH264)
++        builder.encoder(V4L2ComponentName::kH264Encoder, VideoCodec::H264,
++                        &V4L2ComponentFactory::create);
++    if (encVP8)
++        builder.encoder(V4L2ComponentName::kVP8Encoder, VideoCodec::VP8,
++                        &V4L2ComponentFactory::create);
++    if (encVP9)
++        builder.encoder(V4L2ComponentName::kVP9Encoder, VideoCodec::VP9,
++                        &V4L2ComponentFactory::create);
++
++    if (decH264)
++        builder.decoder(V4L2ComponentName::kH264Decoder, VideoCodec::H264,
++                        &V4L2ComponentFactory::create);
++    if (decVP8)
++        builder.decoder(V4L2ComponentName::kVP8Decoder, VideoCodec::VP8,
++                        &V4L2ComponentFactory::create);
++    if (decVP9)
++        builder.decoder(V4L2ComponentName::kVP9Decoder, VideoCodec::VP9,
++                        &V4L2ComponentFactory::create);
++    if (decHEVC)
++        builder.decoder(V4L2ComponentName::kHEVCDecoder, VideoCodec::HEVC,
++                        &V4L2ComponentFactory::create);
++
++    // The .secure variants ride the same probe. They additionally need Widevine
++    // and a secure allocator, neither of which exists on this product, so they
++    // would be unusable even where the device is present -- but there is no
++    // media_codecs_c2.xml entry for them either, and Codec2InfoBuilder drops a
++    // trait with no XML entry, so gating them here is enough and keeps this
++    // block shaped like upstream.
++    if (decH264)
++        builder.decoder(V4L2ComponentName::kH264SecureDecoder, VideoCodec::H264,
++                        &V4L2ComponentFactory::create);
++    if (decVP8)
++        builder.decoder(V4L2ComponentName::kVP8SecureDecoder, VideoCodec::VP8,
++                        &V4L2ComponentFactory::create);
++    if (decVP9)
++        builder.decoder(V4L2ComponentName::kVP9SecureDecoder, VideoCodec::VP9,
++                        &V4L2ComponentFactory::create);
++    if (decHEVC)
++        builder.decoder(V4L2ComponentName::kHEVCSecureDecoder, VideoCodec::HEVC,
++                        &V4L2ComponentFactory::create);
+ 
+     store = std::shared_ptr<C2ComponentStore>(std::move(builder).build());
+     platformStore = store;
+diff --git a/v4l2/V4L2Decoder.cpp b/v4l2/V4L2Decoder.cpp
+index 182c196..de9c87d 100644
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -13,6 +13,8 @@
+ #include <algorithm>
+ #include <vector>
+ 
++#include <cutils/properties.h>
++
+ #include <base/bind.h>
+ #include <base/files/scoped_file.h>
+ #include <base/memory/ptr_util.h>
+@@ -31,6 +33,152 @@ namespace {
+ // Extra buffers for transmitting in the whole video pipeline.
+ constexpr size_t kNumExtraOutputBuffers = 4;
+ 
++// THE V4L2 CAPTURE FOURCC HAS TO MATCH THE LAYOUT GRALLOC HANDED US, AND
++// PICKING IT IN THE DEVICE'S ENUMERATION ORDER DOES NOT.
++//
++// The decoder writes into a gralloc buffer whose layout is fixed: for a YUV
++// capture format the frame pool is YCBCR_420_888 (halFormatForFourcc()), and
++// gralloc resolves that to semi-planar NV12 (Y plane, then interleaved CbCr).
++// The V4L2 format only says how the producer lays the bytes out, so if the two
++// disagree the consumer reads chroma out of a luma-shaped hole: the picture
++// looks nearly right and every checksum is wrong.
++//
++// Upstream's setupOutputFormat() walks the device's ENUM_FMT order and takes
++// the first entry that appears in kSupportedOutputFourccs -- a set, not an
++// order. bcm2835-codec enumerates YU12 (planar I420) first, so that is what is
++// chosen, and the decoded frames are written planar into a semi-planar
++// buffer. Measured on RPi4 2026-09-03, the first run in which VTS actually
++// decoded (the 16 DecodeTest cases had been skipping out until
++// C2_PARAMKEY_PIXEL_FORMAT was declared): 100 checksum mismatches at
++// VtsHalMediaC2V1_0TargetVideoDecTest.cpp:259, the memcmp against the
++// reference md5. Nothing else in the pipeline reported a problem.
++//
++// So drive the choice from OUR preference and intersect it with the device's
++// set. Semi-planar first, because that is what the pool gives us. The planar
++// entries stay as a last resort for a device that offers nothing else -- with
++// a warning, because on such a device the chroma WILL be wrong: the pool is
++// YCBCR_420_888 for every YUV format.
++constexpr std::initializer_list<uint32_t> kPreferredOutputFourccs = {
++        // Semi-planar, CbCr order: what HAL_PIXEL_FORMAT_YCBCR_420_888 is.
++        Fourcc::NV12,
++        Fourcc::NM12,
++        // Semi-planar, CrCb order: right shape, swapped chroma.
++        Fourcc::NV21,
++        Fourcc::NM21,
++        // Planar: wrong shape. Only if the device offers nothing better.
++        Fourcc::YU12,
++        Fourcc::YM12,
++        Fourcc::YV12,
++        Fourcc::YM21,
++};
++
++// THE RGB PREFERENCE, FOR A GUEST WHOSE GPU CANNOT SAMPLE YUV.
++//
++// Decoded frames reach the screen as a GL texture: WebView decodes into an
++// ImageReader and samples it, and every SurfaceFlinger layer here is
++// composition=CLIENT, so there is no overlay to fall back on. Sampling a YUV
++// EGLImage needs driver support this guest does not have -- Mesa/virgl
++// (V3D 4.2.14.0, GLES 3.1) advertises GL_OES_EGL_image_external but NOT
++// GL_EXT_YUV_target. Measured on RPi4 2026-09-03: 18 NV12 ImageReader buffers
++// were allocated and the decoder ran at ~31 fps, and the page stayed black
++// while Chromium logged
++//   image_reader_gl_owner.cc:297  number of concurrently acquired images has
++//                                 reached the limit
++// -- images acquired and never releasable, because they cannot be turned into
++// textures.
++//
++// bcm2835-codec can do the YUV-to-RGB itself: its decode CAPTURE queue offers
++// AB24 (RGBA8888), BGR4 (BGRA) and RGBP (RGB565) alongside the YUV formats,
++// and asking for AB24 was verified end to end on the host with a user-space
++// V4L2 test: 60 correct frames, bytesperline 704 = 176*4 with no padding at
++// all.
++//
++// It costs bandwidth: 4 bytes per pixel instead of 1.5.
++//
++// It is on by default: see preferRgbOutput().
++constexpr std::initializer_list<uint32_t> kPreferredRgbFourccs = {
++        Fourcc::AB24,  // 32bpp RGBA, V4L2_PIX_FMT_RGBA32
++        Fourcc::XB24,  // 32bpp RGBX
++        Fourcc::AR24,  // 32bpp BGRA
++        Fourcc::XR24,  // 32bpp BGRX
++};
++
++bool preferRgbOutput() {
++    // True by default. The guest's GL driver has no GL_EXT_YUV_target
++    // (measured 2026-09-03: Mesa 25.3.6 / virgl (V3D 4.2.14.0) / OpenGL ES 3.1,
++    //  GL_EXT_YUV_target = 0, GL_OES_EGL_image_external = 1).
++    // An NV12 EGLImage cannot be made into a texture, so if the decoder emits NV12
++    // the video area stays black even when the frame arrives correctly.
++    // bcm2835-codec can emit AB24, so let the decoder do the YUV->RGB.
++    //
++    // DecodeInterface reads the same property with the same default to declare
++    // C2StreamPixelFormatInfo, so the advertised and the negotiated format agree.
++    //
++    // The cost is in DomD's CMA: a 720p RGBA buffer (3686400 B) is an order-10
++    // contiguous allocation, measured to fail at cma=128M.
++    static const bool sPrefer =
++            property_get_bool("ro.vendor.v4l2_codec2.prefer_rgba", true);
++    return sPrefer;
++}
++
++// Bytes per pixel of ONE ROW of plane 0, which is what bytesperline counts.
++// For the YUV formats here that is 1 (the luma row); for the 32bpp RGB ones, 4.
++uint32_t rowBytesPerPixel(uint32_t fourcc) {
++    switch (fourcc) {
++    case Fourcc::AB24:
++    case Fourcc::XB24:
++    case Fourcc::AR24:
++    case Fourcc::XR24:
++        return 4;
++    default:
++        return 1;
++    }
++}
++
++// The HAL pixel format that matches a negotiated V4L2 fourcc, for the frame
++// pool. Only the two shapes this decoder can end up with are listed; anything
++// else means the fourcc lists above and this function have drifted apart.
++HalPixelFormat halFormatForFourcc(uint32_t fourcc) {
++    switch (fourcc) {
++    case Fourcc::AB24:
++    case Fourcc::XB24:
++    case Fourcc::AR24:
++    case Fourcc::XR24:
++        return HalPixelFormat::RGBA_8888;
++    default:
++        return HalPixelFormat::YCBCR_420_888;
++    }
++}
++
++// Device capture formats we can use, in the order we want to try them.
++std::vector<uint32_t> orderedOutputFourccs(V4L2Device* device) {
++    const std::vector<uint32_t> offered =
++            device->enumerateSupportedPixelformats(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++    std::vector<uint32_t> candidates;
++
++    if (preferRgbOutput()) {
++        for (const uint32_t preferred : kPreferredRgbFourccs) {
++            if (std::find(offered.begin(), offered.end(), preferred) != offered.end())
++                candidates.push_back(preferred);
++        }
++        ALOGI("%s(): prefer_rgba is set; %zu RGB candidate(s) offered", __func__,
++              candidates.size());
++    }
++    for (const uint32_t preferred : kPreferredOutputFourccs) {
++        if (std::find(offered.begin(), offered.end(), preferred) != offered.end())
++            candidates.push_back(preferred);
++    }
++
++    if (!candidates.empty() && candidates.front() != Fourcc::NV12 &&
++        candidates.front() != Fourcc::NM12 &&
++        halFormatForFourcc(candidates.front()) != HalPixelFormat::RGBA_8888) {
++        ALOGW("No semi-planar capture format offered; falling back to %s. Chroma will not "
++              "match the YCBCR_420_888 buffers the frame pool allocates.",
++              fourccToString(candidates.front()).c_str());
++    }
++    return candidates;
++}
++
+ bool waitForDRC(const C2ConstLinearBlock& input, std::optional<VideoCodec> codec) {
+     C2ReadView view = input.map().get();
+     const uint8_t* pos = view.data();
+@@ -95,6 +243,10 @@ V4L2Decoder::~V4L2Decoder() {
+     if (mOutputQueue) {
+         mOutputQueue->streamoff();
+         mOutputQueue->deallocateBuffers();
++        // The pool this described is gone. Each cached virtgpu GEM handle
++        // holds a reference to its buffer, so close them rather than keep the
++        // freed pool's buffers alive until the next pool is torn down.
++        VideoFrame::clearHandleCache();
+         mOutputQueue = nullptr;
+     }
+     if (mInputQueue) {
+@@ -111,6 +263,48 @@ V4L2Decoder::~V4L2Decoder() {
+     }
+ }
+ 
++// Queue a buffer whose backing store is a set of dmabuf fds.
++bool V4L2Decoder::queueBufferWithFds(V4L2WritableBufferRef buffer,
++                                     const std::vector<int>& fds, uint32_t hostXferRes) {
++    // Tell the device model this buffer's virgl resource id: it writes the
++    // decoded frame straight into that resource on DQBUF.
++    if (hostXferRes != 0) {
++        buffer.setReserved2(hostXferRes);
++    }
++
++    // Hand the device exactly as many fds as the V4L2 format has planes.
++    //
++    // A gralloc handle carries one fd per PLANE, but minigbm puts all planes of
++    // a YUV buffer in a SINGLE bo and duplicates the same fd, so fds[0] already
++    // covers the whole allocation. The V4L2 side here negotiated a single-plane
++    // NV12 (bcm2835-codec reached through virtio-media), so passing all three
++    // was rejected. Measured on RPi4 2026-09-01:
++    //     V4L2Device: Provided 3 pointers while we require 1.
++    //     V4L2Decoder: Failed to queue initial EOS buffer
++    // (queueDMABuf() checks the count against the format, see
++    // V4L2Device.cpp's checkNumFDsForFormat).
++    //
++    // Truncating rather than erroring out is safe *because* the fds alias one
++    // bo. If a gralloc ever returns genuinely separate allocations per plane
++    // while V4L2 asks for one plane, the layouts are incompatible anyway and
++    // the copy would have to be explicit -- hence the log, so that case is
++    // visible instead of silently producing garbage.
++    const size_t wantPlanes = buffer.planesCount();
++    std::vector<int> useFds = fds;
++    if (useFds.size() > wantPlanes) {
++        // Once per decoder: on the YUV path this is every QBUF.
++        if (!mLoggedFdTruncation) {
++            ALOGI("%s(): %zu dmabuf fd(s) for a %zu-plane V4L2 buffer; using the first "
++                  "%zu (minigbm aliases one bo across planes)",
++                  __func__, fds.size(), wantPlanes, wantPlanes);
++            mLoggedFdTruncation = true;
++        }
++        useFds.resize(wantPlanes);
++    }
++
++    return std::move(buffer).queueDMABuf(useFds);
++}
++
+ bool V4L2Decoder::start(const VideoCodec& codec, const size_t inputBufferSize,
+                         const size_t minNumOutputBuffers, GetPoolCB getPoolCb, OutputCB outputCb,
+                         ErrorCB errorCb, bool isSecure) {
+@@ -238,12 +432,46 @@ bool V4L2Decoder::setupInitialOutput() {
+         return false;
+     }
+ 
++    // The usage is USAGE_HW_TEXTURE and the SW flags, in place of upstream's
++    // USAGE_HW_VIDEO_ENCODER.
++    // Measured on RPi4 + virtio-gpu/virgl + minigbm gralloc (2026-09-01), the
++    // upstream encoder-only usage is rejected outright:
++    //   android.hardware.graphics.allocator-service.minigbm: Failed to allocate.
++    //     Unsupported combination: pixel format:YCBCR_420_888,
++    //     drm format:DRM_FOURCC_9999,
++    //     usage:CPU_READ_NEVER | CPU_WRITE_NEVER | VIDEO_ENCODER (0x10000)
++    //   GraphicBufferAllocator: Failed to allocate (32 x 32) layerCount 1
++    //     format 35 usage 10000: -2147483648
++    // (DRM_FOURCC_9999 is minigbm's DRM_FORMAT_FLEX_YCbCr_420_888, printed
++    // before resolution; the 3D resolver maps it to NV12.) minigbm's virgl
++    // backend registers NV12 as
++    //   BO_USE_TEXTURE_MASK | BO_USE_CAMERA_READ | ... |
++    //   BO_USE_HW_VIDEO_ENCODER | BO_USE_SCANOUT
++    // and virgl_add_combination() drops the whole entry when the host cannot
++    // support the requested flag set, so a usage of encoder-only finds no
++    // combination to match.
++    //
++    // This buffer is only ever queued as the initial EOS marker, so changing
++    // its usage costs nothing functionally.
++    // Same format as the pool will use: gralloc validates the
++    // format-plus-usage combination, and a YUV buffer here with an RGBA pool
++    // later would be two different allocations for one pipeline.
+     mInitialEosBuffer =
+             new GraphicBuffer(mCodedSize.getWidth(), mCodedSize.getHeight(),
+-                              static_cast<PixelFormat>(HalPixelFormat::YCBCR_420_888),
+-                              GraphicBuffer::USAGE_HW_VIDEO_ENCODER, "V4L2DecodeComponent");
++                              static_cast<PixelFormat>(
++                                      preferRgbOutput() ? HalPixelFormat::RGBA_8888
++                                                        : HalPixelFormat::YCBCR_420_888),
++                              GraphicBuffer::USAGE_HW_TEXTURE |
++                                      GraphicBuffer::USAGE_SW_READ_OFTEN |
++                                      GraphicBuffer::USAGE_SW_WRITE_OFTEN,
++                              "V4L2DecodeComponent");
+ 
+     if (mInitialEosBuffer->initCheck() != NO_ERROR) {
++        // Upstream returns without logging here, which is why the failure
++        // surfaced only as the caller's "Unable to setup initial output".
++        ALOGE("Failed to allocate initial EOS GraphicBuffer (%dx%d): %d",
++              mCodedSize.getWidth(), mCodedSize.getHeight(),
++              mInitialEosBuffer->initCheck());
+         return false;
+     }
+ 
+@@ -252,7 +480,7 @@ bool V4L2Decoder::setupInitialOutput() {
+         fds.push_back(mInitialEosBuffer->handle->data[i]);
+     }
+ 
+-    if (!std::move(*eosBuffer).queueDMABuf(fds)) {
++    if (!queueBufferWithFds(std::move(*eosBuffer), fds)) {
+         ALOGE("Failed to queue initial EOS buffer");
+         return false;
+     }
+@@ -263,14 +491,8 @@ bool V4L2Decoder::setupInitialOutput() {
+ bool V4L2Decoder::setupMinimalOutputFormat() {
+     ui::Size minResolution, maxResolution;
+ 
+-    for (const uint32_t& pixfmt :
+-         mDevice->enumerateSupportedPixelformats(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)) {
+-        if (std::find(kSupportedOutputFourccs.begin(), kSupportedOutputFourccs.end(), pixfmt) ==
+-            kSupportedOutputFourccs.end()) {
+-            ALOGD("Pixel format %s is not supported, skipping...", fourccToString(pixfmt).c_str());
+-            continue;
+-        }
+-
++    // Our preference order, not the device's -- see kPreferredOutputFourccs.
++    for (const uint32_t pixfmt : orderedOutputFourccs(mDevice.get())) {
+         mDevice->getSupportedResolution(pixfmt, &minResolution, &maxResolution);
+         if (minResolution.isEmpty()) {
+             minResolution.set(128, 128);
+@@ -296,6 +518,49 @@ bool V4L2Decoder::startOutputQueue(size_t minOutputBuffersCount, enum v4l2_memor
+     }
+     *numOutputBuffers = std::max(*numOutputBuffers, minOutputBuffersCount);
+ 
++    // RELEASE THE QUEUE BEFORE VIDIOC_S_FMT, NOT AFTER.
++    //
++    // Upstream releases the queue below setupOutputFormat(), which makes the
++    // second call of this function -- the dynamic-resolution-change path from
++    // changeResolution() -- issue S_FMT on a queue that still has buffers.
++    // vidioc_s_fmt() checks vb2_is_busy() first and returns EBUSY, and
++    // vb2_is_busy() is "num_buffers > 0", so STREAMOFF alone would not be
++    // enough either. The V4L2 stateful decoder contract is explicit about
++    // the order: STREAMOFF, REQBUFS(0), S_FMT, REQBUFS, STREAMON.
++    //
++    // Measured on RPi4 2026-09-03, once V4L2_EVENT_SOURCE_CHANGE reached the
++    // guest:
++    //
++    //   guest:  (CAPTURE_MPLANE)Failed to set format (format_fourcc=0x32315559)
++    //           ... the same for YV12, NV12, NV21, then
++    //           Failed to find supported pixel format
++    //           Failed to start output queue during DRC.
++    //   DomD:   bcm2835-codec: vidioc_s_fmt queue busy      x4, one per fourcc
++    //
++    // Four attempts, four EBUSY, and the fourcc list is setupOutputFormat()'s.
++    //
++    // Nothing between here and the allocation below depends on the buffers: the
++    // codedSize handed to setupOutputFormat() comes from the G_FMT above, and
++    // releasing a queue does not change the driver's format. The bookkeeping
++    // that mirrors the buffer state (mFrameAtDevice, mBlockIdToV4L2Id,
++    // mReuseFrameQueue) moves with the release, which is where it belongs.
++    if (mOutputQueue->isStreaming()) {
++        mOutputQueue->streamoff();
++    }
++    if (mOutputQueue->allocatedBuffersCount() > 0) {
++        mOutputQueue->deallocateBuffers();
++    }
++
++    mFrameAtDevice.clear();
++    mBlockIdToV4L2Id.clear();
++    while (!mReuseFrameQueue.empty()) {
++        mReuseFrameQueue.pop();
++    }
++    // This is where the last C2GraphicBlock references drop. Each cached
++    // virtgpu GEM handle holds a reference to its buffer, so close them, or
++    // the old pool's buffers would stay allocated beside the new pool's.
++    VideoFrame::clearHandleCache();
++
+     const ui::Size codedSize(format->fmt.pix_mp.width, format->fmt.pix_mp.height);
+     if (!setupOutputFormat(codedSize)) {
+         return false;
+@@ -315,19 +580,6 @@ bool V4L2Decoder::startOutputQueue(size_t minOutputBuffersCount, enum v4l2_memor
+         return false;
+     }
+ 
+-    if (mOutputQueue->isStreaming()) {
+-        mOutputQueue->streamoff();
+-    }
+-    if (mOutputQueue->allocatedBuffersCount() > 0) {
+-        mOutputQueue->deallocateBuffers();
+-    }
+-
+-    mFrameAtDevice.clear();
+-    mBlockIdToV4L2Id.clear();
+-    while (!mReuseFrameQueue.empty()) {
+-        mReuseFrameQueue.pop();
+-    }
+-
+     const size_t adjustedNumOutputBuffers =
+             mOutputQueue->allocateBuffers(*numOutputBuffers, memory);
+     if (adjustedNumOutputBuffers == 0) {
+@@ -518,7 +770,7 @@ void V4L2Decoder::pumpDecodeRequest() {
+         inputBuffer->setPlaneBytesUsed(0, request.buffer->offset + request.buffer->size);
+         std::vector<int> fds;
+         fds.push_back(std::move(request.buffer->dmabuf.handle()->data[0]));
+-        if (!std::move(*inputBuffer).queueDMABuf(fds)) {
++        if (!queueBufferWithFds(std::move(*inputBuffer), fds)) {
+             ALOGE("%s(): Failed to QBUF to input queue, bitstreamId=%d", __func__, bitstreamId);
+             onError();
+             return;
+@@ -679,7 +931,8 @@ void V4L2Decoder::serviceDeviceTask(bool event) {
+             auto outputBuffer = mOutputQueue->getFreeBuffer(bufferId);
+             ALOG_ASSERT(outputBuffer, "V4L2 output queue slot %zu is not freed.", bufferId);
+ 
+-            if (!std::move(*outputBuffer).queueDMABuf(frame->getFDs())) {
++            if (!queueBufferWithFds(std::move(*outputBuffer), frame->getFDs(),
++                                    frame->virglResourceId())) {
+                 ALOGE("%s(): Failed to recycle empty buffer to output queue.", __func__);
+                 onError();
+                 return;
+@@ -756,11 +1009,68 @@ bool V4L2Decoder::changeResolution() {
+     // Release the previous VideoFramePool before getting a new one to guarantee only one pool
+     // exists at the same time.
+     mVideoFramePool.reset();
+-    // Always use flexible pixel 420 format YCBCR_420_888 in Android.
+-    mVideoFramePool = mGetPoolCb.Run(mCodedSize, HalPixelFormat::YCBCR_420_888,
++
++    // ASK THE POOL FOR THE DEVICE'S STRIDE, NOT THE CODED WIDTH.
++    //
++    // The device writes rows bytesperline apart, and gralloc picks its own
++    // stride from the width it is handed. Those are different numbers whenever
++    // the device aligns and gralloc does not, and then every row after the
++    // first lands at the wrong offset -- a sheared picture that only a checksum
++    // notices. On a real V4L2 device the driver imports the gralloc buffer and
++    // writes it with the buffer's own stride, so the mismatch is harmless; the
++    // virtio-media device model cannot do that, because it copies its host
++    // buffer into the guest's byte for byte with no stride translation
++    // (virtio_media_sg_copy() in hw/virtio/virtio-media.c).
++    //
++    // Measured on RPi4 2026-09-03, 176x144 H.264:
++    //   capture format NV12 at 176x144, bytesperline=192 sizeimage=41472
++    //   dmabuf fd 11 is 40960 bytes; V4L2 plane 0 is 41472
++    // 40960 is 38016 (stride 176) rounded up to 10 pages, so gralloc used the
++    // coded width unaligned while the device wanted 192. Result: 100 checksum
++    // mismatches in VTS DecodeTest and nothing else complaining.
++    //
++    // Requesting bytesperline pixels of width makes gralloc lay the buffer out
++    // exactly as the device fills it. The visible rect stays mVisibleRect, so
++    // the client still sees 176x144 -- this is the ordinary aligned-decode
++    // arrangement, not a hack. Height is left alone: sizeimage /
++    // bytesperline / 1.5 came out at exactly mCodedSize.height here, and
++    // guessing a padded height from sizeimage would break the moment a device
++    // pads differently.
++    // bytesperline IS BYTES, THE POOL WANTS PIXELS. Dividing by the row's
++    // bytes-per-pixel is not optional: with AB24 a 1280-pixel frame has
++    // bytesperline 5120 (= 1280 * 4), measured on RPi4 2026-09-03.
++    ui::Size poolSize = mCodedSize;
++    const auto negotiated = mOutputQueue->getFormat().first;
++    if (negotiated) {
++        const uint32_t fourcc = negotiated->fmt.pix_mp.pixelformat;
++        const uint32_t bpl = negotiated->fmt.pix_mp.plane_fmt[0].bytesperline;
++        const uint32_t stridepx = bpl / rowBytesPerPixel(fourcc);
++
++        if (stridepx > static_cast<uint32_t>(mCodedSize.width)) {
++            poolSize.setWidth(static_cast<int32_t>(stridepx));
++            ALOGI("%s(): pool width %d -> %u px (bytesperline %u, %u B/px)", __func__,
++                  mCodedSize.width, stridepx, bpl, rowBytesPerPixel(fourcc));
++        }
++    }
++
++    // THE POOL FORMAT FOLLOWS THE NEGOTIATED FOURCC, IT IS NOT A CONSTANT.
++    //
++    // Upstream hardcodes YCBCR_420_888 here, which is right only while the
++    // capture queue is YUV. With ro.vendor.v4l2_codec2.prefer_rgba the decoder
++    // negotiates AB24 and the buffers have to be RGBA, or the client would map
++    // RGBA bytes through a YUV layout. halFormatForFourcc() is the single place
++    // that mapping lives; kPreferredRgbFourccs explains why RGB is on the table
++    // at all.
++    const uint32_t capFourcc = negotiated ? negotiated->fmt.pix_mp.pixelformat : 0;
++    const HalPixelFormat poolFormat = halFormatForFourcc(capFourcc);
++    ALOGI("%s(): pool %s %s(0x%x) x%zu (capture fourcc %.4s = 0x%08x, AB24 = 0x%08x)", __func__,
++          toString(poolSize).c_str(), HalPixelFormatToString(poolFormat),
++          static_cast<uint32_t>(poolFormat), mOutputQueue->allocatedBuffersCount(),
++          (const char *)&capFourcc, capFourcc, static_cast<uint32_t>(Fourcc::AB24));
++    mVideoFramePool = mGetPoolCb.Run(poolSize, poolFormat,
+                                      mOutputQueue->allocatedBuffersCount());
+     if (!mVideoFramePool) {
+-        ALOGE("Failed to get block pool with size: %s", toString(mCodedSize).c_str());
++        ALOGE("Failed to get block pool with size: %s", toString(poolSize).c_str());
+         return false;
+     }
+ 
+@@ -769,15 +1079,22 @@ bool V4L2Decoder::changeResolution() {
+ }
+ 
+ bool V4L2Decoder::setupOutputFormat(const ui::Size& size) {
+-    for (const uint32_t& pixfmt :
+-         mDevice->enumerateSupportedPixelformats(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)) {
+-        if (std::find(kSupportedOutputFourccs.begin(), kSupportedOutputFourccs.end(), pixfmt) ==
+-            kSupportedOutputFourccs.end()) {
+-            ALOGD("Pixel format %s is not supported, skipping...", fourccToString(pixfmt).c_str());
+-            continue;
+-        }
+-
++    // Our preference order, not the device's -- see kPreferredOutputFourccs.
++    for (const uint32_t pixfmt : orderedOutputFourccs(mDevice.get())) {
+         if (mOutputQueue->setFormat(pixfmt, size, 0) != std::nullopt) {
++            // THE NEGOTIATED LAYOUT, PRINTED. The device model copies the
++            // host's buffer into the guest's byte for byte with no stride
++            // translation (virtio_media_sg_copy() in hw/virtio/virtio-media.c),
++            // so the host's bytesperline and the gralloc buffer's stride have
++            // to agree. When they do not the picture shears and only a
++            // checksum notices.
++            const auto negotiated = mOutputQueue->getFormat().first;
++            if (negotiated)
++                ALOGI("%s(): capture format %s at %s, bytesperline=%u sizeimage=%u planes=%u",
++                      __func__, fourccToString(pixfmt).c_str(), toString(size).c_str(),
++                      negotiated->fmt.pix_mp.plane_fmt[0].bytesperline,
++                      negotiated->fmt.pix_mp.plane_fmt[0].sizeimage,
++                      negotiated->fmt.pix_mp.num_planes);
+             return true;
+         }
+     }
+@@ -865,9 +1182,47 @@ void V4L2Decoder::onVideoFrameReady(
+         outputBuffer = mOutputQueue->getFreeBuffer(v4l2BufferId);
+         ALOG_ASSERT(v4l2BufferId == outputBuffer->bufferId());
+     } else {
+-        // If this happens, this is a bug in VideoFramePool. It should never
+-        // provide more blocks than we have V4L2 buffers.
+-        ALOGE("Got more different blocks than we have V4L2 buffers for.");
++        // RE-POINT A FREE V4L2 SLOT AT THE NEW BLOCK INSTEAD OF GIVING UP.
++        //
++        // The 1:1 block-to-V4L2-buffer mapping above is an optimisation, not a
++        // requirement: queueBufferWithFds() hands the device the dmabuf fds on
++        // every QBUF, so any free V4L2 index can carry any block. Only the
++        // COUNT of simultaneously mapped blocks is bounded, and a free index
++        // by definition has no block in flight (mFrameAtDevice drops its entry
++        // at DQBUF).
++        //
++        // Upstream treats a new block as a bug, which breaks every client whose
++        // pool does not recycle ids. A C2BasicGraphicBlockPool -- what a client
++        // that never called createBlockPool() leaves configured, which is VTS in
++        // all three of its surface modes -- allocates a fresh buffer per fetch,
++        // so every id is new. Measured on RPi4 2026-09-03: 25 frames decoded,
++        // then every counter stopped, and 21 of 24 VTS failures were reported
++        // as "Wait for generating C2Work exceeded timeout".
++        //
++        // Real playback does not hit it because CCodec calls createBlockPool()
++        // and gets a recycling pool (BUFFERQUEUE with a surface, a
++        // bufferpool-backed GRALLOC pool without), so the ids repeat.
++        outputBuffer = mOutputQueue->getFreeBuffer();
++        if (outputBuffer) {
++            const uint32_t reusedV4L2Id = outputBuffer->bufferId();
++            for (auto it = mBlockIdToV4L2Id.begin(); it != mBlockIdToV4L2Id.end(); ++it) {
++                if (it->second == reusedV4L2Id) {
++                    ALOGV("%s(): V4L2 buffer %u: block %u -> %u", __func__, reusedV4L2Id,
++                          static_cast<uint32_t>(it->first), blockId);
++                    mBlockIdToV4L2Id.erase(it);
++                    break;
++                }
++            }
++            mBlockIdToV4L2Id.emplace(blockId, reusedV4L2Id);
++        } else {
++            // Every slot is busy. tryFetchVideoFrame() only asks for a frame
++            // when freeBuffersCount() > 0, so this means the pool answered a
++            // request that is no longer valid; drop the block and try again
++            // rather than failing the stream.
++            ALOGW("%s(): no free V4L2 buffer for new block %u; dropping it", __func__, blockId);
++            tryFetchVideoFrame();
++            return;
++        }
+     }
+ 
+     if (!outputBuffer) {
+@@ -879,7 +1234,8 @@ void V4L2Decoder::onVideoFrameReady(
+     uint32_t v4l2Id = outputBuffer->bufferId();
+     ALOGV("QBUF to output queue, blockId=%u, V4L2Id=%u", blockId, v4l2Id);
+ 
+-    if (!std::move(*outputBuffer).queueDMABuf(frame->getFDs())) {
++    if (!queueBufferWithFds(std::move(*outputBuffer), frame->getFDs(),
++                            frame->virglResourceId())) {
+         ALOGE("%s(): Failed to QBUF to output queue, blockId=%u, V4L2Id=%u", __func__, blockId,
+               v4l2Id);
+         onError();
+diff --git a/v4l2/V4L2Device.cpp b/v4l2/V4L2Device.cpp
+index 0190deb..c8f56f9 100644
+--- a/v4l2/V4L2Device.cpp
++++ b/v4l2/V4L2Device.cpp
+@@ -135,7 +135,16 @@ std::unique_ptr<V4L2Buffer> V4L2Buffer::create(scoped_refptr<V4L2Device> device,
+     // Not using std::make_unique because constructor is private.
+     std::unique_ptr<V4L2Buffer> buffer(new V4L2Buffer(device, type, memory, format, bufferId));
+ 
+-    if (!buffer->query()) return nullptr;
++    // Skip VIDIOC_QUERYBUF for DMABUF, the memory type every queue here
++    // uses. Nothing here needs the answer: the plane count comes from
++    // the format in the constructor, the plane lengths are filled from the
++    // format below, the plane mappings are only used for MMAP (see
++    // getPlaneMapping()), and the fd of every plane is supplied by the
++    // caller at QBUF time. On a virtio-media device the query would also be a
++    // round trip to the device model, which runs the host's QUERYBUF on a
++    // queue it allocated as MMAP (it rewrites the guest's REQBUFS to
++    // V4L2_MEMORY_MMAP because bcm2835-codec has no USERPTR support).
++    if (memory != V4L2_MEMORY_DMABUF && !buffer->query()) return nullptr;
+ 
+     return buffer;
+ }
+@@ -156,6 +165,24 @@ V4L2Buffer::V4L2Buffer(scoped_refptr<V4L2Device> device, enum v4l2_buf_type type
+     mV4l2Buffer.type = type;
+     mV4l2Buffer.memory = memory;
+     mV4l2Buffer.memory = V4L2_MEMORY_DMABUF;
++
++    // Fill the per-plane length from the format for DMABUF, because create()
++    // skips VIDIOC_QUERYBUF for it (see the comment there) and QUERYBUF is
++    // what populates these otherwise. Without it
++    // V4L2WritableBufferRef::getPlaneSize() returns 0. Here the field is the
++    // queue's CAPACITY, which V4L2Decoder::pumpDecodeRequest() reads back
++    // through getPlaneSize(0) to reject a frame larger than an input buffer.
++    // It is not the value that goes on the wire -- for DMABUF the virtio-media
++    // guest driver overwrites the wire copy with the exporter's real size and
++    // restores this one, because those are two different numbers whenever the
++    // client's block is smaller than sizeimage (a 28-byte SPS is one page).
++    // See scatterlist_builder_import_buffer_dmabuf().
++    if (memory == V4L2_MEMORY_DMABUF) {
++        for (size_t i = 0; i < mV4l2Buffer.length; i++) {
++            mV4l2Planes[i].length = format.fmt.pix_mp.plane_fmt[i].sizeimage;
++        }
++    }
++
+     mPlaneMappings.resize(mV4l2Buffer.length);
+ }
+ 
+@@ -429,6 +456,12 @@ enum v4l2_memory V4L2WritableBufferRef::memory() const {
+     return static_cast<enum v4l2_memory>(mBufferData->mV4l2Buffer.memory);
+ }
+ 
++void V4L2WritableBufferRef::setReserved2(uint32_t value) {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(mSequenceChecker);
++    ALOG_ASSERT(mBufferData);
++    mBufferData->mV4l2Buffer.reserved2 = value;
++}
++
+ bool V4L2WritableBufferRef::doQueue() && {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(mSequenceChecker);
+     ALOG_ASSERT(mBufferData);
+diff --git a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+index e537f0c..e521dd9 100644
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+@@ -153,6 +153,14 @@ private:
+     // V4L2 buffer index.
+     std::map<size_t, size_t> mBlockIdToV4L2Id;
+ 
++    // Queue a buffer backed by dmabuf fds, at most one per V4L2 plane: the one
++    // place the four call sites share. A non-zero |hostXferRes| is the
++    // buffer's virgl resource id, passed to the device in reserved2.
++    bool queueBufferWithFds(V4L2WritableBufferRef buffer, const std::vector<int>& fds,
++                            uint32_t hostXferRes = 0);
++    // Whether queueBufferWithFds() has logged dropping the extra fds.
++    bool mLoggedFdTruncation = false;
++
+     State mState = State::Idle;
+ 
+     scoped_refptr<::base::SequencedTaskRunner> mTaskRunner;
+diff --git a/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h
+index 29d4a2e..252ac9b 100644
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h
+@@ -116,6 +116,10 @@ public:
+     size_t getPlaneBytesUsed(const size_t plane) const;
+     // Set the data offset for |plane|, in bytes.
+     void setPlaneDataOffset(const size_t plane, const size_t dataOffset);
++    // Set v4l2_buffer.reserved2 (the side channel used for virtio-media's direct
++    // host transfer. A real vb2 device ignores it on QBUF and returns 0 in it,
++    // so make it non-zero only when going through virtio-media).
++    void setReserved2(uint32_t value);
+ 
+     // Return the V4L2 buffer ID of the underlying buffer.
+     size_t bufferId() const;

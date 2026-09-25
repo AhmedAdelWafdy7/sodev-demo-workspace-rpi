@@ -49,23 +49,23 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 #
 # Status of all six against v10.0.2-xt (SRCREV f460a035). None is open any more,
 # which is what allowed the default to move to the Vulkan lane:
-#   0101 RESUME/QAPI guard              -- NOT NEEDED. It guards a RESUME emit that
-#                                          died before the main loop was up in 7.0.0;
-#                                          the code moved (softmmu/vl.c ->
-#                                          system/vl.c) and the death does not
-#                                          reproduce: both guests' device models came
-#                                          up on every boot of the RPi4 board
-#                                          verification, 2026-09-10..12. (No claim
-#                                          here about WHY -- libxl does give the
-#                                          device model a control monitor -- only
-#                                          that the failure this guarded is not
-#                                          observed on 10.0.2.)
-#   0103 deferred autostart vm_start    -- NOT NEEDED, same evidence as 0101; the
-#                                          autostart path in 10.0.2 still calls
-#                                          qmp_cont() from x_exit_preconfig, but
-#                                          nothing in it dies here any more. Revive
-#                                          BOTH if a device model is ever seen to exit
-#                                          during creation.
+#   0101 RESUME/QAPI guard              -- FORWARD-PORTED, with 0103, as
+#                                          meta-xt-qemu's 0201 (listed with the
+#                                          hardware-decode patches in
+#                                          qemu_10.0.2.bb). It guards a RESUME emit
+#                                          that died before the main loop was up in
+#                                          7.0.0. That death was not seen on 10.0.2:
+#                                          both guests' device models came up on
+#                                          every boot of the RPi4 board
+#                                          verification, 2026-09-10..12. The path
+#                                          it comes from is still there, though:
+#                                          libxl spawns the device model with only
+#                                          "-monitor /dev/null" (no QMP monitor, no
+#                                          -S), and 10.0.2's qmp_x_exit_preconfig()
+#                                          still calls qmp_cont() inside
+#                                          qemu_init().
+#   0103 deferred autostart vm_start    -- FORWARD-PORTED with 0101, as 0201; see
+#                                          0101.
 #   0110 virtio-pci ISR IOREQ range     -- REBASED as meta-xt-qemu's 0120, against the
 #                                          fork's reworked xen ioreq code.
 #   0111 virtio-tablet BTN_TOUCH        -- REBASED as meta-xt-qemu's 0118, which is

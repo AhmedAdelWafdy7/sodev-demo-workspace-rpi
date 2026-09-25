@@ -1,0 +1,50 @@
+From 937b8ef693c4a4eb9cd5077b665b9af224db8607 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 1 Sep 2026 20:35:30 +0900
+Subject: [PATCH] virtio-media: use V4L2_CAP_VIDEO_OUTPUT_MPLANE, not the
+ buf_type enumerator
+
+probe picked vfl_dir with
+
+    else if (vd->device_caps &
+             (V4L2_CAP_VIDEO_OUTPUT | V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE))
+
+where the second constant is a BUFFER TYPE whose value is 10, not a
+capability bit. The test therefore read `caps & (0x2 | 0xa)`: it
+matched V4L2_CAP_VIDEO_OUTPUT (0x2) and the unassigned bit 0x8, and it
+never matched V4L2_CAP_VIDEO_OUTPUT_MPLANE (0x2000).
+
+An output-MPLANE-only device thus fell through to VFL_DIR_RX, and
+v4l2-ioctl's check_fmt() rejected every OUTPUT buffer type with -EINVAL:
+G_FMT failed before any of this driver's own code ran. Measured against
+vivid's Video Output Multiplanar node (device_caps=0x05222000):
+
+    queue type: OUTPUT_MPLANE
+    FAIL G_FMT: Invalid argument
+
+The board never hits it: bcm2835-codec is M2M, so it takes the first
+branch and both directions work. That is why it went unnoticed -- and
+it is what blocked exercising the output direction of the DMABUF path,
+where the device model reads the guest pages instead of writing them.
+
+Change-Id: I79f06852149002802ed2fbc4d82c3c3185dfc93d
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ driver/virtio_media_driver.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/driver/virtio_media_driver.c b/driver/virtio_media_driver.c
+index 7fe98c4..1cd4783 100644
+--- a/driver/virtio_media_driver.c
++++ b/driver/virtio_media_driver.c
+@@ -912,7 +912,7 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
+ 	if (vd->device_caps & (V4L2_CAP_VIDEO_M2M | V4L2_CAP_VIDEO_M2M_MPLANE))
+ 		vd->vfl_dir = VFL_DIR_M2M;
+ 	else if (vd->device_caps &
+-		 (V4L2_CAP_VIDEO_OUTPUT | V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE))
++		 (V4L2_CAP_VIDEO_OUTPUT | V4L2_CAP_VIDEO_OUTPUT_MPLANE))
+ 		vd->vfl_dir = VFL_DIR_TX;
+ 	else
+ 		vd->vfl_dir = VFL_DIR_RX;

@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 04 Sep 2026 16:49:50 +0900
+Subject: [PATCH] staging: bcm2835-codec: allow cache hints on both queues
+
+vb2 dma-contig MMAP buffers are coherent (Normal-NC on arm64) by default,
+and a CPU reading a decoded frame out of one runs at bus speed: measured
+678 MB/s against 3469 MB/s for cached memory on a Raspberry Pi 4 (a 942 KB
+RGBA frame costs 1.4 ms instead of 0.3 ms). A userspace consumer that
+copies frames out, such as the virtio-media device model in QEMU that
+forwards them to a guest, pays that on every frame.
+
+vb2 already supports the alternative: with allow_cache_hints set, REQBUFS
+accepts V4L2_MEMORY_FLAG_NON_COHERENT and allocates cacheable memory,
+invalidating it in buf_finish (dma_sync_sgtable_for_cpu) after the
+VideoCore has written it and flushing it in buf_prepare before the
+VideoCore reads it. Nothing changes for callers that do not pass the flag.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ drivers/staging/vc04_services/bcm2835-codec/bcm2835-v4l2-codec.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/drivers/staging/vc04_services/bcm2835-codec/bcm2835-v4l2-codec.c
++++ b/drivers/staging/vc04_services/bcm2835-codec/bcm2835-v4l2-codec.c
+@@ -3249,6 +3249,7 @@ static int queue_init(void *priv, struct vb2_queue *src_vq,
+ 	src_vq->dev = &ctx->dev->device->dev;
+ 	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+ 	src_vq->lock = &ctx->dev->dev_mutex;
++	src_vq->allow_cache_hints = 1;
+ 
+ 	ret = vb2_queue_init(src_vq);
+ 	if (ret)
+@@ -3263,6 +3264,7 @@ static int queue_init(void *priv, struct vb2_queue *src_vq,
+ 	dst_vq->dev = &ctx->dev->device->dev;
+ 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+ 	dst_vq->lock = &ctx->dev->dev_mutex;
++	dst_vq->allow_cache_hints = 1;
+ 
+ 	return vb2_queue_init(dst_vq);
+ }

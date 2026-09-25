@@ -1,0 +1,129 @@
+From 55c7bc469a48ca9854cbb717c3bafb262910e756 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 4 Sep 2026 08:07:10 +0900
+Subject: [PATCH] virtio-media: raise the shadow buffer from 16 KiB to 64 KiB
+
+The per-session shadow buffer could not hold the scatter-gather entry
+array of a 1080p frame, which is why 1080p hardware decode never
+played on RPi4 (it stalled after 4 frames). Measured in DomA on
+2026-09-04:
+
+    virtio-media: 2033 SG entries (32528 bytes) do not fit the
+                  remaining 16384 bytes of the shadow buffer
+
+scatterlist_builder.c already carried a comment predicting this
+ceiling, but it sized it from NV12 and concluded 1080p "fits with
+margin". The premise does not hold on this platform: the guest GL has
+no GL_EXT_YUV_target, so an NV12 EGLImage cannot be sampled and the
+decoder output is forced to RGBA (measured on the board, 2026-09-03).
+That makes a 1920x1088 frame 8,355,840 bytes = 2040 pages; its
+sg_table had 2033 entries, and at 16 bytes per virtio_media_sg_entry
+that is 32,528 bytes -- 2.7x what NV12 would have needed.
+
+64 KiB holds the 1080p RGBA array alongside the command struct and the
+payload staging. 4K RGBA (33,177,600 bytes = 8100 pages = 129,600
+bytes of entries) still does not fit and would need the entry array
+split across descriptors, which is not done here; the comment says so
+with the real numbers.
+
+The host side needs no change: qemu's virtio-media device has a
+VIRTIO_MEDIA_CMD_BUF_SIZE of 256 KiB and copies each plane's entries
+into a g_malloc'd array in virtio_media_qbuf(), so there is no
+matching ceiling.
+
+kmalloc still returns physically contiguous memory at this size, which
+the builder relies on -- it describes the entry array with
+virt_to_page() plus an offset and therefore only ever looks at the
+first page.
+
+Verified on hardware: the warning is gone and 1080p playback advances
+from t=0.16 / 4 frames to t=2.96 / 18 frames. It still does not play
+through -- a separate blocker remains, and 1080p also needs DomA's
+memory lowered (25 pooled 8.36 MB buffers = 209 MB of foreign mappings
+wedged DomD's userspace once). Both were measured on the board,
+2026-09-04.
+
+Change-Id: I418bd4672da9703271cfc07a3d62cbbe3ece4147
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ driver/scatterlist_builder.c | 23 ++++++++++++++---------
+ driver/session.h             | 26 +++++++++++++++++++++++---
+ 2 files changed, 37 insertions(+), 12 deletions(-)
+
+diff --git a/driver/scatterlist_builder.c b/driver/scatterlist_builder.c
+index d4c646d..3a7100f 100644
+--- a/driver/scatterlist_builder.c
++++ b/driver/scatterlist_builder.c
+@@ -696,18 +696,23 @@ static int scatterlist_builder_add_sgt(struct scatterlist_builder *builder,
+ 	    builder->shadow_buffer_size) {
+ 		/*
+ 		 * The ceiling, so a mystery EINVAL at high resolution is not
+-		 * rediscovered from scratch. The shadow buffer is 16 KiB
+-		 * (VIRTIO_SHADOW_BUF_SIZE) and is shared by everything in one
++		 * rediscovered from scratch. The shadow buffer
++		 * (VIRTIO_SHADOW_BUF_SIZE) is shared by everything in one
+ 		 * ioctl -- command struct, payload staging, and every plane's
+-		 * entry array -- at 16 bytes per virtio_media_sg_entry, so
+-		 * roughly 1000 entries total.
++		 * entry array -- at 16 bytes per virtio_media_sg_entry.
++		 *
++		 * A guest GL without GL_EXT_YUV_target makes the decoder
++		 * output RGBA. A 1920x1088 RGBA frame is 8,355,840 bytes =
++		 * 2040 pages, and its sg_table measured 2033 entries =
++		 * 32,528 bytes (RPi4, 2026-09-04), which fits. 4K RGBA
++		 * (33,177,600 bytes = 8100 pages = 129,600 bytes of entries)
++		 * does not fit and needs the entry array split across
++		 * descriptors, which is not done here.
+ 		 *
+ 		 * A fully fragmented 1080p NV12 plane is 3110400 bytes = 760
+-		 * 4 KiB pages, which fits with margin (and contiguous runs are
+-		 * coalesced by the exporter, so the real count is usually far
+-		 * lower). 4K would be ~3000 entries and does not fit: that
+-		 * needs either a larger shadow buffer or splitting the entry
+-		 * array across descriptors, neither of which is done here.
++		 * 4 KiB pages, which fits with margin (and contiguous runs
++		 * are coalesced by the exporter, so the real count is
++		 * usually far lower).
+ 		 */
+ 		pr_warn("virtio-media: %zu SG entries (%zu bytes) do not fit the remaining %zu bytes of the shadow buffer\n",
+ 			(size_t)nents, entries_size,
+diff --git a/driver/session.h b/driver/session.h
+index b3addd6..60c05b0 100644
+--- a/driver/session.h
++++ b/driver/session.h
+@@ -18,10 +18,30 @@
+ #define VIRTIO_MEDIA_LAST_QUEUE (V4L2_BUF_TYPE_META_OUTPUT)
+ 
+ /*
+- * Size of the per-session virtio shadow and event buffers. 16K should be
+- * enough to contain everything we need.
++ * Size of the per-session virtio shadow and event buffers.
++ *
++ * 64 KiB, because a 1080p RGBA frame does not fit in 16 KiB. The output is
++ * RGBA when the guest's GL has no GL_EXT_YUV_target (an NV12 EGLImage then
++ * cannot be used as a texture), and RGBA at 1920x1088 is 8,355,840 B =
++ * 2040 pages. Measured on RPi4, 2026-09-04:
++ *
++ *     virtio-media: 2033 SG entries (32528 bytes) do not fit the
++ *                   remaining 16384 bytes of the shadow buffer
++ *
++ * At 64 KiB those entries (16 B x 2033 = 32,528 B) fit alongside the
++ * staging of the command structure and its payload. 4K RGBA
++ * (3840x2160x4 = 33,177,600 B = 8100 pages = 129,600 B of entries) does not
++ * fit; that needs the entry array split across several descriptors, which
++ * is not implemented.
++ *
++ * kmalloc returns physically contiguous memory, so the SG entry array placed
++ * in the shadow buffer is still describable by one descriptor. That
++ * assumption is required -- scatterlist_builder.c takes virt_to_page +
++ * offset and looks only at the first page -- and it holds at 64 KiB too.
++ * The allocation is order-4, so on failure the session cannot be opened
++ * (err_shadow_buf).
+  */
+-#define VIRTIO_SHADOW_BUF_SIZE 0x4000
++#define VIRTIO_SHADOW_BUF_SIZE 0x10000
+ 
+ /**
+  * struct virtio_media_dmabuf - Cached import of one V4L2_MEMORY_DMABUF plane.

@@ -1,0 +1,190 @@
+From b0b73b72153f2841e31a3728bc4fb65d03b7f7a1 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 3 Sep 2026 22:42:16 +0900
+Subject: [PATCH] xen: keep the autostart device model alive without a QMP
+ monitor
+
+Forward-port of the qemu 7.0.0 patches 0101 + 0103, squashed. They fix one
+root cause from two sides and were always applied together.
+
+Root cause: when qemu runs as a Xen disaggregated device model spawned by
+libxl (argv has only "-monitor /dev/null", no "-S", no QMP control monitor),
+autostart defaults to 1, so qmp_x_exit_preconfig() calls
+qmp_cont() -> vm_start() -> vm_prepare_start() *synchronously inside
+qemu_init(), before the main loop is running*. Several subsystems are not in
+their running state there and vm_prepare_start() dies silently -- first at the
+RESUME emit, then, once that is guarded, inside cpu_enable_ticks(). Each guard
+only exposes the next pre-main-loop hazard; the real defect is the synchronous
+vm_start.
+
+0103 removes the cause: instead of calling qmp_cont() inline, schedule a
+one-shot bottom half on the main-loop AioContext. qemu_init() returns,
+qemu_main_loop() starts main_loop_wait(), and the BH runs qmp_cont() on the
+first iteration with the main loop fully up -- the same property a full device
+model gets from "-S" plus a QMP "cont" issued after startup.
+aio_bh_schedule_oneshot() allocates, schedules and frees the BH itself.
+
+0101 keeps the RESUME notification a no-op whenever there genuinely is no QMP
+client: a QAPI event is addressed to QMP clients only, so with no QMP monitor
+both building and emitting it are pointless, and emitting takes the
+monitor_lock / rate-limit-timer path which is unsafe before the main loop.
+Both are kept for defence in depth.
+
+Verified still needed on this base: system/vl.c qmp_x_exit_preconfig() still
+ends with "} else if (autostart) { qmp_cont(NULL); }" and still runs inside
+qemu_init().
+
+Port deltas against 7.0.0:
+  - softmmu/cpus.c -> system/cpus.c and softmmu/vl.c -> system/vl.c (qemu 9.0
+    moved softmmu/ to system/).
+  - vm_prepare_start() now takes a RunState and has a second
+    qapi_event_send_resume() on the "already running" early-return path
+    (system/cpus.c:757-760). Only the "We are sending this now" site is
+    guarded, as in the original; the early-return site is covered anyway by
+    the qapi_event_emit() guard, which skips every emit when no QMP client
+    exists.
+  - the deferred-cont bottom half was named rpi5_autostart_cont_bh; renamed
+    xenpvh_autostart_cont_bh because it is not board-specific and the machine
+    is xenpvh on this base.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ include/monitor/monitor.h |  1 +
+ monitor/monitor.c         | 39 +++++++++++++++++++++++++++++++++++++++
+ system/cpus.c             | 11 ++++++++++-
+ system/vl.c               | 22 +++++++++++++++++++++-
+ 4 files changed, 71 insertions(+), 2 deletions(-)
+
+diff --git a/include/monitor/monitor.h b/include/monitor/monitor.h
+index c3740ec616a..23870ca8b47 100644
+--- a/include/monitor/monitor.h
++++ b/include/monitor/monitor.h
+@@ -16,6 +16,7 @@ extern QemuOptsList qemu_mon_opts;
+ Monitor *monitor_cur(void);
+ Monitor *monitor_set_cur(Coroutine *co, Monitor *mon);
+ bool monitor_cur_is_qmp(void);
++bool monitor_has_qmp_client(void);
+ 
+ void monitor_init_globals(void);
+ void monitor_init_globals_core(void);
+diff --git a/monitor/monitor.c b/monitor/monitor.c
+index c5a5d308774..d3db877987a 100644
+--- a/monitor/monitor.c
++++ b/monitor/monitor.c
+@@ -412,6 +412,32 @@ monitor_qapi_event_queue_no_reenter(QAPIEvent event, QDict *qdict)
+     }
+ }
+ 
++/*
++ * Return true if at least one QMP monitor is currently registered.
++ * QAPI events are notifications addressed to QMP clients only; if there is
++ * no QMP monitor, emission is a no-op and we can safely skip the whole
++ * queue/lock/timer machinery.  Used both to keep qapi_event_emit() from
++ * touching monitor_lock / the rate-limit QEMUTimer, and to let callers (e.g.
++ * vm_prepare_start()) avoid building/emitting an event altogether when qemu
++ * runs as a Xen disaggregated device-model (xenpvh, -monitor /dev/null,
++ * autostart=1) and a RESUME event would otherwise be emitted before the main
++ * loop is up.
++ */
++bool monitor_has_qmp_client(void)
++{
++    Monitor *mon;
++    bool found = false;
++
++    QEMU_LOCK_GUARD(&monitor_lock);
++    QTAILQ_FOREACH(mon, &mon_list, entry) {
++        if (monitor_is_qmp(mon)) {
++            found = true;
++            break;
++        }
++    }
++    return found;
++}
++
+ void qapi_event_emit(QAPIEvent event, QDict *qdict)
+ {
+     /*
+@@ -429,6 +455,19 @@ void qapi_event_emit(QAPIEvent event, QDict *qdict)
+     static __thread bool reentered;
+     MonitorQapiEvent *ev;
+ 
++    /*
++     * No QMP client to notify: skip entirely.  This avoids the
++     * monitor_lock / rate-limit timer path in
++     * monitor_qapi_event_queue_no_reenter(), which is unsafe before the
++     * main loop is running (Xen device-model, autostart vm_start).
++     * Not when reentered: that call runs with monitor_lock already held
++     * by this thread, which monitor_has_qmp_client() would take again,
++     * and the outer call has done this check already.
++     */
++    if (!reentered && !monitor_has_qmp_client()) {
++        return;
++    }
++
+     if (!reentered) {
+         QSIMPLEQ_INIT(&event_queue);
+     }
+diff --git a/system/cpus.c b/system/cpus.c
+index 2cc5f887ab5..de7d37b7351 100644
+--- a/system/cpus.c
++++ b/system/cpus.c
+@@ -769,7 +769,16 @@ int vm_prepare_start(bool step_pending)
+     }
+ 
+     /* We are sending this now, but the CPUs will be resumed shortly later */
+-    qapi_event_send_resume();
++    /*
++     * A RESUME event is purely a QMP-client notification.  When qemu runs as a
++     * Xen disaggregated device-model (xenpvh, -monitor /dev/null, no QMP
++     * monitor) with autostart=1, this path can run before the main loop is up;
++     * emitting RESUME there is unsafe and pointless.  Skip the whole event
++     * (build + emit) when there is no QMP client to notify.
++     */
++    if (monitor_has_qmp_client()) {
++        qapi_event_send_resume();
++    }
+ 
+     cpu_enable_ticks();
+     runstate_set(state);
+diff --git a/system/vl.c b/system/vl.c
+index ec93988a03a..fe0b4db1e8b 100644
+--- a/system/vl.c
++++ b/system/vl.c
+@@ -2797,6 +2797,15 @@ static bool qemu_machine_creation_done(Error **errp)
+     return true;
+ }
+ 
++/*
++ * One-shot bottom half used to defer the autostart vm_start until the main
++ * loop is actually running.  See qmp_x_exit_preconfig() below.
++ */
++static void xenpvh_autostart_cont_bh(void *opaque)
++{
++    qmp_cont(NULL);
++}
++
+ void qmp_x_exit_preconfig(Error **errp)
+ {
+     if (phase_check(PHASE_MACHINE_INITIALIZED)) {
+@@ -2833,7 +2842,18 @@ void qmp_x_exit_preconfig(Error **errp)
+             }
+         }
+     } else if (autostart) {
+-        qmp_cont(NULL);
++        /*
++         * Do NOT call qmp_cont() inline here.  qmp_x_exit_preconfig() runs
++         * inside qemu_init(), before the main loop.  Calling qmp_cont() ->
++         * vm_start() -> vm_prepare_start() now would run on a pre-main-loop
++         * context where subsystems (QAPI event emit, timers) are not ready and
++         * qemu dies silently.  Instead schedule a one-shot bottom half on the
++         * main-loop AioContext; it runs on the first main_loop_wait()
++         * iteration, i.e. with the main loop up, mirroring the "-S then QMP
++         * cont after main loop" full-device-model startup.
++         */
++        aio_bh_schedule_oneshot(qemu_get_aio_context(),
++                                xenpvh_autostart_cont_bh, NULL);
+     }
+ }
+ 

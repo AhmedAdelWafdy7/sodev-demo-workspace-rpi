@@ -1,0 +1,85 @@
+From 7f2a8e2df62e3b472f3f18bdb82441cf11d9b0c1 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 3 Sep 2026 00:10:18 +0900
+Subject: [PATCH] virtio-media: send USERPTR on the wire for REQBUFS too, not
+ just QBUF
+
+The wire is USERPTR-only, and REQBUFS was the one buffer ioctl still
+leaking the user-space memory type through. It survived on the RPi4 by
+luck: the proxy device model ignores rb->memory entirely (it rewrites
+the host call to V4L2_MEMORY_MMAP regardless), so a DMABUF REQBUFS went
+unnoticed there.
+
+The RPi5 path does not ignore it. The device model's decoder mode,
+which the RPi5 uses, has its own dec_reqbufs(), and it returns EINVAL
+for any memory type but USERPTR -- same restriction as the proxy path,
+for the same reason. So on the RPi5 a DMABUF queue would have died at
+buffer allocation, before a single QBUF, with nothing in any log to
+point at the memory type.
+
+Substitute on the way out and restore before anything reads it --
+including queue->memory, which has to record what user-space asked for
+rather than what went on the wire, because DQBUF restores the memory
+type from it.
+
+The allow_userptr gate is deliberately left inspecting what USER-SPACE
+asked for: a DMABUF queue does not need that module parameter, only a
+user-space request for USERPTR does.
+
+Found by reading the device model's decoder-mode code, not on hardware.
+
+Change-Id: I6630dac2d2a11ece05a012df08db33de6719f6fc
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ driver/virtio_media_ioctls.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/driver/virtio_media_ioctls.c b/driver/virtio_media_ioctls.c
+index 7fc7386..a70ce25 100644
+--- a/driver/virtio_media_ioctls.c
++++ b/driver/virtio_media_ioctls.c
+@@ -842,6 +842,7 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
+ 	struct v4l2_fh *vfh = file_to_v4l2_fh(file);
+ 	struct virtio_media_session *session = fh_to_session(vfh);
+ 	struct virtio_media_queue_state *queue;
++	u32 orig_memory;
+ 	int ret;
+ 
+ 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE)
+@@ -850,8 +851,34 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
+ 	if (b->memory == V4L2_MEMORY_USERPTR && !virtio_media_allow_userptr)
+ 		return -EINVAL;
+ 
++	/*
++	 * REQBUFS goes out as USERPTR too, for the same reason QBUF does: the wire
++	 * is USERPTR-only. See scatterlist_builder_add_buffer_dmabuf().
++	 *
++	 * This is not cosmetic. The proxy device model happens to ignore rb->memory
++	 * (it rewrites the host call to MMAP regardless), so a DMABUF REQBUFS
++	 * survived there by luck. The decoder-mode device model does not: its
++	 * dec_reqbufs() returns EINVAL for any memory type but USERPTR, which is
++	 * where a DMABUF queue would have died on the RPi5 -- at buffer allocation,
++	 * before a single QBUF, with nothing to point at the cause.
++	 *
++	 * Note the allow_userptr gate above is deliberately left looking at what
++	 * user-space asked for. A DMABUF queue does not need that module parameter;
++	 * only a user-space request for USERPTR does.
++	 */
++	orig_memory = b->memory;
++	if (orig_memory == V4L2_MEMORY_DMABUF)
++		b->memory = V4L2_MEMORY_USERPTR;
++
+ 	ret = virtio_media_send_wr_ioctl(vfh, VIDIOC_REQBUFS, b, sizeof(*b),
+ 					 sizeof(*b));
++
++	/*
++	 * Restore before anything reads it -- including queue->memory below, which
++	 * must record what user-space asked for, not what went on the wire.
++	 */
++	b->memory = orig_memory;
++
+ 	if (ret)
+ 		return ret;
+ 

@@ -1,0 +1,86 @@
+From ec58043753fe638bf5e2c0477b486ca46e923687 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 5 Sep 2026 16:45:28 +0900
+Subject: [PATCH] virtio-media: do not kick the event queue when recycling an
+ event buffer
+
+The device pops the event queue only when it has an event to send and
+drops the event if the queue is empty; it never waits for a
+notification. On Xen the kick is an MMIO ioreq that blocks the event
+work item for 1-6 ms under load, delaying delivery of the next DQBUF
+event. Measured on the board, 2026-09-05 (RPi4 DomA, HW 720p60):
+eventq kicks 167 -> 3 per 5 s, fps within noise (21.9 -> 22.6). The
+probe-time fill keeps its kick.
+
+This relies on how the device model used here consumes the event
+queue. A device that parks an event until it is notified of a new
+event buffer would deliver that event late, so the change is specific
+to that device model; other virtio-media implementations have not been
+checked.
+
+Change-Id: I2289ad7088ceb4cc29967026af2618d32368ae0d
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ driver/virtio_media_driver.c | 24 ++++++++++++++++++++----
+ 1 file changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/driver/virtio_media_driver.c b/driver/virtio_media_driver.c
+index 071396a..36acfa5 100644
+--- a/driver/virtio_media_driver.c
++++ b/driver/virtio_media_driver.c
+@@ -386,9 +386,10 @@ int virtio_media_send_command(struct virtio_media *vv, struct scatterlist **sgs,
+  * can return it with an event.
+  * @vv: virtio-media device in use.
+  * @event_buffer: pointer to the event buffer to send to the device.
++ * @notify: kick the event queue after adding the buffer.
+  */
+ static int virtio_media_send_event_buffer(struct virtio_media *vv,
+-					  void *event_buffer)
++					  void *event_buffer, bool notify)
+ {
+ 	struct scatterlist *sgs[1], vresp;
+ 	int ret;
+@@ -404,7 +405,22 @@ static int virtio_media_send_event_buffer(struct virtio_media *vv,
+ 		return ret;
+ 	}
+ 
+-	if (!virtqueue_kick(vv->eventq)) {
++	/*
++	 * Do not kick when recycling an event buffer.
++	 *
++	 * The device pops the event queue only when it has an event to send
++	 * and drops the event if the queue is empty; it never waits for a
++	 * notification to retry. virtqueue_add_sgs() already publishes the
++	 * new available entry with a write barrier, so a kick tells the
++	 * device nothing it needs. On Xen the kick is not free either: it is
++	 * an MMIO ioreq that blocks this vCPU until qemu's main loop gets to
++	 * it (measured 1-6 ms under load, 2026-09-05), and it runs in the
++	 * event work item, so every DQBUF event delayed the delivery of the
++	 * next one by that much. ~70 of the ~180 media kicks per second at
++	 * 1080p60 were these. The initial fill at probe keeps the kick so the
++	 * device sees the queue populated before the first session opens.
++	 */
++	if (notify && !virtqueue_kick(vv->eventq)) {
+ 		v4l2_err(&vv->v4l2_dev, "failed to kick event virtqueue\n");
+ 		return -EINVAL;
+ 	}
+@@ -612,7 +628,7 @@ process_bufs:
+ 		}
+ 
+ end_of_event:
+-		virtio_media_send_event_buffer(vv, evt);
++		virtio_media_send_event_buffer(vv, evt, false);
+ 	}
+ 
+ 	if (!virtqueue_enable_cb(vv->eventq)) {
+@@ -995,7 +1011,7 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
+ 	for (i = 0; i < VIRTIO_MEDIA_NUM_EVENT_BUFS; i++) {
+ 		void *ebuf = vv->event_buffer + VIRTIO_MEDIA_EVENT_MAX_SIZE * i;
+ 
+-		ret = virtio_media_send_event_buffer(vv, ebuf);
++		ret = virtio_media_send_event_buffer(vv, ebuf, true);
+ 		if (ret)
+ 			goto err_send_event_buffer;
+ 	}

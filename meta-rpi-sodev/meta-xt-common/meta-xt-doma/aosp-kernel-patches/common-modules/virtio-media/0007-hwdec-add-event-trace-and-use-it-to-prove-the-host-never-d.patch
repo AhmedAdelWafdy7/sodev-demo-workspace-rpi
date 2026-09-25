@@ -1,0 +1,87 @@
+From b711fc2a0986b2ddd5e376f103342e553357c102 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 3 Sep 2026 14:02:08 +0900
+Subject: [PATCH] virtio-media: add event_trace, and use it to prove the host
+ never drains
+
+A stateful decoder produced no frames with nothing in any log to say
+whether the host never sent V4L2_EVENT_SOURCE_CHANGE or sent it and the
+guest dropped it. Those have completely different fixes, and the
+device model's own comment (virtio_media_update_fd_handler() in
+hw/virtio/virtio-media.c) already flagged the first as a known risk:
+its main-loop fd handler was registered for G_IO_IN only, while V4L2
+raises POLLPRI for events and an M2M device raises POLLOUT for a
+completed OUTPUT buffer.
+
+event_trace=1 logs every event the device sends, by type, plus the V4L2
+event id. Measured on the board, 2026-09-03, across a full 8-second VTS
+H.264 decode attempt:
+
+  EVT_EVENT: 0 / EVT_DQBUF: 0
+
+Not one event of any kind, so the drain never ran once -- the guest did
+not even get its input buffer back. That is the host side, and the
+device model fixes it by waking its drain on POLLOUT as well. Kept as a
+parameter rather than a throwaway printk because this is the only way
+to tell those two failures apart and it costs nothing when off.
+
+Change-Id: I70b272c3c5a6808702f17916734c539f47be7152
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [diagnostic instrumentation]
+---
+ driver/virtio_media_driver.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/driver/virtio_media_driver.c b/driver/virtio_media_driver.c
+index 1cd4783..0b7ce56 100644
+--- a/driver/virtio_media_driver.c
++++ b/driver/virtio_media_driver.c
+@@ -65,6 +65,25 @@ module_param_named(driver_name, virtio_media_driver_name, charp, 0660);
+ bool virtio_media_allow_userptr;
+ module_param_named(allow_userptr, virtio_media_allow_userptr, bool, 0660);
+ 
++/*
++ * Log every event the device sends us.
++ *
++ * Why this is worth a parameter rather than a throwaway printk.
++ * When a stateful decoder produces no frames there is nothing in any log to
++ * say whether the host never sent the event, or sent it and the guest dropped
++ * it. The two have completely different fixes and the device model's own
++ * comment (virtio_media_update_fd_handler() in hw/virtio/virtio-media.c) calls
++ * out the first as a known risk: its main-loop fd handler waits for readable
++ * and writable but not for POLLPRI, which is how V4L2 signals events, so a
++ * V4L2_EVENT_SOURCE_CHANGE that arrives before any buffer completes has
++ * nothing to wake the drain. This is the guest-side half of that
++ * measurement, and it costs nothing when off.
++ */
++static bool event_trace;
++module_param(event_trace, bool, 0644);
++MODULE_PARM_DESC(event_trace,
++		 "log every event received from the device (type, session, and the V4L2 event id)");
++
+ /**
+  * virtio_media_session_alloc - Allocate a new session.
+  * @vv: virtio-media device the session belongs to.
+@@ -547,6 +566,11 @@ process_bufs:
+ 				break;
+ 			}
+ 			dqbuf_evt = (struct virtio_media_event_dqbuf *)evt;
++			if (event_trace)
++				pr_info("virtio-media: EVT_DQBUF session %u type %u index %u bytesused %u\n",
++					evt->session_id, dqbuf_evt->buffer.type,
++					dqbuf_evt->buffer.index,
++					dqbuf_evt->buffer.bytesused);
+ 			virtio_media_process_dqbuf_event(vv, session,
+ 							 dqbuf_evt);
+ 			break;
+@@ -560,6 +584,9 @@ process_bufs:
+ 			}
+ 
+ 			event_evt = (struct virtio_media_event_event *)evt;
++			if (event_trace)
++				pr_info("virtio-media: EVT_EVENT session %u v4l2 event type %u\n",
++					evt->session_id, event_evt->event.type);
+ 			v4l2_event_queue_fh(&session->fh, &event_evt->event);
+ 			break;
+ 

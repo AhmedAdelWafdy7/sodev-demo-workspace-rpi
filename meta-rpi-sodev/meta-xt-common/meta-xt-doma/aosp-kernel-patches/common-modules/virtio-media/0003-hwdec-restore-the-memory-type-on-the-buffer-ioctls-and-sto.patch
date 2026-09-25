@@ -1,0 +1,150 @@
+From 51949540e439c05b2cf18ad799768b7c44d4ab7a Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 1 Sep 2026 20:35:30 +0900
+Subject: [PATCH] virtio-media: restore the memory type on the buffer ioctls,
+ and stop failing silently on a full shadow buffer
+
+The reply to QUERYBUF/QBUF/PREPARE_BUF overwrites the caller's whole
+v4l2_buffer -- it is mapped as a device-writable descriptor as well --
+so whatever the host's vb2 puts in `memory` lands in user-space's
+struct. The device model runs its own queue as MMAP, so for QUERYBUF
+that is V4L2_MEMORY_MMAP.
+
+For a DMABUF queue that is fatal one step away from its cause:
+v4l2_codec2 calls QUERYBUF while building each V4L2Buffer, so its
+cached buffer comes back stamped MMAP and queueDMABuf() then rejects
+every buffer with "Called on invalid buffer type!". The decoder fails
+before a single QBUF and it looks like DMABUF support was never added.
+Found with a user-space test that checks the memory type QUERYBUF
+reports, not on hardware.
+
+The same clobber applied to USERPTR and was being masked by
+v4l2_codec2 skipping QUERYBUF entirely for that memory type.
+
+Restore from queue->memory rather than from the value the caller passed
+in: for QUERYBUF `memory` is an OUTPUT field, so user-space is not
+required to have set it. REQBUFS records queue->memory precisely so
+this can be answered. Plane lengths are deliberately left as the host
+wrote them -- the DMABUF coverage check needs them.
+
+Also give the shadow-buffer overflow in scatterlist_builder_add_sgt() a
+pr_warn. It was the one silent failure left in a change whose whole
+point is that failures say why, and it is the branch a higher
+resolution would actually hit. The comment records the ceiling: 16 KiB
+is ~1000 entries, which covers a worst-case 1080p NV12 plane (760) but
+not 4K (~3000).
+
+Change-Id: If5b27fbaeae96f50953063cc74d29032472dae84
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ driver/scatterlist_builder.c | 21 ++++++++++++++++++-
+ driver/virtio_media_ioctls.c | 39 +++++++++++++++++++++++++++++-------
+ 2 files changed, 52 insertions(+), 8 deletions(-)
+
+diff --git a/driver/scatterlist_builder.c b/driver/scatterlist_builder.c
+index 765dfa7..4f86898 100644
+--- a/driver/scatterlist_builder.c
++++ b/driver/scatterlist_builder.c
+@@ -599,8 +599,27 @@ static int scatterlist_builder_add_sgt(struct scatterlist_builder *builder,
+ 	nents = sgt->orig_nents;
+ 	entries_size = sizeof(*sg_list) * nents;
+ 	if (builder->shadow_buffer_pos + entries_size >
+-	    builder->shadow_buffer_size)
++	    builder->shadow_buffer_size) {
++		/*
++		 * The ceiling, so a mystery EINVAL at high resolution is not
++		 * rediscovered from scratch. The shadow buffer is 16 KiB
++		 * (VIRTIO_SHADOW_BUF_SIZE) and is shared by everything in one
++		 * ioctl -- command struct, payload staging, and every plane's
++		 * entry array -- at 16 bytes per virtio_media_sg_entry, so
++		 * roughly 1000 entries total.
++		 *
++		 * A fully fragmented 1080p NV12 plane is 3110400 bytes = 760
++		 * 4 KiB pages, which fits with margin (and contiguous runs are
++		 * coalesced by the exporter, so the real count is usually far
++		 * lower). 4K would be ~3000 entries and does not fit: that
++		 * needs either a larger shadow buffer or splitting the entry
++		 * array across descriptors, neither of which is done here.
++		 */
++		pr_warn("virtio-media: %zu SG entries (%zu bytes) do not fit the remaining %zu bytes of the shadow buffer\n",
++			(size_t)nents, entries_size,
++			builder->shadow_buffer_size - builder->shadow_buffer_pos);
+ 		return -ENOMEM;
++	}
+ 
+ 	sg_list = builder->shadow_buffer + builder->shadow_buffer_pos;
+ 
+diff --git a/driver/virtio_media_ioctls.c b/driver/virtio_media_ioctls.c
+index 3e9d97e..7fc7386 100644
+--- a/driver/virtio_media_ioctls.c
++++ b/driver/virtio_media_ioctls.c
+@@ -242,6 +242,7 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
+ 	struct virtio_media *vv = to_virtio_media(video_dev);
+ 	struct virtio_media_session *session = fh_to_session(fh);
+ 	struct v4l2_plane *orig_planes = NULL;
++	struct virtio_media_queue_state *queue;
+ 	struct virtio_media_buffer *state = NULL;
+ 	struct scatterlist *sgs[64];
+ 	/*
+@@ -283,6 +284,8 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
+ 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE)
+ 		return -EINVAL;
+ 
++	queue = &session->queues[b->type];
++
+ 	if (V4L2_TYPE_IS_MULTIPLANAR(b->type))
+ 		orig_planes = b->m.planes;
+ 
+@@ -305,9 +308,6 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
+ 	use_dmabuf = (orig_memory == V4L2_MEMORY_DMABUF) &&
+ 		     (ioctl == VIDIOC_QBUF || ioctl == VIDIOC_PREPARE_BUF);
+ 	if (use_dmabuf) {
+-		struct virtio_media_queue_state *queue =
+-			&session->queues[b->type];
+-
+ 		if (b->index >= queue->allocated_bufs)
+ 			return -EINVAL;
+ 		state = &queue->buffers[b->index];
+@@ -378,11 +378,36 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
+ 
+ restore_memory:
+ 	/*
+-	 * Single exit so the substitution above is undone on every path,
+-	 * including the error ones: @b belongs to the caller and the device
+-	 * writes its own USERPTR into it during the round trip.
++	 * Restore the memory type on every path and for every one of these
++	 * three ioctls, not only for the DMABUF substitution.
++	 *
++	 * The device model runs its own queue as MMAP and the reply overwrites
++	 * the whole v4l2_buffer (@b is mapped as a device-writable descriptor
++	 * too, see the loop above), so whatever the host's vb2 puts in `memory`
++	 * lands in the caller's struct. For QUERYBUF that is V4L2_MEMORY_MMAP,
++	 * and it is what user-space then sees.
++	 *
++	 * That is fatal for a DMABUF queue, one step away from its cause:
++	 * v4l2_codec2 calls QUERYBUF while building each V4L2Buffer, so its
++	 * cached v4l2_buffer comes back stamped MMAP, and queueDMABuf()'s
++	 * `if (memory() != V4L2_MEMORY_DMABUF) "Called on invalid buffer type!"`
++	 * then rejects every buffer -- the decoder fails before a single QBUF and
++	 * it looks like DMABUF support was never added. The same clobber applied
++	 * to USERPTR and was being masked by v4l2_codec2 skipping QUERYBUF
++	 * entirely for that memory type.
++	 *
++	 * The authority is the queue, not @b: for QUERYBUF `memory` is an OUTPUT
++	 * field, so user-space is not required to have set it and @orig_memory
++	 * can legitimately be 0. REQBUFS records queue->memory precisely so this
++	 * can be answered. Fall back to @orig_memory when no buffers are
++	 * allocated, i.e. when there is no queue state to be authoritative.
++	 *
++	 * Plane lengths are deliberately left as the host wrote them --
++	 * scatterlist_builder_add_buffer_dmabuf()'s coverage check needs them.
+ 	 */
+-	if (use_dmabuf)
++	if (queue->allocated_bufs > 0)
++		b->memory = queue->memory;
++	else if (use_dmabuf)
+ 		b->memory = orig_memory;
+ 
+ 	return ret;

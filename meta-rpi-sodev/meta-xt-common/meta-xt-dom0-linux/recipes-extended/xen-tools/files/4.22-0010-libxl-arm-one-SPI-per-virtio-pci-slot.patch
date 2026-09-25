@@ -1,0 +1,153 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 25 Aug 2026 11:56:39 +0900
+Subject: [PATCH] libxl/arm: one SPI per virtio-pci slot instead of INTA-D
+
+With four SPIs the interrupt-map wraps (irq = irq_first + ((pin + slot) %
+num_irqs)), so slots 1&5, 2&6, 3&7 and 4&8 share one level-triggered SPI each.
+Measured in DomA with eight virtio-pci devices (2026-08-24):
+
+    14: 14437  Level  virtio0, virtio4   (blk 01   + tablet 05)
+    15:   599  Level  virtio1, virtio5   (vsock 02 + net1 06)
+    16: 30570  Level  virtio2, virtio6   (serial 03+ gpu 07)
+    17:   155  Level  virtio7, virtio3   (net0 04  + snd 08)
+
+virtio-blk and virtio-net recover from a lost interrupt on the next kick, but
+virtio-snd's used-buffer interrupt is its only wake-up source, so one lost
+interrupt stalls playback permanently. The guest cannot use MSI instead: this
+SoC has a GIC-400 (GICv2, no ITS) and Xen emulates no GICv2m frame for guests.
+
+Hand out one SPI per slot, sixteen per host, and widen interrupt-map-mask to
+four device-number bits. Sixteen rather than eight because the hardware decoder
+adds virtio-media at slot 09.0, and at eight the map wraps again and slot 9
+lands on slot 1 -- virtio-blk, the rootfs. GUEST_VIRTIO_PCI_SPI_FIRST..LAST is
+32 SPIs, so at sixteen a guest can have two virtio-pci hosts: libxl allocates
+them per guest, one per backend domain, and every guest here has one, DomD. The
+SPI BUILD_BUG_ON becomes a bound rather than an equality, and a runtime guard
+rejects a third host instead of letting it overlap. The interrupt-map keeps an
+entry per slot for each of the four INTx pins rather than one per SPI, since a
+PCI function has no pin beyond INTD.
+
+Requires the matching qemu change (one SPI per virtio-pci slot). An older qemu
+rejects num_irqs != GPEX_NUM_IRQS and the device model fails to spawn, so the
+two must be deployed together.
+
+This is the two steps the bring-up took (4 -> 8 -> 16) as one change: eight was
+never shipped, and a guest DT generated at eight pairs with no libxl here.
+Rebased onto Xen 4.22: the prefetch-window equality the first step relaxed had
+already become a bound in 4.22-0009 (the Venus 256 MiB window), so only the SPI
+equality is touched.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [downstream fork / BSP-layer delta]
+---
+--- a/tools/libs/light/libxl_arm.c
++++ b/tools/libs/light/libxl_arm.c
+@@ -43,7 +43,46 @@
+  * domain), so nothing that works today stops working.
+  */
+ #define VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE   xen_mk_ullong(0x10000000)
+-#define VIRTIO_PCI_HOST_NUM_SPIS            4
++/*
++ * One SPI per PCI slot instead of the four INTA-D lines, and sixteen of them.
++ *
++ * With 4 the interrupt-map wraps (irq = irq_first + ((pin + slot) % num_irqs)),
++ * so slots 1&5, 2&6, 3&7 and 4&8 share one level-triggered SPI each. Measured
++ * in DomA with eight virtio-pci devices (2026-08-24):
++ *     14: 14437  Level  virtio0, virtio4   (blk 01   + tablet 05)
++ *     15:   599  Level  virtio1, virtio5   (vsock 02 + net1 06)
++ *     16: 30570  Level  virtio2, virtio6   (serial 03+ gpu 07)
++ *     17:   155  Level  virtio7, virtio3   (net0 04  + snd 08)
++ * virtio-blk and virtio-net recover from a lost interrupt on the next kick, but
++ * virtio-snd's used-buffer interrupt is its only wake-up source: the shared line
++ * stopped delivering after 155 interrupts and playback stalled permanently.
++ *
++ * Sixteen, not eight: DomA already fills slots 01.0..08.0 and the hardware
++ * decoder adds virtio-media at 09.0. At eight the map wraps again and slot 9
++ * lands on slot 1's line -- virtio-blk, the rootfs. A decode session waits on
++ * DQBUF and on the event queue, so a dropped completion stalls it with no kick
++ * to recover it, unlike virtio-blk.
++ *
++ * Slot N -> SPI_FIRST + N for every slot that exists, no wrap:
++ *   01 blk  02 vsock  03 serial  04 net  05 tablet
++ *   06 net1 07 gpu    08 snd     09 media
++ *
++ * The window is unchanged and sufficient: SPI_FIRST..LAST is 32 SPIs = two
++ * hosts of 16. A guest gets one host per backend domain (alloc_virtio_pci_host()
++ * allocates them per guest), so that is two backend domains per guest, and every
++ * guest here has one, DomD. A third host is rejected by the runtime guard in
++ * alloc_virtio_pci_host() rather than silently overlapping.
++ *
++ * The guest cannot use MSI instead: this SoC has a GIC-400 (GICv2, no ITS) and
++ * Xen emulates no GICv2m frame for guests, so the guest only has legacy INTx.
++ *
++ * Requires the matching qemu change (one SPI per virtio-pci slot). An older
++ * qemu rejects num_irqs != GPEX_NUM_IRQS and the device model fails to spawn,
++ * so the two must be deployed together.
++ */
++#define VIRTIO_PCI_HOST_NUM_SPIS            16
++/* INTA..INTD: the interrupt-map has an entry per slot for each of them. */
++#define VIRTIO_PCI_HOST_NUM_PINS            4
+ #define VIRTIO_PCI_MAX_HOSTS                8
+ #define VIRTIO_PCI_MAX_PREFETCH_HOSTS       \
+     (GUEST_VIRTIO_PCI_PREFETCH_MEM_SIZE / VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE)
+@@ -134,7 +173,13 @@ static int alloc_virtio_pci_host(libxl__gc *gc,
+     BUILD_BUG_ON(VIRTIO_PCI_MAX_PREFETCH_HOSTS < 1);
+     BUILD_BUG_ON(GUEST_VIRTIO_PCI_PREFETCH_MEM_SIZE %
+                  VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE);
+-    BUILD_BUG_ON(VIRTIO_PCI_MAX_HOSTS !=
++    /*
++     * The SPI window now holds fewer hosts than the ECAM and MEM windows do
++     * (NUM_SPIS was raised to 16), so this is a bound, not an equality: 32 SPIs
++     * at 16 each is 2 hosts. The per-host range is checked against SPI_LAST in
++     * alloc_virtio_pci_host() below.
++     */
++    BUILD_BUG_ON(VIRTIO_PCI_MAX_HOSTS <
+                  (GUEST_VIRTIO_PCI_SPI_LAST - GUEST_VIRTIO_PCI_SPI_FIRST) / VIRTIO_PCI_HOST_NUM_SPIS);
+ 
+     if (*num_hosts > VIRTIO_PCI_MAX_HOSTS)
+@@ -189,6 +234,13 @@ static int alloc_virtio_pci_host(libxl__gc *gc,
+     hosts[i].irq_first = GUEST_VIRTIO_PCI_SPI_FIRST +
+         i * VIRTIO_PCI_HOST_NUM_SPIS;
+     hosts[i].num_irqs = VIRTIO_PCI_HOST_NUM_SPIS;
++    if (hosts[i].irq_first + hosts[i].num_irqs - 1 > GUEST_VIRTIO_PCI_SPI_LAST) {
++        LOG(ERROR, "virtio-pci host #%u SPI range %u..%u exceeds %u",
++            i, hosts[i].irq_first,
++            hosts[i].irq_first + hosts[i].num_irqs - 1,
++            GUEST_VIRTIO_PCI_SPI_LAST);
++        return ERROR_INVAL;
++    }
+ 
+     *host_id = hosts[i].id;
+ 
+@@ -1127,12 +1179,12 @@ static int create_virtio_pci_irq_map(libxl__gc *gc, void *fdt,
+         return res;
+ 
+     cells = res;
+-    len = sizeof(uint32_t) * host->num_irqs * host->num_irqs *
++    len = sizeof(uint32_t) * host->num_irqs * VIRTIO_PCI_HOST_NUM_PINS *
+           (PCI_IRQ_MAP_MIN_STRIDE + cells);
+     irq_map = full_irq_map = libxl__malloc(gc, len);
+ 
+     for (slot = 0; slot < host->num_irqs; slot++) {
+-        for (pin = 0; pin < host->num_irqs; pin++) {
++        for (pin = 0; pin < VIRTIO_PCI_HOST_NUM_PINS; pin++) {
+             uint32_t irq = host->irq_first + ((pin + slot) % host->num_irqs);
+             unsigned int i = 0;
+ 
+@@ -1162,8 +1214,14 @@ static int create_virtio_pci_irq_map(libxl__gc *gc, void *fdt,
+     res = fdt_property(fdt, "interrupt-map", full_irq_map, len);
+     if (res) return res;
+ 
++    /*
++     * Mask FOUR device-number bits (slots 0-15) to match
++     * VIRTIO_PCI_HOST_NUM_SPIS = 16. PCI_DEVFN(3, 0) masked two bits, so slot 8
++     * folded onto slot 0 and every line was shared; three bits would be right
++     * for 8 SPIs but folds slot 9 (virtio-media) onto slot 1 (virtio-blk).
++     */
+     res = fdt_property_values(gc, fdt, "interrupt-map-mask", 4,
+-                              PCI_DEVFN(3, 0) << 8, 0, 0, 0x7);
++                              PCI_DEVFN(15, 0) << 8, 0, 0, 0x7);
+     if (res) return res;
+ 
+     return 0;

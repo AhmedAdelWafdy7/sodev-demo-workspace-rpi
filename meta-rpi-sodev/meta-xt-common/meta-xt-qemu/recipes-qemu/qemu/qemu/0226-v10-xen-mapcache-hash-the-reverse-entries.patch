@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 04 Sep 2026 16:51:23 +0900
+Subject: [PATCH] xen/mapcache: find reverse entries by hash, not by list walk
+
+Every dma_memory_unmap() ends in xen-mapcache twice: address_space_unmap()
+asks memory_region_from_host() for the RAM address, which walks
+locked_entries in xen_ram_addr_from_mapcache_single(), and the invalidation
+walks it again in xen_invalidate_map_cache_entry_unlocked(). The list
+holds one MapCacheRev per locked page, and virtio-gpu keeps every page of
+every live resource locked for the resource's lifetime, so on a guest
+running a compositor the list is thousands long and each unmap is a
+linear scan.
+
+perf on RPi4 DomD (qemu 10.0.2, DomA playing 360p H.264 through the
+hardware decoder, cpu-clock sampling of the device model):
+
+  4.00 %  xen_invalidate_map_cache_entry_unlocked
+  3.53 %  xen_ram_addr_from_mapcache_single
+
+both entirely under virgl_cmd_resource_unref -> virtio_gpu_cleanup_mapping_iov
+-> address_space_unmap. 7.5 % of the device model's CPU on list walks.
+
+Index the reverse entries by vaddr_req in a GHashTable alongside the list.
+A vaddr can be locked more than once; the newest entry is kept in the table
+and chains to the older ones, so removal keeps the same order the head-
+inserted list gave. The list itself stays for the iteration in
+xen_invalidate_map_cache_single().
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/hw/xen/xen-mapcache.c b/hw/xen/xen-mapcache.c
+index 33ca168699f..cd9374389b7 100644
+--- a/hw/xen/xen-mapcache.c
++++ b/hw/xen/xen-mapcache.c
+@@ -55,6 +55,8 @@ typedef struct MapCacheRev {
+     hwaddr paddr_index;
+     hwaddr size;
+     QTAILQ_ENTRY(MapCacheRev) next;
++    /* Older lock of the same vaddr_req, if any (see locked_by_vaddr). */
++    struct MapCacheRev *same_vaddr;
+     bool dma;
+ } MapCacheRev;
+ 
+@@ -62,6 +64,15 @@ typedef struct MapCache {
+     MapCacheEntry *entry;
+     unsigned long nr_buckets;
+     QTAILQ_HEAD(, MapCacheRev) locked_entries;
++    /*
++     * vaddr_req -> newest MapCacheRev with that vaddr_req. Unmapping and
++     * host-to-guest address translation both have to find the reverse entry
++     * for a host pointer, and locked_entries can hold every page of every
++     * live virtio-gpu resource (thousands), so a list walk there is paid on
++     * every dma_memory_unmap() in the process. A hit or miss here is one
++     * hash probe; the list stays for iteration.
++     */
++    GHashTable *locked_by_vaddr;
+ 
+     /* For most cases (>99.9%), the page address is the same. */
+     MapCacheEntry *last_entry;
+@@ -115,6 +126,7 @@ static MapCache *xen_map_cache_init_single(phys_offset_to_gaddr_t f,
+     qemu_mutex_init(&mc->lock);
+ 
+     QTAILQ_INIT(&mc->locked_entries);
++    mc->locked_by_vaddr = g_hash_table_new(g_direct_hash, g_direct_equal);
+ 
+     mc->bucket_shift = bucket_shift;
+     mc->bucket_size = 1UL << bucket_shift;
+@@ -441,6 +453,10 @@ tryagain:
+         reventry->paddr_index = mc->last_entry->paddr_index;
+         reventry->size = entry->size;
+         QTAILQ_INSERT_HEAD(&mc->locked_entries, reventry, next);
++        reventry->same_vaddr = g_hash_table_lookup(mc->locked_by_vaddr,
++                                                   reventry->vaddr_req);
++        g_hash_table_insert(mc->locked_by_vaddr, reventry->vaddr_req,
++                            reventry);
+     }
+ 
+     trace_xen_map_cache_return(
+@@ -492,13 +508,11 @@ static ram_addr_t xen_ram_addr_from_mapcache_single(MapCache *mc, void *ptr)
+     int found = 0;
+ 
+     mapcache_lock(mc);
+-    QTAILQ_FOREACH(reventry, &mc->locked_entries, next) {
+-        if (reventry->vaddr_req == ptr) {
+-            paddr_index = reventry->paddr_index;
+-            size = reventry->size;
+-            found = 1;
+-            break;
+-        }
++    reventry = g_hash_table_lookup(mc->locked_by_vaddr, ptr);
++    if (reventry) {
++        paddr_index = reventry->paddr_index;
++        size = reventry->size;
++        found = 1;
+     }
+     if (!found) {
+         trace_xen_ram_addr_from_mapcache_not_found(ptr);
+@@ -546,13 +560,11 @@ static void xen_invalidate_map_cache_entry_unlocked(MapCache *mc,
+     int found = 0;
+     int rc;
+ 
+-    QTAILQ_FOREACH(reventry, &mc->locked_entries, next) {
+-        if (reventry->vaddr_req == buffer) {
+-            paddr_index = reventry->paddr_index;
+-            size = reventry->size;
+-            found = 1;
+-            break;
+-        }
++    reventry = g_hash_table_lookup(mc->locked_by_vaddr, buffer);
++    if (reventry) {
++        paddr_index = reventry->paddr_index;
++        size = reventry->size;
++        found = 1;
+     }
+     if (!found) {
+         trace_xen_invalidate_map_cache_entry_unlocked_not_found(buffer);
+@@ -564,6 +576,12 @@ static void xen_invalidate_map_cache_entry_unlocked(MapCache *mc,
+         }
+         return;
+     }
++    /* Newest lock of this vaddr goes first, as the list walk did. */
++    if (reventry->same_vaddr) {
++        g_hash_table_insert(mc->locked_by_vaddr, buffer, reventry->same_vaddr);
++    } else {
++        g_hash_table_remove(mc->locked_by_vaddr, buffer);
++    }
+     QTAILQ_REMOVE(&mc->locked_entries, reventry, next);
+     g_free(reventry);
+ 

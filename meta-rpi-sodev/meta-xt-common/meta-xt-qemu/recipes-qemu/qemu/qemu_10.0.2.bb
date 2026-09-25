@@ -57,8 +57,10 @@
 #      instead: 0118 is 0111 rebased (virtio-tablet BTN_TOUCH, DomA touch) and 0120
 #      is 0110 rebased (virtio-pci ISR IOREQ range). Of the rest, 0112 is moot (no
 #      hw/arm/xen_arm.c and no GUEST_TPM_BASE anywhere in 10.0.2), 0113 is fixed in
-#      10.0.2 itself, and 0101/0103 guard a pre-main-loop death that does not
-#      reproduce here. That bbappend states the evidence per patch.
+#      10.0.2 itself, and 0101/0103 come back squashed and forward-ported as
+#      0201, with the hardware-decode patches below: the pre-main-loop death
+#      they guard was not seen on 10.0.2, but the synchronous autostart path it
+#      comes from is still there. That bbappend states the evidence per patch.
 require recipes-devtools/qemu/qemu_10.2.0.bb
 
 # '=' not ':append': oe-core's SRC_URI is the release tarball, the patches written
@@ -295,3 +297,213 @@ SYSTEMD_SERVICE:${PN}-guest-agent = ""
 # `bb.utils.filter('DISTRO_FEATURES', 'alsa pulseaudio xen', d)` would otherwise
 # add a pulseaudio DEPENDS to the DomD build.
 PACKAGECONFIG:remove = "pulseaudio"
+
+# ---------------------------------------------------------------------------
+# virtio-media and the Xen/virgl work the hardware decoder needs.
+#
+# Listed here one per line like the patches above, because this recipe is the
+# one place that knows which qemu this product builds. The decode bring-up's
+# 0210 (IOREQ MMIO self-heal) and 0211 (virtio-input BTN_TOUCH) are not
+# carried: 0120 and 0118 above are the same two fixes, written against this
+# recipe.
+# ---------------------------------------------------------------------------
+SRC_URI:append:class-target = " file://0201-v10-xen-keep-the-autostart-device-model-alive.patch"
+
+SRC_URI:append:class-target = " file://0215-v10-xen-pvh-common-one-INTX-line-per-virtio-pci-slot.patch"
+
+SRC_URI:append:class-target = " file://0216-v10-hw-virtio-add-a-native-virtio-media-device.patch"
+
+# 0222: move the commandq processing into a BH. On Xen/Arm even an MMIO write
+#   leaves the guest vCPU descheduled until the ioreq completes
+#   (ioreq_needs_completion() excludes only PIO writes), and qemu can complete
+#   an ioreq only from the main loop (xen_io_listener has no .eventfd_add, i.e.
+#   no ioeventfd). So doing a host V4L2 ioctl and a 942 KB copy inside the vq
+#   handler stops the MMIO of every other DomA device for that whole time.
+#   virtio-gpu already moves this into a BH for the same reason.
+# 0223: narrow the host-side drain with poll's revents. Measured 77 wasted
+#   ioctls per frame (DQEVENT fails 100 % of the time, 96 % of DQBUF is EAGAIN).
+#   A standalone m2m poll test confirmed a 66.7 % reduction for both vicodec
+#   and bcm2835-codec.
+SRC_URI:append:class-target = " file://0222-v10-virtio-media-defer-commands-to-a-bottom-half.patch"
+
+SRC_URI:append:class-target = " file://0223-v10-virtio-media-drain-only-what-poll-reports.patch"
+
+# 0224-v10: restore the 7.0 behaviour of the Xen mapcache. Since 9.1 the bucket
+#   head entry is munmap'd as well once its lock drops to 0, so every 4 KiB
+#   entry costs a privcmd foreign map plus a munmap (a hypercall pair). For
+#   virtio-media's 942 KB/frame that measured about 6 ms/frame (the memcpy
+#   itself is 0.6 ms). Grants are still unmapped the way upstream does it. The
+#   DMA of virtio-blk/net/gpu takes the same path, so this helps beyond HW
+#   decode. The fork reverted its own copy of this workaround in the commit
+#   SRCREV_qemu pins; the patch says why it is back for foreign mappings.
+# 0225-v10: coalesce physically contiguous SG entries in QBUF, so a contiguous
+#   run of pages is mapped once.
+SRC_URI:append:class-target = " file://0224-v10-xen-mapcache-keep-foreign-bucket-heads-mapped.patch"
+
+SRC_URI:append:class-target = " file://0225-v10-virtio-media-coalesce-sg-runs.patch"
+
+# 0226-v10 / 0227-v10: two patches attributed with perf (cpu-clock, on qemu
+#   during HW playback), measured on the board, 2026-09-04.
+# 0226: hash the mapcache reverse lookup (vaddr -> MapCacheRev). virtio-gpu
+#   keeps every page of a live resource locked, so locked_entries runs into the
+#   thousands, and the two linear scans per unmap are 7.5 % of qemu's CPU.
+# 0227: V4L2_MEMORY_FLAG_NON_COHERENT on the host-side REQBUFS. A coherent vb2
+#   MMAP is Normal-NC and reads at 678 MB/s (3469 MB/s when cached). The
+#   942 KB/frame memcpy is 10.7 % of qemu's CPU. Pairs with 0015 on the DomD
+#   kernel side (bcm2835-codec allow_cache_hints). If the driver does not
+#   support it, vb2 just drops the flag and no harm is done (the log's
+#   non_coherent=0/1 says which).
+SRC_URI:append:class-target = " file://0226-v10-xen-mapcache-hash-the-reverse-entries.patch"
+
+SRC_URI:append:class-target = " file://0227-v10-virtio-media-request-non-coherent-host-buffers.patch"
+
+# 0228-v10: virtio-media transfers the decode result straight into the guest's
+#   virgl resource. When the guest puts a virgl resource id in QBUF's
+#   reserved2, as v4l2_codec2 does, DQBUF writes from the host buffer into the
+#   GL texture with virgl_renderer_transfer_write_iov, which skips the 942 KB
+#   copy into guest pages and the guest's TRANSFER_TO_HOST + WAIT (3 to
+#   4.7 ms/frame). -device ...,host-xfer=off disables it.
+SRC_URI:append:class-target = " file://0228-v10-virtio-media-direct-virgl-transfer.patch"
+
+# 0229-v10: replace 0228's CPU tiling (glTexSubImage2D -> v3d_move_pixels) with
+#   the GPU. The host capture buffer is exported as a dmabuf -> EGLImage
+#   (LINEAR) -> glBlitFramebuffer into the virgl resource's texture, which v3d
+#   turns into a TFU job (glCopyImageSubData would be a CPU copy on v3d). A
+#   dedicated EGL context, and a fence guards QBUF.
+#   -device ...,gpu-xfer=off disables it (falling back to 0228's path).
+SRC_URI:append:class-target = " file://0229-v10-virtio-media-gpu-copy-into-virgl-resource.patch"
+
+# 0230-v10: with gpu-xfer, CAPTURE stays coherent (the CPU never reads it, so
+#   0227's cache maintenance is wasted).
+SRC_URI:append:class-target = " file://0230-v10-virtio-media-coherent-capture-buffers-with-gpu-xfer.patch"
+
+# 0231-v10: make CAPTURE NV12 on the host and convert it to RGBA in a GPU shader
+#   (this avoids the order-10 allocation failure; the guest still sees RGBA).
+#   host-nv12=off goes back.
+SRC_URI:append:class-target = " file://0231-v10-virtio-media-host-nv12-capture-with-gpu-conversion.patch"
+
+# 0232-v10: never unmap an IOREQ MMIO range. In the gap between region_del and
+#   region_add a virtio-pci ISR read becomes a data abort and the guest panics
+#   in vp_interrupt. Reproduced within seconds with an asynchronous/polling
+#   driver. On -EEXIST it re-adds the span page by page, in place of 0120's
+#   self-heal, whose unmap reopened that gap.
+SRC_URI:append:class-target = " file://0232-v10-xen-never-unregister-ioreq-mmio-ranges.patch"
+
+# 0233-v10: suppress the guest's notifications (kicks) while virtio-gpu-gl's
+#   ctrl queue is being processed (the same idiom as virtio-blk). At 720p60 that
+#   was 360 kicks/s, which this cuts down.
+SRC_URI:append:class-target = " file://0233-v10-virtio-gpu-gl-suppress-notifications-while-draining.patch"
+
+# 0234-v10: when virtio-media's host fd wakes on POLLERR alone (vb2: a queue
+#   with no buffers), park the handler and restore it on QBUF/STREAMON. At
+#   720p60 this was 2402 of the main loop's 3112 wakeups in 4 s.
+SRC_URI:append:class-target = " file://0234-v10-virtio-media-park-fd-handler-on-pollerr.patch"
+
+# 0235-v10: poll for retired fences every 1 ms instead of 10 ms. A guest
+#   blocked on a fence waits for the next tick, and the 10 ms tick capped
+#   1080p60 at 14.7 fps and 720p60 at 22 fps.
+SRC_URI:append:class-target = " file://0235-v10-virtio-gpu-virgl-poll-retired-fences-every-1-ms.patch"
+
+# 0242-v10: two levers for the host-side QBUF cost (gpu_wait 449 us / host
+# ioctl 593 us, the latter over both queues, against 84 us native), both off by
+# default and both turned on by the RPi4's DomA cfg: (a) output-coherent:
+# rb.flags=0 for the host OUTPUT as well (vb2 syncs the whole sizeimage of
+# 524288 while the copy is only 8 KB); (b) gpu-fence-fd: take the
+# EGL_ANDROID_native_fence_sync fd at blit time, so QBUF only does poll(fd,0)
+# (removing two eglMakeCurrent calls).
+SRC_URI:append:class-target = " file://0242-v10-virtio-media-output-coherent-and-gpu-fence-fd.patch"
+
+# Pairs with XT_DOMA_HWDEC_DEVARG = "decoder=hevc" (the shared xt-xen-cfg-doma
+# default for raspberrypi5) and with XT_DOMA_HWDEC=true on the AOSP side, which
+# installs android.hardware.media.c2@1.2-service-v4l2. All three are required:
+# the guest-facing decoder, the device argument that selects it, and the Android
+# component that drives it. 0217 comes after 0242, not next to 0216, because its
+# hunks are anchored on code 0222..0242 add.
+SRC_URI:append:class-target = " file://0217-v10-hw-virtio-media-add-a-stateful-decoder-mode.patch"
+
+SRC_URI:append:class-target = " file://0218-v10-hw-virtio-media-drive-decoder-mode-with-the-v4l2request-hwaccel.patch"
+
+# libavcodec for the decoder mode 0217 adds and 0218 drives, and ONLY for the
+# Raspberry Pi 5.
+#
+# The two boards reach hardware decode through different host devices, and only one
+# of them needs a codec library in the device model. On a Pi 4 the host device is
+# bcm2835-codec, which is a STATEFUL V4L2 decoder, so 0216's plain one-node proxy is
+# the whole path: the guest's stateful decoder maps onto a stateful host decoder and
+# nothing parses the bitstream in qemu. BCM2712's only decode block is codec@800000
+# driven by rpi-hevc-dec, and that is STATELESS -- a media device plus a request fd
+# per frame, with the caller expected to parse the bitstream and build the DPB.
+# virtio-media cannot carry either: its protocol has five commands and no file
+# descriptors, and Android's external/v4l2_codec2 has no stateless support at all.
+# So 0217 converts on the host, offering the guest an ordinary stateful HEVC decoder
+# and letting libavcodec do the stateless driving.
+#
+# rpidistro-ffmpeg rather than poky's ffmpeg: only the Raspberry Pi fork carries the
+# v4l2request hwaccel that 0218 uses. Named as the RECIPE, so PREFERRED_PROVIDER is
+# not involved -- that only decides who provides the virtual `ffmpeg`, and this
+# DEPENDS is unambiguous on its own.
+#
+# The dependency is what turns decoder mode on, not a configure switch: meson finds
+# the three libraries with pkg-config, and the file 0217 adds stubs itself out when
+# they are absent. That is why the Pi 4 binary is unaffected even though the patches
+# are applied for both boards -- it gets the stub, and its device argument
+# (XT_DOMA_HWDEC_DEVARG, v4l2-device=/dev/video10) never selects decoder mode.
+DEPENDS:append:raspberrypi5 = " rpidistro-ffmpeg"
+
+# 0219-v10: the board run that produced the 0218 measurements then died on the
+# fourth input buffer. Decoder mode failed VIDIOC_QBUF while libavcodec was full
+# -- an OUTPUT queue is a queue, and v4l2_codec2 treats a QBUF failure as fatal
+# (pumpDecodeRequest -> state Error). Input is backlogged instead now. Must stay
+# after 0218: it patches the dec_qbuf/dec_pump that 0217 adds.
+SRC_URI:append:class-target = " file://0219-v10-hw-virtio-media-do-not-fail-an-OUTPUT-QBUF-when-the-decoder-is-full.patch"
+
+# 0244-v10: the OUTPUT buffer timestamp was never returned to the guest, so
+# v4l2_codec2 lost every decode callback after the first (its bitstreamId rides
+# in that field) and stopped recycling output buffers -- instrumented guest side
+# showed the surface pool saturated at max=23 cur=23. Must stay after 0219.
+SRC_URI:append:class-target = " file://0244-v10-hw-virtio-media-return-the-OUTPUT-buffer-timestamp-on-completion.patch"
+
+# 0245-v10: the decode was already right (0219/0244) and the picture was still
+# black. This is the display half: RGBA out, because DomA's virgl GL has no
+# GL_EXT_YUV_target and cannot sample NV12 at all, plus 0228's direct
+# virgl transfer from decoder mode, because virtio-media writes the guest pages
+# while the compositor samples the host resource. Must stay after 0244.
+SRC_URI:append:class-target = " file://0245-v10-hw-virtio-media-give-decoder-mode-an-RGBA-output-and-the-direct-virgl-transfer.patch"
+
+# 0243-v10: HDMI audio goes completely silent during 1080p30 HW decode. Draining
+# TX depends on the audio backend's main-loop callback, and the same main loop
+# is turning virtio-media's QBUF, so it is delayed: the guest's PCM write blocks
+# for up to 89 ms, the HAL's ring overflows, and AudioFlinger's data is thrown
+# away (measured with strace and a recording tap, 2026-09-16). ioeventfd gives
+# no fast path under Xen (xen_io_listener has no .eventfd_add), so this cannot
+# be handed to an iothread. Instead a dedicated thread runs the
+# same drain function. Off by default. On the board it is enabled by adding
+# tx-poll-us=10000 to virtio-snd in doma.cfg.
+SRC_URI:append:class-target = " file://0243-v10-virtio-snd-drain-tx-from-a-dedicated-thread.patch"
+# 0122: 0115 reads the virtio-pci layout from xenstore and 0215 can hand out one
+# INTX line per slot, but nothing passed the count between them -- the GPEX stayed
+# at four lines however many the guest DT declared, which pairs slots onto shared
+# level-triggered SPIs and stalls virtio-snd and the decoder. libxl already
+# publishes num_irqs; this reads it.
+SRC_URI:append:class-target = " file://0122-hw-arm-pass-the-virtio-pci-INTX-line-count-to-the-GPEX.patch"
+
+# 0246-v10: host-max-width=N lets 0231's NV12 -> RGBA shader scale a frame wider
+# than N down to N (both axes by the width ratio, the compose rectangle with
+# it), so a 1080p stream reaches a 1280x720 DomA already at display size instead
+# of as 8.4 MB of RGBA that SurfaceFlinger then scales. It applies to every
+# decode wider than N, displayed or not. Off (0) by default, and meant to be
+# set per board from DomA's display width, in the board layer's
+# xt-xen-cfg-doma_%.bbappend. Measured on the RPi4 at 1080p30 with the
+# guest's frame rate override off: SF 27.1-28.8 -> 29.2-29.7 fps, missed
+# 5.3-7.8 -> 0.9-1.3/s. Its context is 0231, 0242 and 0217, so it stays after
+# them.
+SRC_URI:append:class-target = " file://0246-v10-hw-virtio-media-let-host-nv12-scale-the-frame-down-to-the-display.patch"
+
+# 0247-v10: gpu_draw_nv12() redraws the whole RGBA target with one triangle but
+# never invalidated it, so V3D loaded the old target into its tile buffer before
+# every draw (3.7 MB at the RPi4's 1280x720, 8.4 MB at 1920x1088).
+# glInvalidateFramebuffer after the completeness check lets Mesa's v3d skip that
+# load. Measured on the RPi4 (host-max-width=1280), decode only: qemu's V3D
+# render per frame 3.21 -> 2.77 ms at 1080p60, 1.25 -> 0.99 ms at 720p60. Its
+# context is 0231's; the line numbers assume 0246, so it stays after it.
+SRC_URI:append:class-target = " file://0247-v10-hw-virtio-media-invalidate-the-RGBA-target-before-the-NV12-draw.patch"

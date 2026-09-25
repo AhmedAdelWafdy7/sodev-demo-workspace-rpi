@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 24 Sep 2026 10:53:28 +0900
+Subject: [PATCH] hw/virtio-media: invalidate the RGBA target before the NV12
+ draw
+
+gpu_draw_nv12() converts each decoded NV12 frame into the guest's RGBA
+resource with one full-screen triangle, and never tells GL that the old
+contents of that target do not matter. On a tiled GPU (V3D on the
+Raspberry Pi) that makes every draw load the whole target into the tile
+buffer first -- 3.7 MB for a 1280x720 frame, every frame -- only for the
+triangle to overwrite all of it.
+
+glInvalidateFramebuffer() on the colour attachment says the contents are
+dead. Mesa's v3d marks the resource invalidated and skips the load in the
+first job it builds after a framebuffer state change -- which is every
+draw here as long as consecutive frames go to different capture buffers,
+the normal case; when the same buffer is the target twice in a row the
+load still happens, so the gain is lost but nothing else changes. The draw
+covers the target exactly (viewport = target size, no scissor, no blend,
+full colour mask), so nothing visible changes. It has to come after
+glCheckFramebufferStatus: glFramebufferTexture2D marks the attachment
+incomplete again, and Mesa ignores an invalidate on an attachment that has
+not been through the completeness test since.
+
+Measured on the RPi4 (2026-09-24, H.264 through the codec CLI, decode
+only, host-max-width=1280), qemu's V3D render time per frame:
+  1080p60: 3.21 -> 2.77 ms, decode 71.1 -> 74.3 fps
+  720p60:  1.25 -> 0.99 ms
+1080p30 through VideoView stayed at 29.2-29.8 fps.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device
+ (0216), which upstream qemu does not have]
+---
+ hw/virtio/virtio-media-virgl.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/hw/virtio/virtio-media-virgl.c b/hw/virtio/virtio-media-virgl.c
+index 5ec4e01c93e..72e53c31eee 100644
+--- a/hw/virtio/virtio-media-virgl.c
++++ b/hw/virtio/virtio-media-virgl.c
+@@ -489,6 +489,7 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
+     float cscale = full ? 1.0f : 255.0f / 224.0f;
+     float c[4] = { coef[0] * cscale, coef[1] * cscale, coef[2] * cscale,
+                    coef[3] * cscale };
++    static const GLenum invalidate = GL_COLOR_ATTACHMENT0;
+     GLenum status;
+ 
+     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gpu.draw_fbo);
+@@ -499,6 +500,16 @@ static int gpu_draw_nv12(VirtIOMediaGpuBuf *b, GLuint dst_tex)
+         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+         return -EIO;
+     }
++    /*
++     * The triangle below covers the whole target, so its old contents are
++     * dead. Say so: without it the tiled GPU loads the full RGBA target into
++     * its tile buffer before drawing (3.7 MB for a 1280x720 frame). This must
++     * stay after glCheckFramebufferStatus: glFramebufferTexture2D marks the
++     * attachment incomplete again, the check is what runs the completeness
++     * test, and Mesa ignores an invalidate on an attachment that has not
++     * passed it.
++     */
++    glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &invalidate);
+     glDisable(GL_SCISSOR_TEST);
+     glDisable(GL_BLEND);
+     glDisable(GL_DEPTH_TEST);

@@ -85,6 +85,65 @@ XT_VENUS_VKR_DEVICE_HEAP_MIB ??= "1088"
 # fallback only ever applies to a bare `bitbake` in this tree's own conf.
 XT_DM_QEMU_VERSION ??= "${@d.getVar('PREFERRED_VERSION_qemu') or '7.0.0'}"
 
+# [hardware decode] Whether DomA is given a virtio-media device. Comes from the
+# moulin GPU parameter through the domd and dom0 component confs, for a reason that
+# is a hard dependency and not a policy: the decoder the guest talks to IS a
+# virtio-media device, and only the qemu 10.0.2 device model has one, so GPU=gl is
+# false, and GPU=vulkan gives whatever the board yaml sets for that lane: true,
+# except in a Dom0 flavour whose DomD has no decoder (the Pi 5's linux one). The
+# same parameter sets it on the AOSP side, where it
+# gates the c2 HAL and its seccomp policy (the HAL's sepolicy is built in every
+# lane) -- the two halves must agree or the guest declares a HAL for a device
+# that is not on the bus.
+#
+# Defaulted for the same reason BOARD_RAM is: a standalone bitbake outside moulin
+# must still install a working config, and "no decoder" is the one configuration
+# every device model in this tree can run. moulin always sets the value explicitly.
+XT_DOMA_HWDEC ??= "false"
+
+# [hardware decode] What the virtio-media device is pointed at. Per board, because
+# the two boards' decode hardware has nothing in common beyond the words "hardware
+# decode":
+#
+#   RPi4  v4l2-device=/dev/video10 -- proxy bcm2835-codec, which is a STATEFUL
+#         H.264 decoder, so the guest talks to it almost directly. video10 because
+#         bcm2835-v4l2-codec registers decode/encode/isp/deinterlace as
+#         video10..13 in that order.
+#   RPi5  decoder=hevc -- there is no stateful device to proxy. BCM2712 has no
+#         vchiq node (measured: zero occurrences in the shipped
+#         bcm2712-rpi-5-b.dtb) so bcm2835-codec cannot bind, and its only decode
+#         block, codec@800000/rpi-hevc-dec, is STATELESS: it needs a media device
+#         and a request fd per frame, neither of which virtio-media can carry.
+#         qemu patches 0217-v10/0218-v10 therefore synthesise a stateful decoder
+#         and drive the stateless side through libavcodec's v4l2request hwaccel.
+#
+# The default is the RPi4 value and only raspberrypi5 overrides it, so the boards
+# that do not set it keep the generated file they had.
+#
+# The RPi4 value also switches on the two levers of qemu patch 0242 (both default
+# off). Measured on that board with 1080p hardware decode running:
+#
+#   phase        default        with both levers
+#   gpu-cap      avg 449 us     avg  43 us
+#   ioctl-out    avg 593 us *   avg 224 us
+#   qbuf-cap     avg 953 us     avg 401 us      max 36730 us -> 14176 us
+#
+#   * measured over both queues together, not OUTPUT alone
+#
+# That matters for AUDIO, not for the decode rate: virtio-snd's TX and virtio-media's
+# QBUF are serviced by the same device-model main loop, so a 37 ms QBUF starves the
+# audio device. With the levers on and the ALSA buffer at doma.cfg's 60 ms the host
+# PCM ran 99.0% of nominal with 0 restarts over 20 s; a 40 ms buffer without them
+# XRUN-ed 125 times in 25 s. (doma.cfg quotes the earlier run that chose its 60 ms,
+# which counted 1-2 XRUNs per 20 s at 40 ms, before these levers existed; the two
+# runs' other conditions were not recorded.)
+#   output-coherent  coherent OUTPUT queue, so vb2 stops syncing 512 KB per 8 KB
+#                    access unit;
+#   gpu-fence-fd     export the blit fence as a sync_file and poll it, instead of two
+#                    eglMakeCurrent calls per CAPTURE QBUF.
+XT_DOMA_HWDEC_DEVARG ?= "v4l2-device=/dev/video10,output-coherent=on,gpu-fence-fd=on"
+XT_DOMA_HWDEC_DEVARG:raspberrypi5 = "decoder=hevc"
+
 
 do_compile() {
     dtc -I dts -O dtb -o ${WORKDIR}/doma.dtb ${UNPACKDIR}/doma.dts
@@ -178,6 +237,100 @@ do_install() {
             ${D}${sysconfdir}/xen/doma.cfg
     fi
 
+    # [hardware decode] Substitute, or delete, the two tokens that carry the
+    # virtio-media device: one in the libxl virtio list (the 09.0 host slot) and one
+    # in device_model_args (the device itself). They are driven by the SAME variable
+    # so DomA can never get a slot with no device on it, or a device with no slot.
+    #
+    # Two tokens rather than one because they live in different lists, and the
+    # non-decode lane must DELETE both lines rather than empty them: bare whitespace
+    # inside either list is not valid Python for xl's config parser.
+    case "${XT_DOMA_HWDEC}" in
+    true)  doma_hwdec=yes ;;
+    false) doma_hwdec=no ;;
+    *)     bbfatal "XT_DOMA_HWDEC must be 'true' or 'false' (got '${XT_DOMA_HWDEC}')" ;;
+    esac
+    # A 7.0.0 device model has no virtio-media device at all, so it would exit on
+    # the -device line and DomA would never start. Keyed on XT_DM_QEMU_VERSION,
+    # the version every other section of this file writes the device-model
+    # syntax for: a conf that names no qemu gets the 7.0.0 fallback there, and
+    # fails here.
+    if [ "$doma_hwdec" = "yes" ]; then
+        case "${XT_DM_QEMU_VERSION}" in
+        7.*) bbfatal "XT_DOMA_HWDEC=true with a qemu ${XT_DM_QEMU_VERSION} device model: virtio-media exists only in the 10.0.2 one" ;;
+        esac
+    fi
+    # Fail loudly rather than ship a placeholder: xl's parser would reject the bare
+    # name, so DomA would never start -- and the same applies if a future edit
+    # renames a token.
+    for doma_tok in XT_DOMA_HWDEC_VIRTIO_PLACEHOLDER XT_DOMA_HWDEC_DEVICE_PLACEHOLDER; do
+        grep -q "^    $doma_tok\$" ${D}${sysconfdir}/xen/doma.cfg || \
+            bbfatal "$doma_tok not found in doma.cfg"
+    done
+    # Delete the comment blocks that document the tokens in both lanes -- they
+    # explain a build-time mechanism and have no meaning in the installed file.
+    sed -i -e '/^    # XT_DOMA_HWDEC_VIRTIO_PLACEHOLDER is SUBSTITUTED AT BUILD TIME/,/^    # rootfs\.$/d' \
+           -e '/^    # XT_DOMA_HWDEC_DEVICE_PLACEHOLDER is SUBSTITUTED AT BUILD TIME/,/^    # exit on an unknown -device and DomA would never start\.$/d' \
+        ${D}${sysconfdir}/xen/doma.cfg
+    if [ "$doma_hwdec" = "yes" ]; then
+        sed -i -e "s|^    XT_DOMA_HWDEC_VIRTIO_PLACEHOLDER\$|    'backend=1, type=virtio,device, transport=pci, bdf=0000:00:09.0, grant_usage=0, backend_type=qemu',|" \
+               -e "s|^    XT_DOMA_HWDEC_DEVICE_PLACEHOLDER\$|    '-device', 'virtio-media-pci,${XT_DOMA_HWDEC_DEVARG},disable-legacy=on,ioeventfd=off,iommu_platform=on,bus=pcie.0,addr=9',|" \
+            ${D}${sysconfdir}/xen/doma.cfg
+        grep -q "bdf=0000:00:09.0" ${D}${sysconfdir}/xen/doma.cfg || \
+            bbfatal "doma.cfg: the 09.0 virtio list entry did not get substituted"
+        grep -q "virtio-media-pci,${XT_DOMA_HWDEC_DEVARG}," ${D}${sysconfdir}/xen/doma.cfg || \
+            bbfatal "doma.cfg: the backend argument '${XT_DOMA_HWDEC_DEVARG}' did not reach the -device line"
+    else
+        sed -i -e '/^    XT_DOMA_HWDEC_VIRTIO_PLACEHOLDER$/d' \
+               -e '/^    XT_DOMA_HWDEC_DEVICE_PLACEHOLDER$/d' \
+            ${D}${sysconfdir}/xen/doma.cfg
+        if grep -q "virtio-media-pci\|bdf=0000:00:09.0" ${D}${sysconfdir}/xen/doma.cfg; then
+            bbfatal "doma.cfg: a virtio-media device was left in with XT_DOMA_HWDEC=false"
+        fi
+    fi
+
+    # [audio] Substitute the virtio-snd device-model property that only the patched
+    # qemu 10.0.2 has, and empty the token on 7.0.0.
+    #
+    # tx-poll-us comes from qemu patch
+    # 0243-v10-virtio-snd-drain-tx-from-a-dedicated-thread.patch: it drains the TX
+    # queue from a thread of the device model's own every N microseconds. The device
+    # model cannot hand a virtio queue to an iothread on Xen (xen_io_listener has no
+    # .eventfd_add), and the single main loop that serves the audio backend also runs
+    # virtio-media's QBUF work for the video, so without the thread the audio
+    # callback arrives late under video load and the guest blocks in its own PCM
+    # write. 10000 is half the 20000 us period doma.cfg asks for; 0 would disable the
+    # thread.
+    #
+    # Keyed on the device model's version, like the argument fixups below, and for
+    # the same kind of reason in the other direction: a 7.0.0 device model exits with
+    # "Property 'virtio-snd-pci.tx-poll-us' not found" and DomA then dies as a (null)
+    # domain with "Qdisk backend didn't respond in time" (measured on the board
+    # 2026-09-20).
+    if ! grep -q 'streams=1,XT_DOMA_SND_PROPS_PLACEHOLDER' ${D}${sysconfdir}/xen/doma.cfg; then
+        bbfatal "XT_DOMA_SND_PROPS_PLACEHOLDER not found in doma.cfg"
+    fi
+    case "${XT_DM_QEMU_VERSION}" in
+    7.*) doma_snd_props="" ;;
+    *)   doma_snd_props="tx-poll-us=10000," ;;
+    esac
+    # Delete the comment block documenting the token in both lanes -- it explains a
+    # build-time mechanism and has no meaning in the installed file. The token is
+    # substituted in place rather than by line, because it sits inside the -device
+    # argument string and the empty lane has to close the gap, not leave a hole.
+    sed -i -e '/^    # XT_DOMA_SND_PROPS_PLACEHOLDER is SUBSTITUTED AT BUILD TIME/,/^    # at the substitution in xt-xen-cfg-doma\.$/d' \
+           -e "s/XT_DOMA_SND_PROPS_PLACEHOLDER/$doma_snd_props/" \
+        ${D}${sysconfdir}/xen/doma.cfg
+    if grep -q XT_DOMA_SND_PROPS_PLACEHOLDER ${D}${sysconfdir}/xen/doma.cfg; then
+        bbfatal "doma.cfg: XT_DOMA_SND_PROPS_PLACEHOLDER was not substituted"
+    fi
+    if [ -n "$doma_snd_props" ]; then
+        grep -q "streams=1,$doma_snd_props" ${D}${sysconfdir}/xen/doma.cfg || \
+            bbfatal "doma.cfg: '$doma_snd_props' did not reach the virtio-snd -device line"
+    elif grep -q 'tx-poll-us' ${D}${sysconfdir}/xen/doma.cfg; then
+        bbfatal "doma.cfg: tx-poll-us left in for qemu ${XT_DM_QEMU_VERSION}, whose device model has no such property"
+    fi
+
     # [qemu 10] Device-model argument fixups. Two of the options in doma.cfg are
     # 7.0.0-xt-only and qemu 10 EXITS on either one -- both measured on RPi5:
     #   virtio-snd-pci        -> "'virtio-snd-pci' is not a valid device model name"
@@ -230,8 +383,13 @@ do_install[vardeps] += "DOMA_MEM_MiB"
 do_install[vardeps] += "XT_VENUS_GPU_OPTS"
 # Same reason for the two memory knobs substituted into the same qemu_envs line.
 do_install[vardeps] += "XT_VENUS_VKR_DEVICE_HEAP_MIB XT_VENUS_V3DV_BO_CACHE_MIB"
-# Same reason for the device-model version that selects the argument fixups.
+# Same reason for the device-model version that selects the argument fixups and
+# the virtio-snd property.
 do_install[vardeps] += "XT_DM_QEMU_VERSION"
+# Same reason for the hardware-decode gate and the backend it selects: switching
+# lanes or boards must not reuse a doma.cfg from sstate that carries the other
+# lane's device, or the other board's backend argument.
+do_install[vardeps] += "XT_DOMA_HWDEC XT_DOMA_HWDEC_DEVARG"
 
 FILES:${PN} = " \
     ${sysconfdir}/xen/doma.cfg \

@@ -1,0 +1,272 @@
+From 757c54cdf901d026590216752acaa58bdb0d6d0a Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 3 Sep 2026 13:46:52 +0900
+Subject: [PATCH] virtio-media: put the exporter's size, not the caller's, on
+ the DMABUF wire
+
+VTS died at the input queue with
+
+  V4L2Device: (OUTPUT_MPLANE)VIDIOC_QBUF failed
+  virtio-media: dmabuf covers 4096 bytes but the plane needs 2097152
+
+The guard was right; the length was wrong. For V4L2_MEMORY_DMABUF the
+plane length on the wire has to be the exporter's size, and only this
+driver knows it when the descriptor chain is built. Userspace routinely
+puts something else there: v4l2_codec2 fills every plane with the
+queue's sizeimage because it skips QUERYBUF, while a decoder's input
+block is a C2LinearBlock sized to the frame -- 28 bytes of SPS is one
+page.
+
+Import every plane and rewrite its length before the v4l2_buffer is
+staged, then restore the caller's value on the way out. Both halves are
+required:
+
+ - The wire value must be EXACTLY the SG total. The device model
+   concatenates the per-plane entry arrays and splits them apart by
+   accumulating entry lengths until each plane's length is reached, so
+   a short length would hand plane N's leftover entries to plane N+1,
+   and a long one is rejected.
+ - The caller's value must survive. @b is device-writable and the reply
+   lands in it, and v4l2_codec2 reads that field back through
+   getPlaneSize() as the queue's capacity -- leaving 4096 there would
+   reject the NEXT, larger frame.
+
+The rewrite has to precede scatterlist_builder_add_buffer(), which may
+copy the buffer into the shadow buffer rather than map it by reference.
+That is the same ordering constraint the DMABUF-to-USERPTR memory
+substitution has, so the import moves next to it. The import is
+idempotent (identity is the struct dma_buf *), so the one inside
+scatterlist_builder_add_buffer_dmabuf() becomes a cache hit and its
+coverage check stays live rather than becoming dead code.
+
+Verified with an aarch64 guest running this driver against a
+vivid-backed device model, before and after this change:
+
+  before: FAIL QBUF(DMABUF, 4096-byte dmabuf, plane length 118784)
+          -> -1 EINVAL
+          dmesg: dmabuf covers 4096 bytes but the plane needs 118784
+  after:  OK   QBUF ... -> 0
+          OK   the caller's plane length survives: 118784
+
+The other buffer tests pass before and after, and the decode tests fail
+identically in both runs (vivid is not a decoder).
+
+Change-Id: Ic5f1484b4de7a8118834f7527bb860e6d2ca68b9
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ driver/scatterlist_builder.c | 94 ++++++++++++++++++++++++++++++++++++
+ driver/scatterlist_builder.h |  4 ++
+ driver/virtio_media_ioctls.c | 58 +++++++++++++++++++++-
+ 3 files changed, 154 insertions(+), 2 deletions(-)
+
+diff --git a/driver/scatterlist_builder.c b/driver/scatterlist_builder.c
+index 4f86898..d4c646d 100644
+--- a/driver/scatterlist_builder.c
++++ b/driver/scatterlist_builder.c
+@@ -567,6 +567,100 @@ static int virtio_media_import_dmabuf(struct scatterlist_builder *builder,
+ 	return 0;
+ }
+ 
++/* Total number of bytes the entries of @sgt cover. */
++static size_t sgt_covered_bytes(struct sg_table *sgt)
++{
++	struct scatterlist *sg_iter;
++	size_t covered = 0;
++	int i;
++
++	for_each_sgtable_sg(sgt, sg_iter, i)
++		covered += sg_iter->length;
++
++	return covered;
++}
++
++/**
++ * scatterlist_builder_import_buffer_dmabuf() - Import every plane's dmabuf and
++ * make each plane length describe its exporter.
++ * @builder: builder to use. Its @dev must be set.
++ * @b: ``v4l2_buffer`` whose ``DMABUF`` planes are to be imported.
++ * @state: driver-side state of the buffer, which caches the imports.
++ *
++ * Why the plane length has to be rewritten, and why exactly to the SG total.
++ *
++ * For ``V4L2_MEMORY_DMABUF`` the plane length is the exporter's size, and only
++ * this driver knows it at the time the descriptor chain is built. Userspace
++ * routinely puts something else there: v4l2_codec2 fills every plane with the
++ * queue's ``sizeimage`` because it skips ``VIDIOC_QUERYBUF``, and its input
++ * (bitstream) blocks come from a C2LinearBlock sized to the frame -- a 28-byte
++ * SPS is one page. Measured on RPi4 2026-09-03, VTS ThumbnailTest:
++ *
++ *   V4L2Device: (OUTPUT_MPLANE)VIDIOC_QBUF failed
++ *   virtio-media: dmabuf covers 4096 bytes but the plane needs 2097152
++ *
++ * The guard was right and the length was wrong.
++ *
++ * The new length must be exactly the SG total, not a clamp of the caller's
++ * value: the device model concatenates every plane's entry array and splits it
++ * back apart by accumulating entry lengths until each plane's length is reached
++ * (virtio_media_qbuf() in hw/virtio/virtio-media.c). A length shorter than the
++ * bytes actually emitted for plane N would hand plane N's leftover entries to
++ * plane N+1. Larger is rejected outright by the same loop.
++ *
++ * Must run before scatterlist_builder_add_buffer(). That call may copy the
++ * v4l2_buffer and its plane array into the shadow buffer rather than mapping
++ * them by reference, so a later mutation would never reach the device. This is
++ * the same ordering constraint the DMABUF-to-USERPTR memory substitution has.
++ *
++ * The import itself is idempotent -- identity is the ``struct dma_buf *``, so
++ * the second import from scatterlist_builder_add_buffer_dmabuf() is a
++ * dma_buf_get()/compare/put() cache hit -- which is why that function is left
++ * unchanged and its coverage check stays live rather than becoming dead code.
++ *
++ * The caller is responsible for restoring the lengths userspace passed in; see
++ * virtio_media_send_buffer_ioctl().
++ */
++int scatterlist_builder_import_buffer_dmabuf(struct scatterlist_builder *builder,
++					     struct v4l2_buffer *b,
++					     struct virtio_media_buffer *state)
++{
++	int ret;
++	int i;
++
++	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
++		if (b->length > VIDEO_MAX_PLANES)
++			return -EINVAL;
++
++		for (i = 0; i < b->length; i++) {
++			struct v4l2_plane *plane = &b->m.planes[i];
++
++			if (plane->m.fd < 0)
++				return -EINVAL;
++
++			ret = virtio_media_import_dmabuf(
++				builder, &state->dmabufs[i], plane->m.fd);
++			if (ret)
++				return ret;
++
++			plane->length = (u32)sgt_covered_bytes(
++				state->dmabufs[i].sgt);
++		}
++	} else {
++		if (b->m.fd < 0)
++			return -EINVAL;
++
++		ret = virtio_media_import_dmabuf(builder, &state->dmabufs[0],
++						 b->m.fd);
++		if (ret)
++			return ret;
++
++		b->length = (u32)sgt_covered_bytes(state->dmabufs[0].sgt);
++	}
++
++	return 0;
++}
++
+ /*
+  * Emit one plane's virtio_media_sg_entry array from an already-mapped sg_table
+  * into the shadow buffer, and reference it with a single descriptor.
+diff --git a/driver/scatterlist_builder.h b/driver/scatterlist_builder.h
+index 70cc855..c604be5 100644
+--- a/driver/scatterlist_builder.h
++++ b/driver/scatterlist_builder.h
+@@ -97,6 +97,10 @@ int scatterlist_builder_add_buffer(struct scatterlist_builder *builder,
+ int scatterlist_builder_add_buffer_userptr(struct scatterlist_builder *builder,
+ 					   struct v4l2_buffer *b);
+ 
++int scatterlist_builder_import_buffer_dmabuf(struct scatterlist_builder *builder,
++					     struct v4l2_buffer *b,
++					     struct virtio_media_buffer *state);
++
+ int scatterlist_builder_add_buffer_dmabuf(struct scatterlist_builder *builder,
+ 					  struct v4l2_buffer *b,
+ 					  struct virtio_media_buffer *state);
+diff --git a/driver/virtio_media_ioctls.c b/driver/virtio_media_ioctls.c
+index a70ce25..75b08a7 100644
+--- a/driver/virtio_media_ioctls.c
++++ b/driver/virtio_media_ioctls.c
+@@ -276,6 +276,8 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
+ 		.dev = vv->virtio_dev->dev.parent ?: &vv->virtio_dev->dev,
+ 	};
+ 	u32 orig_memory;
++	u32 orig_lengths[VIDEO_MAX_PLANES];
++	u32 num_planes = 0;
+ 	bool use_dmabuf;
+ 	size_t resp_len;
+ 	int ret;
+@@ -319,6 +321,40 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
+ 		 * the device.
+ 		 */
+ 		b->memory = V4L2_MEMORY_USERPTR;
++
++		/*
++		 * The plane lengths go on the wire as the exporter's size,
++		 * and come back to userspace as it passed them.
++		 *
++		 * scatterlist_builder_import_buffer_dmabuf() explains why the
++		 * wire value has to be the SG total. It cannot simply be left
++		 * that way afterwards, because @b is mapped device-writable and
++		 * scatterlist_builder_retrieve_buffer() copies the host's reply
++		 * over the caller's plane array: userspace would get the
++		 * exporter's size back instead of what it set. v4l2_codec2
++		 * treats that field as the queue's capacity -- V4L2Decoder's
++		 * `request.buffer->size > getPlaneSize(0)` check -- so a
++		 * one-page input block would shrink the recorded capacity to
++		 * 4096 and the next larger frame would be rejected with
++		 * "The input size is not enough". Save and restore.
++		 */
++		if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
++			if (b->length > VIDEO_MAX_PLANES) {
++				ret = -EINVAL;
++				goto restore_memory;
++			}
++			num_planes = b->length;
++			for (i = 0; i < num_planes; i++)
++				orig_lengths[i] = b->m.planes[i].length;
++		} else {
++			num_planes = 1;
++			orig_lengths[0] = b->length;
++		}
++
++		ret = scatterlist_builder_import_buffer_dmabuf(&builder, b,
++							      state);
++		if (ret)
++			goto restore_memory;
+ 	}
+ 
+ 	/* Command descriptor */
+@@ -402,14 +438,32 @@ restore_memory:
+ 	 * can be answered. Fall back to @orig_memory when no buffers are
+ 	 * allocated, i.e. when there is no queue state to be authoritative.
+ 	 *
+-	 * Plane lengths are deliberately left as the host wrote them --
+-	 * scatterlist_builder_add_buffer_dmabuf()'s coverage check needs them.
++	 * On the USERPTR path the plane lengths are deliberately left as the
++	 * host wrote them -- scatterlist_builder_add_buffer()'s fixup and
++	 * scatterlist_builder_add_buffer_userptr() work off those. DMABUF is
++	 * the opposite case and is handled below.
+ 	 */
+ 	if (queue->allocated_bufs > 0)
+ 		b->memory = queue->memory;
+ 	else if (use_dmabuf)
+ 		b->memory = orig_memory;
+ 
++	/*
++	 * num_planes stays 0 when the goto fired before the lengths were
++	 * saved, and then there is nothing to put back.
++	 */
++	if (use_dmabuf && num_planes > 0) {
++		if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
++			b->length = num_planes;
++			if (b->m.planes)
++				for (i = 0; i < num_planes; i++)
++					b->m.planes[i].length =
++						orig_lengths[i];
++		} else {
++			b->length = orig_lengths[0];
++		}
++	}
++
+ 	return ret;
+ }
+ 

@@ -1,0 +1,99 @@
+From d3bc7e5a55c473977b518cd973aa8e05e1de1872 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 4 Sep 2026 08:35:04 +0900
+Subject: [PATCH] virtio-media: EPOLLOUT means dequeueable, not "has a free
+ slot"
+
+virtio_media_device_poll() raised EPOLLOUT whenever the OUTPUT queue
+had a free slot:
+
+    else if (output_queue->queued_bufs < output_queue->allocated_bufs)
+            rc |= EPOLLOUT | EPOLLWRNORM;
+
+That is not what EPOLLOUT means for a V4L2 streaming queue.
+vb2_core_poll() reports it only when q->done_list is non-empty -- a
+completed buffer waiting to be dequeued -- and v4l2_m2m_poll() builds
+on that. The CAPTURE branch of this same function already had it right
+(!list_empty(&pending_dqbufs)); only the OUTPUT branch was
+inconsistent.
+
+A free slot is almost always available, so poll() returned immediately
+and any client that polls in a loop spun at full speed. Measured in
+DomA on RPi4/AAOS17, 223,200 ioctls for about 720 decoded frames:
+
+    POLL  = 413,718 (575 per frame, 69-77 us avg)
+    DQBUF = 212,162 (295 per frame, 7 us avg -- all EAGAIN)
+
+v4l2_codec2's V4L2DevicePoller::devicePollTask() polls with an infinite
+timeout and is written to block; it was never given the chance.
+
+After the fix, same workload:
+
+    POLL  =  51,131 (891 us avg -- it actually blocks now)
+    DQBUF =   4,495
+    POLL + DQBUF: about 870 per frame -> about 77
+
+Total CPU for hardware-decoded 360x640 playback (xl list Time, DomA +
+DomD, median of three runs) drops from 201.0 % to 162.8 %: DomA 121.5
+-> 85.8, DomD 80.7 -> 77.3, qemu's main thread 49.6 -> 45.2. Frame rate
+and dropped frames are unchanged (16.6 -> 16.1 fps, 5 -> 6 of 720), so
+the same work is being done with 19 % less CPU. The gap to software
+decode narrows from +66 to +28 points.
+
+The client loses nothing: it decides when to QBUF from its own
+bookkeeping (freeBuffersCount()), never from poll, and it needs waking
+only when a queued bitstream buffer has actually completed.
+
+Verified: the user-space buffer tests pass with allow_userptr=1 (the
+parameter defaults to false, and without it only the USERPTR test
+fails; playback uses DMABUF), VTS EOSTest OK, Wi-Fi unaffected. Numbers
+and method measured on the board, 2026-09-04.
+
+Change-Id: I2fe0ea2060da0957239191e05f85f3d836fb45b6
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ driver/virtio_media_driver.c | 29 +++++++++++++++++++++++++++--
+ 1 file changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/driver/virtio_media_driver.c b/driver/virtio_media_driver.c
+index c32883a..071396a 100644
+--- a/driver/virtio_media_driver.c
++++ b/driver/virtio_media_driver.c
+@@ -726,8 +726,33 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
+ 	if (req_events & (EPOLLOUT | EPOLLWRNORM)) {
+ 		if (!output_queue->streaming)
+ 			rc |= EPOLLERR;
+-		else if (output_queue->queued_bufs <
+-			 output_queue->allocated_bufs)
++		/*
++		 * EPOLLOUT means "a buffer can be dequeued from the OUTPUT
++		 * queue", not "the queue has a free slot to QBUF into". That
++		 * is what vb2_core_poll() does (it only reports EPOLLOUT when
++		 * q->done_list is non-empty) and what v4l2_m2m_poll() relies
++		 * on, and it is what the CAPTURE branch above already does.
++		 *
++		 * Reporting readiness on free space instead made poll() return
++		 * immediately essentially always -- the OUTPUT queue almost
++		 * always has a slot -- so a client that polls in a loop spins
++		 * at full speed. Measured in DomA on RPi4 (2026-09-04), over
++		 * 223,200 ioctls for about 720 decoded frames:
++		 *
++		 *     POLL  = 413,718 (575 per frame, 69-77 us each)
++		 *     DQBUF = 212,162 (295 per frame, 7 us each, all EAGAIN)
++		 *
++		 * That spin is what the codec2 HAL's 38 % of a core (68 % of
++		 * it stime) was; the decoder's poll thread woke, posted a
++		 * service task, dequeued nothing, and polled again. Measured on
++		 * the board, 2026-09-04.
++		 *
++		 * The client is not deprived of anything: it QBUFs from its own
++		 * bookkeeping (freeBuffersCount()), never from poll, and it
++		 * needs to be woken only when a queued bitstream buffer has
++		 * actually completed.
++		 */
++		else if (!list_empty(&output_queue->pending_dqbufs))
+ 			rc |= EPOLLOUT | EPOLLWRNORM;
+ 	}
+ 	mutex_unlock(&session->queues_lock);

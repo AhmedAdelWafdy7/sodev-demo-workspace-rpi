@@ -1,0 +1,63 @@
+From 1056eb9ab54d357a307e995eefa846f4f234d1f4 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 6 Sep 2026 00:55:30 +0900
+Subject: [PATCH] virtio-media: an empty CAPTURE queue is not POLLERR
+
+poll() raised EPOLLERR whenever the CAPTURE queue had no queued buffer
+and no pending DQBUF. POLLERR lands in revents regardless of the
+requested mask, so v4l2_codec2's V4L2DevicePoller returned from every
+poll() immediately and re-polled: measured on the board (RPi4 DomA,
+1080p60 H.264, 11 CAPTURE buffers) POLL = 6551/s against DQBUF = 140/s
+and QBUF = 76/s, i.e. 47 polls per dequeue.
+
+vb2_core_poll() raises EPOLLERR only for !streaming, q->error and
+q->waiting_for_buffers, and the OUTPUT branch of this same function was
+corrected the same way in "virtio-media: EPOLLOUT means dequeueable,
+not has a free slot". This driver tracks neither q->error nor
+waiting_for_buffers, so a streaming CAPTURE queue that has had no QBUF
+since REQBUFS or STREAMOFF, which vb2 also reports as EPOLLERR, polls
+as not ready here.
+
+Blocking is safe for the only consumer we have: v4l2_codec2's
+V4L2Device::poll() calls ::poll() with timeout -1 and keeps an
+interrupt fd in the set, so it is woken either by a completed buffer or
+by its own wakeup pipe.
+
+Change-Id: I775f978b77f70d8032f7a66fbfa0e7cd9599a691
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ driver/virtio_media_driver.c | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/driver/virtio_media_driver.c b/driver/virtio_media_driver.c
+index 050f099..0c3a873 100644
+--- a/driver/virtio_media_driver.c
++++ b/driver/virtio_media_driver.c
+@@ -826,9 +826,22 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
+ 
+ 	mutex_lock(&session->queues_lock);
+ 	if (req_events & (EPOLLIN | EPOLLRDNORM)) {
+-		if (!capture_queue->streaming ||
+-		    (capture_queue->queued_bufs == 0 &&
+-		     list_empty(&capture_queue->pending_dqbufs)))
++		/*
++		 * Only a queue that is not streaming is an error. An empty
++		 * CAPTURE queue is not: POLLERR is reported in revents
++		 * whether or not the caller asked for it, so raising it just
++		 * because no buffer is queued yet turns every poll() into a
++		 * busy loop. Measured on RPi4 DomA 2026-09-05 with 11 CAPTURE
++		 * buffers and 1080p60 H.264: POLL 6551/s against DQBUF 140/s
++		 * (47 polls per dequeue). vb2_core_poll() raises EPOLLERR only
++		 * for !streaming, q->error and q->waiting_for_buffers; this
++		 * driver tracks neither of the last two, so a streaming queue
++		 * with nothing to dequeue simply polls as not ready, as the
++		 * OUTPUT branch below does. v4l2_codec2's V4L2Device::poll()
++		 * passes timeout -1 and also watches an interrupt fd, so
++		 * blocking here is what it wants.
++		 */
++		if (!capture_queue->streaming)
+ 			rc |= EPOLLERR;
+ 		else if (!list_empty(&capture_queue->pending_dqbufs))
+ 			rc |= EPOLLIN | EPOLLRDNORM;

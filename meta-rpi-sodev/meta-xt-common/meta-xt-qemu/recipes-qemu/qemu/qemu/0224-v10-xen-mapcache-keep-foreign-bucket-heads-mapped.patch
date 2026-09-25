@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 04 Sep 2026 15:58:51 +0900
+Subject: [PATCH] xen/mapcache: keep foreign bucket heads mapped when unlocked
+
+Since the grant-mapping series (9.1, "xen: mapcache: Unmap first entries in
+buckets") xen_invalidate_map_cache_entry_unlocked() munmaps the head entry
+of a bucket as soon as its lock count reaches zero. Before that, the head
+entry stayed mapped (the "|| pentry == NULL" early return) and only chained
+entries were torn down, which is what made the mapcache a cache for the
+common case of one entry per bucket.
+
+The consequence for a device that maps guest pages one 4 KiB entry at a
+time is that every dma_memory_map()/dma_memory_unmap() pair is now a
+privcmd foreign-map hypercall plus a munmap. Measured on RPi4 DomD with
+qemu 10.0.2 while virtio-media copied a 942 KB decoded frame into guest
+USERPTR pages: about 6 ms per frame in the map/unmap path for 230 entries,
+against 0.6 ms for the memcpy itself. Every DMA-capable virtio device in
+the same process (blk, net, gpu) pays the same per-page cost.
+
+The xen-troops fork carried the pre-9.1 behaviour back as a workaround
+(8e6a6725, "xen: mapcache: leave first in buckets unmapped") and reverted
+it in the commit this recipe pins (f460a035), for two stated reasons: with
+the fork's 64 KiB buckets (0bafd789, "xen-mapcache: adjust bucket size")
+the workaround is not needed, and keeping heads mapped leaves a lot of
+memory to unmap when a domain is destroyed, so the domain takes long to
+reboot. The first reason does not hold for the per-page mapping above: the
+6 ms per frame was measured on the pinned source, 64 KiB buckets included.
+The second one applies to this patch too, for DomA, whose virtio devices
+all use foreign mappings: how much longer DomA's destroy and reboot take
+with it has not been measured.
+
+Restore the pre-9.1 behaviour for foreign mappings only. Grant mappings
+keep being unmapped at lock zero, because the guest must be able to revoke
+a grant, which is the reason upstream changed this in the first place.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+diff --git a/hw/xen/xen-mapcache.c b/hw/xen/xen-mapcache.c
+index c5616ca54d1..dccf33045f8 100644
+--- a/hw/xen/xen-mapcache.c
++++ b/hw/xen/xen-mapcache.c
+@@ -585,6 +585,26 @@ static void xen_invalidate_map_cache_entry_unlocked(MapCache *mc,
+     if (entry->lock > 0) {
+         return;
+     }
++    /*
++     * Keep the head entry of a bucket mapped once its lock drops to zero,
++     * unless it is a grant. This is what every release up to 9.0 did
++     * (upstream's "|| pentry == NULL" early return, removed in 9.1), and it
++     * is what makes this a cache: a foreign mapping that is torn down on
++     * every unlock is re-created by a privcmd hypercall on the next
++     * address_space_map() of the same page.
++     * Upstream started unmapping head entries so that transient grant
++     * mappings can be released (the guest has to be able to revoke them);
++     * a foreign mapping of guest RAM has no such requirement.
++     *
++     * Measured on RPi4 DomD, qemu 10.0.2, virtio-media copying a 942 KB
++     * decoded frame into guest USERPTR pages one 4 KiB entry at a time:
++     * about 6 ms per frame in dma_memory_map()/dma_memory_unmap(), i.e.
++     * 230 map+unmap hypercall pairs, where the memcpy itself is 0.6 ms.
++     * Every DMA-capable device (virtio-blk, -net, -gpu) pays the same tax.
++     */
++    if (pentry == NULL && !(entry->flags & XEN_MAPCACHE_ENTRY_GRANT)) {
++        return;
++    }
+ 
+     ram_block_notify_remove(entry->vaddr_base, entry->size, entry->size);
+     if (entry->flags & XEN_MAPCACHE_ENTRY_GRANT) {

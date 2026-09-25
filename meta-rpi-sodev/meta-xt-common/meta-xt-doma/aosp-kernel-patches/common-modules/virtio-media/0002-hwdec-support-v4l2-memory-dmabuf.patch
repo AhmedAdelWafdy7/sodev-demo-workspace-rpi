@@ -1,0 +1,766 @@
+From dcb75239e5f020c63400ac89fa11e1406938ff1d Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 1 Sep 2026 19:58:09 +0900
+Subject: [PATCH] virtio-media: support V4L2_MEMORY_DMABUF
+
+USERPTR cannot carry a dmabuf, and that is a property of the kernel
+rather than of this driver. A dmabuf mmap is VM_PFNMAP|VM_IO --
+drm_gem_shmem_mmap() sets it for graphic buffers, remap_pfn_range() for
+dma_heap ones -- and get_vaddr_frames() is pin_user_pages_fast() and
+nothing else, which gup rejects for such a VMA with -EFAULT (mm/gup.c
+check_vma_flags). __scatterlist_builder_add_userptr() then rewrote that
+-EFAULT to -EINVAL and deliberately skipped the pr_warn, so on the RPi4
+board the only symptom was
+
+    V4L2Device: (CAPTURE_MPLANE)VIDIOC_QBUF failed
+
+with an empty dmesg. Every gralloc and every dma_heap buffer failed
+this way; the capture queue simply reached it first.
+
+Measured on a PC with a user-space PFNMAP probe against a plain
+uvcvideo device, no virtualisation in the path:
+
+    USERPTR + anonymous mmap       -> QBUF 0
+    USERPTR + dma_heap dmabuf mmap -> QBUF -1 EFAULT (VmFlags: pf io)
+    DMABUF  + the same allocation  -> QBUF 0
+
+So take the exporter's sg_table instead of pinning a VMA. The wire
+stays USERPTR-only: the device model accepts no other memory type in
+its QBUF handler and only reads the sg_entry array, so
+virtio_media_send_buffer_ioctl() substitutes USERPTR on the way out and
+restores DMABUF on the way back, and the host side needs no change at
+all.
+
+  - scatterlist_builder_add_buffer_dmabuf() imports each plane's fd and
+    emits the sg_entry array from the mapped sg_table, using sg_phys()
+    (the protocol carries guest physical addresses, not dma_addr_t) and
+    refusing an exporter whose entries have no struct page rather than
+    sending unmappable addresses.
+  - The import is cached per buffer index, keyed on the struct dma_buf
+    pointer and not on the fd, because an fd number is reused after
+    close().
+  - REQBUFS records the queue's memory type and no longer clears
+    V4L2_BUF_CAP_SUPPORTS_DMABUF; DQBUF restores that memory type,
+    which the host stamps as USERPTR in every event.
+  - Attach to the transport's parent device: a virtio_device's own
+    struct device has no dma_mask, which trips WARN_ON_ONCE in
+    __dma_map_sg_attrs() and returns zero mapped entries (the QBUF
+    still succeeds, because the page links stay valid and this driver
+    reads sg_phys -- but past a kernel warning).
+  - Release the imports at the three places that discard buffer state
+    plus STREAMOFF, outside queues_lock since unmapping can sleep. NOT
+    in CREATE_BUFS: the memcpy there moves ownership to the new array.
+
+Verified in an aarch64 guest against the virtio-media device model,
+before and after: a dmabuf QBUF goes from EINVAL to success with no
+kernel warning, while the malloc USERPTR path is unchanged.
+
+Change-Id: I2e1833b3f0086af2ec67a210e0eaf1dcd1a5da9b
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ driver/scatterlist_builder.c | 286 +++++++++++++++++++++++++++++++++++
+ driver/scatterlist_builder.h |  10 ++
+ driver/session.h             |  34 +++++
+ driver/virtio_media_driver.c |  27 +++-
+ driver/virtio_media_ioctls.c | 125 +++++++++++++--
+ 5 files changed, 464 insertions(+), 18 deletions(-)
+
+diff --git a/driver/scatterlist_builder.c b/driver/scatterlist_builder.c
+index 619c59f..765dfa7 100644
+--- a/driver/scatterlist_builder.c
++++ b/driver/scatterlist_builder.c
+@@ -6,6 +6,7 @@
+  * Copyright (c) 2024-2025 Google LLC.
+  */
+ 
++#include <linux/dma-buf.h>
+ #include <linux/moduleparam.h>
+ #include <linux/scatterlist.h>
+ #include <linux/videodev2.h>
+@@ -431,6 +432,291 @@ int scatterlist_builder_add_buffer_userptr(struct scatterlist_builder *builder,
+ 	return 0;
+ }
+ 
++/*
++ * ---------------------------------------------------------------------------
++ * V4L2_MEMORY_DMABUF
++ *
++ * Why this exists at all, given that USERPTR already works.
++ *
++ * USERPTR cannot carry a dmabuf, and that is a property of the kernel, not of
++ * this driver. A dmabuf mmap is VM_PFNMAP|VM_IO -- drm_gem_shmem_mmap() sets it
++ * for graphic buffers, and the dma_heap system heap gets it from
++ * remap_pfn_range(). get_vaddr_frames() is pin_user_pages_fast() and nothing
++ * else, and gup's check_vma_flags() rejects VM_IO|VM_PFNMAP outright with
++ * -EFAULT. So every QBUF of a gralloc or dma_heap buffer through the USERPTR
++ * path fails, and __scatterlist_builder_add_userptr() below turns that -EFAULT
++ * into a -EINVAL with no pr_warn, which is why it looked like a device bug.
++ *
++ * Measured on the PC 2026-09-01 with a standalone PFNMAP probe, run
++ * against a plain uvcvideo device -- no virtio, no virtualisation involved:
++ *
++ *   USERPTR + anonymous mmap          -> QBUF 0
++ *   USERPTR + dma_heap dmabuf mmap    -> QBUF -1 EFAULT   (VmFlags has "pf io")
++ *   DMABUF  + the same allocation     -> QBUF 0
++ *
++ * The third line is the way out: with an fd, vb2 takes the exporter's sg_table
++ * instead of pinning a VMA, and VM_PFNMAP stops mattering. This does the same
++ * thing for virtio-media -- the sg_table gives us exactly the guest physical
++ * ranges the protocol wants.
++ *
++ * The wire stays USERPTR. The QEMU device model rejects any memory type but
++ * USERPTR in its QBUF handler and only reads the sg_entry array, so
++ * virtio_media_send_buffer_ioctl() substitutes USERPTR on the way out and
++ * restores DMABUF on the way back. That keeps the host side unmodified, which
++ * is what keeps the DomD rootfs out of the change.
++ * ---------------------------------------------------------------------------
++ */
++
++static void virtio_media_release_dmabuf_slot(struct virtio_media_dmabuf *slot)
++{
++	if (!slot->dmabuf)
++		return;
++
++	if (slot->sgt)
++		dma_buf_unmap_attachment_unlocked(slot->att, slot->sgt,
++						  DMA_BIDIRECTIONAL);
++	if (slot->att)
++		dma_buf_detach(slot->dmabuf, slot->att);
++	dma_buf_put(slot->dmabuf);
++
++	slot->dmabuf = NULL;
++	slot->att = NULL;
++	slot->sgt = NULL;
++}
++
++/**
++ * virtio_media_release_dmabufs() - Drop every dmabuf imported for a buffer.
++ * @state: buffer state whose imports are to be released.
++ *
++ * Safe to call on a buffer that never imported anything, and safe to call
++ * twice. This driver has no per-buffer destructor, so the callers are the
++ * places that discard buffer state: the vfree() of the buffers array in
++ * REQBUFS and in virtio_media_session_free(), and virtio_media_clear_queue().
++ * CREATE_BUFS frees only the old array, whose imports move to the new one.
++ */
++void virtio_media_release_dmabufs(struct virtio_media_buffer *state)
++{
++	unsigned int i;
++
++	for (i = 0; i < VIDEO_MAX_PLANES; i++)
++		virtio_media_release_dmabuf_slot(&state->dmabufs[i]);
++}
++
++/*
++ * Import @fd into @slot, reusing the existing attachment if it is already the
++ * same dma_buf.
++ *
++ * Identity is the ``struct dma_buf *``, not @fd: an fd number is reused after
++ * close(), so an fd comparison would keep a stale mapping for a different
++ * buffer. dma_buf_get() is cheap enough to do unconditionally for the
++ * comparison.
++ */
++static int virtio_media_import_dmabuf(struct scatterlist_builder *builder,
++				      struct virtio_media_dmabuf *slot, int fd)
++{
++	struct dma_buf_attachment *att;
++	struct dma_buf *dmabuf;
++	struct sg_table *sgt;
++
++	if (!builder->dev)
++		return -EINVAL;
++
++	/*
++	 * Without a dma_mask the mapping below returns zero entries and the
++	 * kernel logs a WARN. Say which device is at fault instead, once.
++	 */
++	if (!builder->dev->dma_mask)
++		pr_warn_once("virtio-media: %s has no dma_mask; dmabuf import will not map\n",
++			     dev_name(builder->dev));
++
++	dmabuf = dma_buf_get(fd);
++	if (IS_ERR(dmabuf))
++		return PTR_ERR(dmabuf);
++
++	if (slot->dmabuf == dmabuf) {
++		dma_buf_put(dmabuf);
++		return 0;
++	}
++
++	virtio_media_release_dmabuf_slot(slot);
++
++	att = dma_buf_attach(dmabuf, builder->dev);
++	if (IS_ERR(att)) {
++		dma_buf_put(dmabuf);
++		return PTR_ERR(att);
++	}
++
++	/*
++	 * DMA_BIDIRECTIONAL because the same code path serves both queues: an
++	 * output buffer is read by the host, a capture buffer is written by it.
++	 *
++	 * The _unlocked variant is the correct one here -- we do not hold the
++	 * reservation lock, and taking it would be wrong under queues_lock.
++	 */
++	sgt = dma_buf_map_attachment_unlocked(att, DMA_BIDIRECTIONAL);
++	if (IS_ERR(sgt)) {
++		dma_buf_detach(dmabuf, att);
++		dma_buf_put(dmabuf);
++		return PTR_ERR(sgt);
++	}
++
++	slot->dmabuf = dmabuf;
++	slot->att = att;
++	slot->sgt = sgt;
++
++	return 0;
++}
++
++/*
++ * Emit one plane's virtio_media_sg_entry array from an already-mapped sg_table
++ * into the shadow buffer, and reference it with a single descriptor.
++ *
++ * sg_phys(), not sg_dma_address(). The protocol carries guest physical
++ * addresses -- __scatterlist_builder_add_userptr() below does the same, and the
++ * host resolves them through the hypervisor's foreign-memory mapping. A
++ * dma_addr_t would be an IOVA and mean nothing on the other side.
++ *
++ * @length is the plane length the host will expect to be covered; 0 means "do
++ * not check", which is what a caller passes when userspace left the field
++ * unset.
++ */
++static int scatterlist_builder_add_sgt(struct scatterlist_builder *builder,
++				       struct sg_table *sgt, size_t length)
++{
++	struct virtio_media_sg_entry *sg_list;
++	struct scatterlist *sg_iter;
++	size_t entries_size;
++	size_t covered = 0;
++	int nents;
++	int i;
++
++	/*
++	 * orig_nents, not sg_nents(): for_each_sgtable_sg() below iterates
++	 * exactly orig_nents entries. Sizing the shadow-buffer area from a
++	 * separately computed chain length would let the loop write past it if
++	 * the two ever disagreed.
++	 */
++	nents = sgt->orig_nents;
++	entries_size = sizeof(*sg_list) * nents;
++	if (builder->shadow_buffer_pos + entries_size >
++	    builder->shadow_buffer_size)
++		return -ENOMEM;
++
++	sg_list = builder->shadow_buffer + builder->shadow_buffer_pos;
++
++	for_each_sgtable_sg(sgt, sg_iter, i) {
++		/*
++		 * sg_phys() is only meaningful for a page-backed entry. The
++		 * dma-buf contract does not promise one: drm_gem_shmem and the
++		 * dma_heap system heap are page-backed, an exporter handing out
++		 * bus addresses would not be. Fail loudly rather than sending
++		 * the host addresses it cannot map.
++		 */
++		if (!sg_page(sg_iter)) {
++			pr_warn("virtio-media: dmabuf exporter produced an sg entry with no page; it cannot be imported\n");
++			return -EINVAL;
++		}
++		sg_list[i].start = sg_phys(sg_iter);
++		sg_list[i].len = sg_iter->length;
++		covered += sg_iter->length;
++	}
++
++	/*
++	 * The host walks the entries accumulating lengths until the plane
++	 * length is reached and rejects the QBUF if it runs out. Say so here,
++	 * where both numbers are known, instead of leaving it to a bare EINVAL
++	 * from the other side.
++	 */
++	if (length && covered < length) {
++		pr_warn("virtio-media: dmabuf covers %zu bytes but the plane needs %zu\n",
++			covered, length);
++		return -EINVAL;
++	}
++
++	builder->shadow_buffer_pos += entries_size;
++
++	return scatterlist_builder_add_data(builder, sg_list, entries_size);
++}
++
++/**
++ * scatterlist_builder_add_buffer_dmabuf() - Add the payload of a ``DMABUF``
++ * v4l2_buffer to the descriptor chain.
++ * @builder: builder to use. Its @dev must be set.
++ * @b: ``v4l2_buffer`` whose ``DMABUF`` payload we want to add.
++ * @state: driver-side state of the buffer, which caches the imports.
++ *
++ * Counterpart of :ref:`scatterlist_builder_add_buffer_userptr`, and split out
++ * for the same reason: these descriptors belong to the device-readable part of
++ * the chain only.
++ *
++ * Unlike its USERPTR counterpart, this does not check ``b->memory`` -- the
++ * caller must only call it for a DMABUF buffer. It cannot check, because by
++ * the time it runs ``b->memory`` already says USERPTR: the substitution has to
++ * happen before scatterlist_builder_add_buffer(), which may memcpy the
++ * v4l2_buffer into the shadow buffer rather than map it by reference (see the
++ * last-resort branch of scatterlist_builder_add_data()), so a later mutation of
++ * @b would not reach the host.
++ */
++int scatterlist_builder_add_buffer_dmabuf(struct scatterlist_builder *builder,
++					  struct v4l2_buffer *b,
++					  struct virtio_media_buffer *state)
++{
++	int i;
++	int ret;
++
++	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
++		if (b->length > VIDEO_MAX_PLANES)
++			return -EINVAL;
++
++		for (i = 0; i < b->length; i++) {
++			struct v4l2_plane *plane = &b->m.planes[i];
++
++			/*
++			 * No skipping. The host consumes one sg_entry array per
++			 * plane, in order, taking each plane's share from the
++			 * concatenated list by its length. Emitting nothing for
++			 * plane N while emitting for N+1 would silently shift
++			 * every later plane's entries onto the wrong plane.
++			 *
++			 * The USERPTR path can skip a plane only because
++			 * scatterlist_builder_add_buffer() zeroes that plane's
++			 * length first, so the host expects nothing for it. That
++			 * fixup cannot be reused here: it runs before this
++			 * function and may already have copied the planes array
++			 * into the shadow buffer. So an unusable fd is an error.
++			 */
++			if (plane->m.fd < 0)
++				return -EINVAL;
++
++			ret = virtio_media_import_dmabuf(
++				builder, &state->dmabufs[i], plane->m.fd);
++			if (ret)
++				return ret;
++
++			ret = scatterlist_builder_add_sgt(
++				builder, state->dmabufs[i].sgt, plane->length);
++			if (ret)
++				return ret;
++		}
++	} else {
++		if (b->m.fd < 0)
++			return -EINVAL;
++
++		ret = virtio_media_import_dmabuf(builder, &state->dmabufs[0],
++						 b->m.fd);
++		if (ret)
++			return ret;
++
++		ret = scatterlist_builder_add_sgt(builder,
++						  state->dmabufs[0].sgt,
++						  b->length);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ /**
+  * scatterlist_builder_retrieve_buffer() - Retrieve a v4l2_buffer written by
+  * the device on the shadow buffer, if needed.
+diff --git a/driver/scatterlist_builder.h b/driver/scatterlist_builder.h
+index 505ba1f..70cc855 100644
+--- a/driver/scatterlist_builder.h
++++ b/driver/scatterlist_builder.h
+@@ -25,6 +25,8 @@
+  * @sgs: descriptor chain to eventually pass to virtio functions.
+  * @num_sgs: total number of entries in @sgs.
+  * @cur_sg: next entry in @sgs to be used.
++ * @dev: device to attach imported dmabufs to. Only needed for
++ * V4L2_MEMORY_DMABUF buffers; may be NULL otherwise.
+  *
+  * Virtio passes data from the driver to the device (through e.g.
+  * ``virtqueue_add_sgs``) via a scatterlist that the device interprets as a
+@@ -69,6 +71,8 @@ struct scatterlist_builder {
+ 	struct scatterlist **sgs;
+ 	size_t num_sgs;
+ 	size_t cur_sg;
++
++	struct device *dev;
+ };
+ 
+ int scatterlist_builder_add_descriptor(struct scatterlist_builder *builder,
+@@ -93,6 +97,12 @@ int scatterlist_builder_add_buffer(struct scatterlist_builder *builder,
+ int scatterlist_builder_add_buffer_userptr(struct scatterlist_builder *builder,
+ 					   struct v4l2_buffer *b);
+ 
++int scatterlist_builder_add_buffer_dmabuf(struct scatterlist_builder *builder,
++					  struct v4l2_buffer *b,
++					  struct virtio_media_buffer *state);
++
++void virtio_media_release_dmabufs(struct virtio_media_buffer *state);
++
+ int scatterlist_builder_retrieve_buffer(struct scatterlist_builder *builder,
+ 					size_t sg_index,
+ 					struct v4l2_buffer *buffer,
+diff --git a/driver/session.h b/driver/session.h
+index ee4fe75..b3addd6 100644
+--- a/driver/session.h
++++ b/driver/session.h
+@@ -23,15 +23,41 @@
+  */
+ #define VIRTIO_SHADOW_BUF_SIZE 0x4000
+ 
++/**
++ * struct virtio_media_dmabuf - Cached import of one V4L2_MEMORY_DMABUF plane.
++ * @dmabuf: reference taken with dma_buf_get(), NULL when nothing is imported.
++ * @att: attachment of @dmabuf to the virtio device.
++ * @sgt: mapping of @att. The SG entries sent to the host are built from it.
++ *
++ * Why the import is cached per buffer rather than redone per QBUF.
++ * A decoder re-queues the same buffer index with the same fd for every frame,
++ * so attaching and mapping on each QBUF would repeat identical work in the hot
++ * path. Caching also means there is exactly one place that owns the reference,
++ * which matters because this driver has no per-buffer destructor: the release
++ * sites are the vfree() of the buffers array in REQBUFS and in
++ * virtio_media_session_free(), plus virtio_media_clear_queue().
++ *
++ * Identity is the ``struct dma_buf *`` returned by dma_buf_get(), not the fd.
++ * An fd number is reused after close(), so an fd comparison would happily keep
++ * a stale mapping for a different buffer.
++ */
++struct virtio_media_dmabuf {
++	struct dma_buf *dmabuf;
++	struct dma_buf_attachment *att;
++	struct sg_table *sgt;
++};
++
+ /**
+  * struct virtio_media_buffer - Current state of a buffer.
+  * @buffer: ``struct v4l2_buffer`` with current information about the buffer.
+  * @planes: backing planes array for @buffer.
++ * @dmabufs: imported dmabufs, one per plane, for V4L2_MEMORY_DMABUF queues.
+  * @list: link into the list of buffers pending dequeue.
+  */
+ struct virtio_media_buffer {
+ 	struct v4l2_buffer buffer;
+ 	struct v4l2_plane planes[VIDEO_MAX_PLANES];
++	struct virtio_media_dmabuf dmabufs[VIDEO_MAX_PLANES];
+ 	struct list_head list;
+ };
+ 
+@@ -41,14 +67,22 @@ struct virtio_media_buffer {
+  * @allocated_bufs: How many buffers are currently allocated.
+  * @is_capture_last: set to true when the last buffer has been received on a
+  * capture queue, so we can return -EPIPE on subsequent DQBUF requests.
++ * @memory: ``V4L2_MEMORY_*`` this queue was set up with by REQBUFS.
+  * @buffers: Buffer state array of size @allocated_bufs.
+  * @queued_bufs: How many buffers are currently queued on the device.
+  * @pending_dqbufs: Buffers that are available for being dequeued.
++ *
++ * @memory is recorded because REQBUFS fixes a queue's memory type for the
++ * queue's lifetime, and the host does not preserve it: the device model stamps
++ * V4L2_MEMORY_USERPTR into every DQBUF event (the wire is USERPTR-only, see
++ * scatterlist_builder_add_buffer_dmabuf()). Without this, userspace that
++ * requested DMABUF would get USERPTR back on every dequeue.
+  */
+ struct virtio_media_queue_state {
+ 	bool streaming;
+ 	size_t allocated_bufs;
+ 	bool is_capture_last;
++	u32 memory;
+ 
+ 	struct virtio_media_buffer *buffers;
+ 	size_t queued_bufs;
+diff --git a/driver/virtio_media_driver.c b/driver/virtio_media_driver.c
+index 0a027e9..7fe98c4 100644
+--- a/driver/virtio_media_driver.c
++++ b/driver/virtio_media_driver.c
+@@ -32,6 +32,8 @@
+ #include <media/v4l2-ioctl.h>
+ 
+ #include "protocol.h"
++/* for virtio_media_release_dmabufs() */
++#include "scatterlist_builder.h"
+ #include "session.h"
+ #include "virtio_media.h"
+ 
+@@ -142,8 +144,14 @@ static void virtio_media_session_free(struct virtio_media *vv,
+ 
+ 	sg_free_table(&session->command_sgs);
+ 
+-	for (i = 0; i <= VIRTIO_MEDIA_LAST_QUEUE; i++)
+-		vfree(session->queues[i].buffers);
++	for (i = 0; i <= VIRTIO_MEDIA_LAST_QUEUE; i++) {
++		struct virtio_media_queue_state *queue = &session->queues[i];
++		size_t b;
++
++		for (b = 0; queue->buffers && b < queue->allocated_bufs; b++)
++			virtio_media_release_dmabufs(&queue->buffers[b]);
++		vfree(queue->buffers);
++	}
+ 
+ 	kfree(session->shadow_buf);
+ 	kfree(session);
+@@ -438,10 +446,18 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
+ 	/*
+ 	 * Preserve the 'm' union that was passed to us during QBUF so userspace
+ 	 * gets back the information it submitted.
++	 *
++	 * The memory type needs the same treatment, and for a sharper reason:
++	 * the host stamps V4L2_MEMORY_USERPTR into every DQBUF event because the
++	 * wire is USERPTR-only (virtio_media_send_buffer_ioctl() substitutes it
++	 * for DMABUF on the way out). Without restoring it from the queue,
++	 * user-space that set up the queue with DMABUF would be handed USERPTR
++	 * back on every dequeue.
+ 	 */
+ 	buffer_m = dqbuf->buffer.m;
+ 	memcpy(&dqbuf->buffer, &dqbuf_evt->buffer, sizeof(dqbuf->buffer));
+ 	dqbuf->buffer.m = buffer_m;
++	dqbuf->buffer.memory = queue->memory;
+ 	if (V4L2_TYPE_IS_MULTIPLANAR(dqbuf->buffer.type)) {
+ 		if (dqbuf->buffer.length > VIDEO_MAX_PLANES) {
+ 			v4l2_err(&vv->v4l2_dev,
+@@ -971,6 +987,13 @@ static struct virtio_driver virtio_media_driver = {
+ module_virtio_driver(virtio_media_driver);
+ 
+ MODULE_DEVICE_TABLE(virtio, id_table);
++/*
++ * dma_buf_get/attach/detach/put and dma_buf_{map,unmap}_attachment_unlocked are
++ * exported with EXPORT_SYMBOL_NS_GPL(..., "DMA_BUF"). Without this the module
++ * fails to load with "module uses symbols from namespace DMA_BUF, but does not
++ * import it".
++ */
++MODULE_IMPORT_NS("DMA_BUF");
+ MODULE_DESCRIPTION("virtio media driver");
+ MODULE_AUTHOR("Alexandre Courbot <gnurou@gmail.com>");
+ MODULE_LICENSE("Dual BSD/GPL");
+diff --git a/driver/virtio_media_ioctls.c b/driver/virtio_media_ioctls.c
+index d7db98f..3e9d97e 100644
+--- a/driver/virtio_media_ioctls.c
++++ b/driver/virtio_media_ioctls.c
+@@ -242,6 +242,7 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
+ 	struct virtio_media *vv = to_virtio_media(video_dev);
+ 	struct virtio_media_session *session = fh_to_session(fh);
+ 	struct v4l2_plane *orig_planes = NULL;
++	struct virtio_media_buffer *state = NULL;
+ 	struct scatterlist *sgs[64];
+ 	/*
+ 	 * End of the device-readable buffer SGs, to reuse in device-writable
+@@ -259,7 +260,22 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
+ 		.sgs = sgs,
+ 		.num_sgs = ARRAY_SIZE(sgs),
+ 		.cur_sg = 0,
++		/*
++		 * The DMA-capable device, not the virtio one. A struct
++		 * virtio_device's own struct device carries no dma_mask, so
++		 * dma_buf_map_attachment() on it trips
++		 * WARN_ON_ONCE(!dev->dma_mask) in __dma_map_sg_attrs() and
++		 * returns 0 mapped entries. The QBUF still succeeds then, only
++		 * because the sg_table's page links stay valid and this driver
++		 * reads sg_phys() rather than sg_dma_address() -- past a kernel
++		 * warning. The transport's parent (the PCI device for
++		 * virtio-pci) is the device virtio itself maps through, so that
++		 * is the correct attachment target.
++		 */
++		.dev = vv->virtio_dev->dev.parent ?: &vv->virtio_dev->dev,
+ 	};
++	u32 orig_memory;
++	bool use_dmabuf;
+ 	size_t resp_len;
+ 	int ret;
+ 	int i;
+@@ -270,35 +286,73 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
+ 	if (V4L2_TYPE_IS_MULTIPLANAR(b->type))
+ 		orig_planes = b->m.planes;
+ 
++	/*
++	 * DMABUF is translated to USERPTR on the wire.
++	 *
++	 * The device model accepts no memory type but USERPTR in its QBUF
++	 * handler and only ever reads the virtio_media_sg_entry array that
++	 * follows, so a DMABUF buffer is presented to it as USERPTR while
++	 * user-space keeps seeing DMABUF. That is what lets the host side stay
++	 * unmodified. See scatterlist_builder_add_buffer_dmabuf() for why
++	 * USERPTR cannot carry a dmabuf in the first place.
++	 *
++	 * Only QBUF and PREPARE_BUF: on QUERYBUF the ``m`` union is an output
++	 * field, so ``m.fd`` holds nothing meaningful and importing it would
++	 * either fail or, worse, pick up an unrelated fd that happens to be a
++	 * dmabuf.
++	 */
++	orig_memory = b->memory;
++	use_dmabuf = (orig_memory == V4L2_MEMORY_DMABUF) &&
++		     (ioctl == VIDIOC_QBUF || ioctl == VIDIOC_PREPARE_BUF);
++	if (use_dmabuf) {
++		struct virtio_media_queue_state *queue =
++			&session->queues[b->type];
++
++		if (b->index >= queue->allocated_bufs)
++			return -EINVAL;
++		state = &queue->buffers[b->index];
++
++		/*
++		 * Must happen before scatterlist_builder_add_buffer(): that may
++		 * copy the v4l2_buffer into the shadow buffer instead of
++		 * mapping it by reference, so a later mutation would not reach
++		 * the device.
++		 */
++		b->memory = V4L2_MEMORY_USERPTR;
++	}
++
+ 	/* Command descriptor */
+ 	ret = scatterlist_builder_add_ioctl_cmd(&builder, session, ioctl);
+ 	if (ret)
+-		return ret;
++		goto restore_memory;
+ 
+ 	/* Command payload (struct v4l2_buffer) */
+ 	ret = scatterlist_builder_add_buffer(&builder, b);
+ 	if (ret < 0)
+-		return ret;
++		goto restore_memory;
+ 
+ 	end_buf_sg = builder.cur_sg;
+ 
+ 	/* Payload of SHARED_PAGES buffers, if relevant */
+-	ret = scatterlist_builder_add_buffer_userptr(&builder, b);
++	if (use_dmabuf)
++		ret = scatterlist_builder_add_buffer_dmabuf(&builder, b, state);
++	else
++		ret = scatterlist_builder_add_buffer_userptr(&builder, b);
+ 	if (ret < 0)
+-		return ret;
++		goto restore_memory;
+ 
+ 	num_cmd_sgs = builder.cur_sg;
+ 
+ 	/* Response descriptor */
+ 	ret = scatterlist_builder_add_ioctl_resp(&builder, session);
+ 	if (ret)
+-		return ret;
++		goto restore_memory;
+ 
+ 	/* Response payload (same as input, but no userptr mapping) */
+ 	for (i = 1; i < end_buf_sg; i++) {
+ 		ret = scatterlist_builder_add_descriptor(&builder, i);
+ 		if (ret < 0)
+-			return ret;
++			goto restore_memory;
+ 	}
+ 
+ 	ret = virtio_media_send_command(vv, builder.sgs, num_cmd_sgs,
+@@ -306,23 +360,32 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl,
+ 					sizeof(struct virtio_media_resp_ioctl) +
+ 					sizeof(*b), &resp_len);
+ 	if (ret < 0)
+-		return ret;
++		goto restore_memory;
+ 
+ 	resp_len -= sizeof(struct virtio_media_resp_ioctl);
+ 
+ 	/* Make sure that the reply length covers our v4l2_buffer */
+-	if (resp_len < sizeof(*b))
+-		return -EINVAL;
++	if (resp_len < sizeof(*b)) {
++		ret = -EINVAL;
++		goto restore_memory;
++	}
+ 
+ 	ret = scatterlist_builder_retrieve_buffer(&builder, num_cmd_sgs + 1, b,
+ 						  orig_planes);
+-	if (ret) {
++	if (ret)
+ 		v4l2_err(&vv->v4l2_dev,
+ 			 "failed to retrieve response descriptor chain\n");
+-		return ret;
+-	}
+ 
+-	return 0;
++restore_memory:
++	/*
++	 * Single exit so the substitution above is undone on every path,
++	 * including the error ones: @b belongs to the caller and the device
++	 * writes its own USERPTR into it during the round trip.
++	 */
++	if (use_dmabuf)
++		b->memory = orig_memory;
++
++	return ret;
+ }
+ 
+ /**
+@@ -472,6 +535,20 @@ static void virtio_media_clear_queue(struct virtio_media_session *session,
+ 	queue->is_capture_last = false;
+ 
+ 	mutex_unlock(&session->queues_lock);
++
++	/*
++	 * Drop the imported dmabufs, outside queues_lock: unmapping takes the
++	 * exporter's reservation lock and can sleep, and nothing else here needs
++	 * the queue lock held for it.
++	 *
++	 * They are released rather than kept because the cached attachment holds
++	 * a reference on the dma_buf, so keeping it across STREAMOFF would pin
++	 * the (potentially large) graphic buffers that user-space is entitled to
++	 * free at that point. Re-importing on the next QBUF is cheap and only
++	 * happens after a STREAMOFF.
++	 */
++	for (i = 0; i < queue->allocated_bufs; i++)
++		virtio_media_release_dmabufs(&queue->buffers[i]);
+ }
+ 
+ /*
+@@ -759,6 +836,12 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
+ 	if (b->count == 0)
+ 		virtio_media_clear_queue(session, queue);
+ 
++	if (queue->buffers) {
++		size_t i;
++
++		for (i = 0; i < queue->allocated_bufs; i++)
++			virtio_media_release_dmabufs(&queue->buffers[i]);
++	}
+ 	vfree(queue->buffers);
+ 	queue->buffers = NULL;
+ 
+@@ -771,6 +854,14 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
+ 
+ 	queue->allocated_bufs = b->count;
+ 
++	/*
++	 * REQBUFS fixes a queue's memory type for the queue's lifetime, and the
++	 * host does not preserve it: the device model stamps USERPTR into every
++	 * DQBUF event because the wire is USERPTR-only. Remember what user-space
++	 * asked for so virtio_media_process_dqbuf_event() can put it back.
++	 */
++	queue->memory = b->memory;
++
+ 	/*
+ 	 * If a multiplanar queue is successfully used here, this means
+ 	 * we are using the multiplanar interface.
+@@ -781,9 +872,6 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
+ 	if (!virtio_media_allow_userptr)
+ 		b->capabilities &= ~V4L2_BUF_CAP_SUPPORTS_USERPTR;
+ 
+-	/* We do not support DMABUF yet. */
+-	b->capabilities &= ~V4L2_BUF_CAP_SUPPORTS_DMABUF;
+-
+ 	return 0;
+ }
+ 
+@@ -850,6 +938,11 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
+ 		return -ENOMEM;
+ 	}
+ 
++	/*
++	 * The imported dmabufs travel with this memcpy: ownership moves to the
++	 * new array, so virtio_media_release_dmabufs() must not be called here.
++	 * Only the old storage is freed.
++	 */
+ 	memcpy(queue->buffers, buffers,
+ 	       sizeof(*buffers) * queue->allocated_bufs);
+ 	vfree(buffers);

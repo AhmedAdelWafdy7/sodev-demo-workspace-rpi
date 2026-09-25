@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 04 Sep 2026 16:51:23 +0900
+Subject: [PATCH] virtio-media: request non-coherent (cacheable) host MMAP
+ buffers
+
+The host side of a USERPTR session owns vb2 MMAP buffers and copies every
+decoded frame out of one into the guest's pages. A coherent dma-contig
+MMAP buffer is Normal-NC on arm64, and the CPU reads it at bus speed:
+678 MB/s on RPi4 against 3469 MB/s for cached memory, so the 942 KB
+RGBA frame costs 1.4 ms instead of 0.3 ms. perf attributes
+10.7 % of the device model's CPU to that memcpy.
+
+Pass V4L2_MEMORY_FLAG_NON_COHERENT on the host REQBUFS. vb2 allocates
+cacheable memory and does the cache maintenance itself in buf_prepare and
+buf_finish; a driver that has not set allow_cache_hints clears the flag,
+so the log line reports whether it stuck. bcm2835-codec gets the flag in
+the DomD kernel patch 0015.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [depends on the downstream virtio-media device
+ (0216), which upstream qemu does not have]
+---
+diff --git a/hw/virtio/virtio-media.c b/hw/virtio/virtio-media.c
+index 5d79cd3af62..05c07de67b0 100644
+--- a/hw/virtio/virtio-media.c
++++ b/hw/virtio/virtio-media.c
+@@ -662,6 +662,16 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+      * carries whatever its own header version put there.
+      */
+     memset(host_rb.reserved, 0, sizeof(host_rb.reserved));
++    /*
++     * Ask for cacheable host buffers. A coherent vb2 MMAP buffer is Normal-NC
++     * on arm64 and this device reads every decoded frame out of one with the
++     * CPU: 678 MB/s against 3469 MB/s for cached memory on RPi4, 1.4 ms per
++     * 942 KB frame instead of 0.3 ms (perf: 10 % of the device model's CPU).
++     * vb2 honours the flag only if the driver sets allow_cache_hints, and
++     * clears it otherwise, so on a driver without it nothing changes; the
++     * cache maintenance then happens in vb2's buf_prepare/buf_finish.
++     */
++    host_rb.flags = V4L2_MEMORY_FLAG_NON_COHERENT;
+     if (ioctl(s->fd, VIDIOC_REQBUFS, &host_rb) < 0) {
+         int err = errno;
+         struct v4l2_format fmt = { .type = rb->type };
+@@ -682,8 +692,10 @@ static int virtio_media_reqbufs(VirtIOMediaSession *s,
+         }
+         return err;
+     }
+-    info_report("virtio-media: host REQBUFS type=%u -> count=%u caps=0x%x (fd %d)",
+-                host_rb.type, host_rb.count, host_rb.capabilities, s->fd);
++    info_report("virtio-media: host REQBUFS type=%u -> count=%u caps=0x%x "
++                "non_coherent=%u (fd %d)", host_rb.type, host_rb.count,
++                host_rb.capabilities,
++                !!(host_rb.flags & V4L2_MEMORY_FLAG_NON_COHERENT), s->fd);
+     if (host_rb.count > VIRTIO_MEDIA_MAX_BUFFERS) {
+         /*
+          * Give the surplus back rather than silently tracking fewer buffers

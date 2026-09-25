@@ -1,0 +1,82 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 22 Sep 2026 16:56:39 +0900
+Subject: [PATCH] hw/arm: pass the virtio-pci INTX line count to the GPEX
+
+0115 publishes the virtio-pci layout to the xenpvh machine by reading the seven
+xenstore keys libxl writes, and 0215 teaches xen-pvh-common to hand out one INTX
+line per PCI slot when cfg.pci_intx_irq_count says so. Nothing connects the two:
+0115 reads irq_first and stops, so the count stays at the GPEX default of four
+however many lines libxl put in the guest device tree.
+
+That mismatch is silent and it is not cosmetic. libxl's interrupt-map wraps as
+
+    irq = irq_first + ((pin + slot) % num_irqs)
+
+so a guest DT written for sixteen lines against a GPEX wired for four pairs
+slots onto shared level-triggered SPIs. virtio-blk and virtio-net recover on the
+next kick; virtio-snd's used-buffer interrupt and a decode session's DQBUF
+completion are their only wake-up sources, so they stall with nothing to recover
+them. libxl has published num_irqs alongside irq_first since the virtio-pci host
+was introduced (tools/libs/light/libxl_dm.c), so the value is already there.
+
+Read it, and read it on its own `ok`: a DomD paired with an older libxl would
+have the other seven keys and not this one, and failing the whole layout over it
+would take PCI away from a guest that works today. Absent or zero keeps the GPEX
+default, which is what xen-pvh-common does with pci_intx_irq_count == 0.
+
+Depends-on: 0115-hw-arm-accept-xenpv-as-an-alias-for-the-xenpvh-machi.patch
+Depends-on: 0215-v10-xen-pvh-common-one-INTX-line-per-virtio-pci-slot.patch
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [downstream fork / xenstore layout is fork-only]
+---
+diff --git a/hw/arm/xen-pvh.c b/hw/arm/xen-pvh.c
+index 6a66478af0c..c77c6fa6775 100644
+--- a/hw/arm/xen-pvh.c
++++ b/hw/arm/xen-pvh.c
+@@ -90,7 +90,7 @@ static void xen_arm_pci_layout_from_xenstore(XenPVHMachineState *s)
+     struct qemu_xs_handle *h;
+     bool ok = true;
+     uint64_t ecam_base, ecam_size, mem_base, mem_size;
+-    uint64_t pref_base, pref_size, irq_first;
++    uint64_t pref_base, pref_size, irq_first, num_irqs;
+ 
+     if (s->cfg.pci_ecam.size) {
+         return;         /* explicitly configured; nothing to do */
+@@ -119,6 +119,21 @@ static void xen_arm_pci_layout_from_xenstore(XenPVHMachineState *s)
+     pref_base = xen_arm_xs_read_u64(h, "prefetch_mem_base", &ok);
+     pref_size = xen_arm_xs_read_u64(h, "prefetch_mem_size", &ok);
+     irq_first = xen_arm_xs_read_u64(h, "irq_first", &ok);
++    /*
++     * num_irqs is read on its own `ok`: libxl has published it since the
++     * virtio-pci host was introduced, but a DomD paired with an older libxl
++     * would have the other seven keys and not this one, and failing the whole
++     * layout over it would take PCI away from a guest that works without it.
++     * Absent or zero means "the GPEX default", which is what xen-pvh-common
++     * does with pci_intx_irq_count == 0.
++     */
++    {
++        bool have_num_irqs = true;
++        num_irqs = xen_arm_xs_read_u64(h, "num_irqs", &have_num_irqs);
++        if (!have_num_irqs) {
++            num_irqs = 0;
++        }
++    }
+     qemu_xen_xs_close(h);
+ 
+     if (!ok || !ecam_size) {
+@@ -129,6 +144,14 @@ static void xen_arm_pci_layout_from_xenstore(XenPVHMachineState *s)
+     s->cfg.pci_mmio      = (MemMapEntry) { mem_base, mem_size };
+     s->cfg.pci_mmio_high = (MemMapEntry) { pref_base, pref_size };
+     s->cfg.pci_intx_irq_base = irq_first;
++    /*
++     * One INTX line per PCI slot instead of the four INTA-D lines. libxl's
++     * interrupt-map wraps as irq = irq_first + ((pin + slot) % num_irqs), so
++     * the guest DT and the GPEX have to agree on num_irqs or two slots share a
++     * level-triggered SPI -- fatal for virtio-snd and for a decode session,
++     * whose completion interrupt is their only wake-up source.
++     */
++    s->cfg.pci_intx_irq_count = num_irqs;
+ }
+ 
+ static void (*xen_pvh_common_machine_init)(MachineState *ms);

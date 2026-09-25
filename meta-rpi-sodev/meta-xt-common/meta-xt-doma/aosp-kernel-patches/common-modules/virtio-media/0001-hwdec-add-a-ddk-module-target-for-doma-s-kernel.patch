@@ -1,0 +1,53 @@
+From 49fde05aee6d5dca256d5cb80f973a751cce2064 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 26 Aug 2026 07:55:27 +0900
+Subject: [PATCH] virtio-media: add a ddk_module target for DomA's kernel
+
+Add a ddk_module instance of the driver for DomA's kernel, the
+xen_virtual_device_aarch64 kernel_build. The existing target cannot be
+reused: ddk_module bakes its kernel_build in, and the target's
+visibility is limited to //common-modules/virtual-device.
+xen-virtual-device's external-modules group references the new target,
+which is what puts virtio-media.ko into DomA's kernel dist; the device
+it drives is the virtio-media device model in DomD's qemu.
+
+The target names //common-modules/xen-virtual-device, which DomA's
+pinned kernel manifest takes from outside AOSP. Upstream virtio-media
+has no such package, so this patch goes with that manifest and not to
+upstream virtio-media.
+
+Change-Id: I64bbaa6483eb75733e00d3913107814cfea6c5b9
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [DomA build wiring: references the
+ xen-virtual-device kernel_build, which the AOSP tree does not carry]
+---
+ driver/BUILD.bazel | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/driver/BUILD.bazel b/driver/BUILD.bazel
+index 0584178..f0b3db3 100644
+--- a/driver/BUILD.bazel
++++ b/driver/BUILD.bazel
+@@ -37,6 +37,21 @@ ddk_module(
+     visibility = ["//common-modules/virtual-device:__pkg__"],
+ )
+ 
++# Same module, built against the Xen guest kernel instead of cuttlefish's.
++#
++# The target above cannot be reused: ddk_module bakes kernel_build in, and its
++# visibility is limited to //common-modules/virtual-device. DomA runs
++# xen_virtual_device_aarch64, a different kernel_build with its own defconfig,
++# so it needs its own instance rather than a dependency edge.
++ddk_module(
++    name = "xen_aarch64/virtio-media",
++    srcs = [":virtio_media_sources"],
++    out = "virtio-media.ko",
++    kernel_build = "//common-modules/xen-virtual-device:xen_virtual_device_aarch64",
++    deps = ["//common:all_headers_aarch64"],
++    visibility = ["//common-modules/xen-virtual-device:__pkg__"],
++)
++
+ ddk_module(
+     name = "aarch64_16k/virtio-media",
+     srcs = [":virtio_media_sources"],

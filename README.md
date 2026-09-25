@@ -140,7 +140,7 @@ disables the heavy Android/Flatcar guests by default).
 | Flag (env var) | Default | Effect |
 |---|---|---|
 | `--board=<board>` (`BOARD`) | **rpi5** | Which board to build: `rpi5` or `rpi4`. Selects `<board>-sodev.yaml`, and with it the SoC, MACHINE, Zephyr Dom0 board, passthrough set, physical memory map and board layer (`meta-xt-rpi5` or `meta-xt-rpi4` — never both). Raspberry Pi 5 is the reference platform; see *meta-xt-rpi4/README.md* for what the Raspberry Pi 4 configuration is verified against |
-| `--dom0=<os>` (`DOM0_OS`) | **zephyr** | Selects the entire Dom0 component body: Zephyr xenstore-only Dom0 (disaggregated; DomD owns the toolstack) or the thin Linux control Dom0 (classic; Dom0 owns xl). The Zephyr flavour is the shipping default. On the RPi5 the linux flavour gives DomD no Wi-Fi and no Bluetooth: their pins need muxing over SCMI, which only the Zephyr flavour sets up. On the RPi4 the linux flavour gives DomD no Wi-Fi either: the Wi-Fi SDIO controller shares GIC SPI 126 with the SD card controller, which that flavour's Dom0 keeps, so it stays with Dom0 as well. What has been run on hardware, and with which flavour, is in *Build & hardware verification (RPi5)* below. |
+| `--dom0=<os>` (`DOM0_OS`) | **zephyr** | Selects the entire Dom0 component body: Zephyr xenstore-only Dom0 (disaggregated; DomD owns the toolstack) or the thin Linux control Dom0 (classic; Dom0 owns xl). The Zephyr flavour is the shipping default. On the RPi5 the linux flavour gives DomD no Wi-Fi, no Bluetooth and no hardware video decode: Wi-Fi and Bluetooth need their pins muxed over SCMI, which only the Zephyr flavour sets up. On the RPi4 the linux flavour gives DomD no Wi-Fi either: the Wi-Fi SDIO controller shares GIC SPI 126 with the SD card controller, which that flavour's Dom0 keeps, so it stays with Dom0 as well. What has been run on hardware, and with which flavour, is in *Build & hardware verification (RPi5)* below. |
 | `--ram=<sku>` (`BOARD_RAM`) | **16g** (rpi5) / **8g** (rpi4) | Board SKU; the valid values and the default depend on `--board`. **rpi5: `16g`\|`8g`.** `16g` = the full 4-domain map (Dom0 512 + DomD 4096 + DomU 1024 + DomA 4096 = 9728 MiB). `8g` takes **DomD to 3072 MiB** (static-mem bank4 at `0x180000000` dropped) **and DomA to 3072 MiB**; Dom0/DomU keep their sizes, so the four total 7680 MiB and fit an 8 GB board. Splitting the reduction is measured, not a preference — see *Board RAM size* (`docs/DESIGN.md`). **rpi4: `8g`\|`4g`.** `8g` = Dom0 128 (zephyr, the default) or 256 (linux) + DomD 1920 + DomU 1024 + DomA 2560; `4g` drops bank2 and shrinks DomD (the per-lane DomD and DomA sizes are in *meta-xt-rpi4/README.md*), and DomA and DomU can no longer RUN at the same time — each fits alone, and `build.sh` says so |
 | `-u`, `--domu` (`ENABLE_DOMU`) | **off** | Adds the AGL instrument-cluster DomU: Xen-aware kernel `linux-virtio-armv8` (p1) + AGL rootfs (p3). V4H-aligned minimal domu layer set (kernel via moulin; AGL rootfs via `build.sh`'s AGL bitbake) |
 | `-a`, `--android` (`ENABLE_ANDROID`) | **off** | Include DomA (AAOS, p4 nested GPT). Alias for `--aaos=auto` — the mode chooses how DomA is produced |
@@ -394,8 +394,8 @@ renders on HDMI-A-2 (all guest modules load, SurfaceFlinger up) — the guest
 kernel and the `super.img` vendor_dlkm modules must come from one coherent build
 (same `module_layout` ABI; see *How the DomA artifacts are produced* (`docs/BUILD.md`)). The **thin Linux-Dom0** flavour
 has been booted end to end on both boards, in the Xen 4.22 run of 2026-08-18
-described below. That run does not cover DomD's Wi-Fi or Bluetooth, and on the
-RPi5 the linux flavour gives DomD neither.
+described below. That run does not cover DomD's Wi-Fi, Bluetooth or hardware
+decode, and on the RPi5 the linux flavour gives DomD none of the three.
 The Zephyr full-image HW checklist. **[4.22] The list below was first measured on Xen
 4.21.** On **Xen 4.22** the four verification patterns of this tree were run on hardware
 on 2026-08-18 and all passed -- RPi4 and RPi5 x Zephyr-Dom0 and thin-Linux-Dom0 -- with
@@ -496,6 +496,61 @@ not password-protected at all:
 `4.22-0003` patch reverts an upstream restriction on buffered ioreq for Arm so the
 DomD device model can serve the guests. That revert is deliberate and is documented in
 the patch header; it should not be carried into a production hypervisor.
+
+## FFmpeg on the Raspberry Pi 5 DomD, and its `commercial` licence flag
+
+Some Yocto recipes set `LICENSE_FLAGS`, and BitBake does not build them until the
+build configuration lists the flag in `LICENSE_FLAGS_ACCEPTED`. The Yocto Project
+describes the flag as typically marking recipes that "might require additional
+licenses in order to be used in a commercial product". Accepting a flag only lets
+the recipe build; it says nothing about which licences, if any, apply.
+
+**What is included.** DomA's hardware HEVC decode runs through DomD: the device
+model (qemu 10.0.2) drives the BCM2712 HEVC decoder (`rpi-hevc-dec`) with
+libavcodec's V4L2 request-API hwaccel. Upstream FFmpeg, and so poky's `ffmpeg`, does
+not have that hwaccel; Raspberry Pi's FFmpeg fork does. meta-raspberrypi builds the
+fork as `rpidistro-ffmpeg`, from the RPi-Distro/ffmpeg tree that Raspberry Pi OS
+packages as `ffmpeg`. Like poky's `ffmpeg`, the recipe declares
+`LICENSE_FLAGS = "commercial"`. The Raspberry Pi 5 DomD image contains its libraries
+and the `ffmpeg` command-line tools.
+
+**Accepted by default, as Raspberry Pi OS does.** Raspberry Pi OS installs the same
+FFmpeg fork by default in its desktop image, and hardware HEVC decode on
+Raspberry Pi 5 needs no licence key. This build likewise accepts that one flag by
+default. The acceptance is part of this build's configuration, not of a layer: the
+DomD `conf:` list in `rpi5-sodev.yaml` writes
+
+    LICENSE_FLAGS_ACCEPTED:append:raspberrypi5 = " commercial_rpidistro-ffmpeg"
+
+(and the two `PREFERRED_PROVIDER` lines that select this FFmpeg) into
+`yocto/build-domd/conf/moulin.conf`, which `local.conf` requires, on every run.
+The Dom0 `conf:` list of the `linux` flavour writes the same three lines into
+`yocto/build-dom0/conf/moulin.conf`: that Dom0's image installs no qemu, but its
+build makes the qemu xen-tools recommends, and on the `vulkan` lane that is the
+10.0.2 one, which needs this FFmpeg.
+`meta-xt-rpi5` itself does not accept the flag, so a build that adds the layer
+without this configuration stops with "Has a restricted license 'commercial' which
+is not listed in your LICENSE_FLAGS_ACCEPTED" until its own configuration accepts
+it. Only this recipe is accepted: a bare `commercial` would also change other
+recipes that test for it (Mesa's `VIDEO_CODECS`).
+
+If you ship a product built from this tree, review this component and the codecs it
+contains through your own licensing process.
+
+**Building without it.** There is no `build.sh` switch. Remove the three lines
+above from both `conf:` lists in `rpi5-sodev.yaml`, and switch off the path that
+needs FFmpeg, or the build stops at `Nothing PROVIDES 'rpidistro-ffmpeg'`:
+
+- set `XT_DOMA_HWDEC_VULKAN` to `"false"` in `rpi5-sodev.yaml` (the value the
+  `vulkan` choice of the `GPU` parameter gives `XT_DOMA_HWDEC`), which takes the
+  virtio-media decoder out of `doma.cfg` and the codec2 HAL out of DomA;
+- remove `rpidistro-ffmpeg` from `DEPENDS:append:raspberrypi5` in
+  `meta-xt-common/meta-xt-qemu/recipes-qemu/qemu/qemu_10.0.2.bb`;
+- remove `ffmpeg` from `DOMD_HEVC_PACKAGES:raspberrypi5` in
+  `meta-xt-rpi5/recipes-core/images/rpi5-image-xt-domd-v4h.bbappend`.
+
+DomA is then left with Android's software decoders. This is not a tested
+configuration.
 
 ## References
 - V4H AGL SoDeV (DomU/DomA source of truth): <https://github.com/automotive-grade-linux/sodev-demo-workspace>
