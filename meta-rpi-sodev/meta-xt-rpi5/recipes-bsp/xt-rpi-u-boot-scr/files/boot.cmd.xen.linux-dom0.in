@@ -242,6 +242,25 @@ fdt rm /soc@107c000000/fb
 # ------------------------------------------------------------------
 
 # ------------------------------------------------------------------
+# NO SCMI IN THIS FLAVOUR, so DomD gets no Wi-Fi here.
+# ------------------------------------------------------------------
+# The zephyr flavour's script applies bcm2712-raspberrypi5-scmi-host.dtbo, marks
+# the pin controller (pinctrl@7d504100) and gio as passthrough, and makes DomD
+# TF-A's SCMI agent 0, which is how DomD's Wi-Fi SDIO pins get muxed: TF-A
+# programs them at EL3. None of that is done here: handing a single SCMI channel
+# to DomD while a Linux Dom0 is the hardware domain is a design question nobody
+# has answered yet.
+#
+# So domd-vc4.bb strips the Wi-Fi SDIO controller, wl_on_reg, gio and the SCMI
+# nodes out of DomD's partial DT for this flavour, and nothing here marks
+# /axi/mmc@1100000: the controller stays with this Dom0, like any other unmarked
+# node. Marking it would not help, since its pins stay unmuxed, and a DomD that
+# still claimed it would make Xen panic at DomD creation: Dom0 is built first
+# and takes its interrupt (SPI 274), so route_irq_to_guest() refuses it to DomD
+# with -EBUSY.
+# ------------------------------------------------------------------
+
+# ------------------------------------------------------------------
 # Disable the Bluetooth UART: nothing in this configuration uses it.
 # ------------------------------------------------------------------
 fdt set /soc@107c000000/serial@7d50c000 status "disabled"

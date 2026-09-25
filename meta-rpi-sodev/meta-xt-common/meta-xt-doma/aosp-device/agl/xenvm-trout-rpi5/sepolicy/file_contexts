@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Labels for the shadow-AP bring-up path. See sepolicy/doma_shadow_ap.te.
+
+# Give the script its own exec type so init has something to transition to, and so
+# avc denials name doma_shadow_ap instead of being attributed to init.
+/vendor/bin/doma-shadow-ap       u:object_r:doma_shadow_ap_exec:s0
+# doma-wifi-relay SHARES doma_shadow_ap_exec on purpose. It touches exactly the same
+# objects -- $CONF_DIR, hostapd.conf, the hostapd binary -- so a second domain would
+# need a duplicate of every rule in doma_shadow_ap.te for no gain, and inventing a
+# domain is where the neverallow risk lives.
+# Attribution stays useful because the two run at different times: doma_shadow_ap is
+# oneshot at bring-up, doma_wifi_relay is the long-lived loop.
+/vendor/bin/doma-wifi-relay      u:object_r:doma_shadow_ap_exec:s0
+
+# /data/vendor/wifi/shadow holds the generated hostapd.conf, the AP list
+# doma-wifi-relay writes (aps.conf) and hostapd's ctrl_interface sockets.
+# system/sepolicy/vendor/file_contexts:169-170 label /data/vendor/wifi/hostapd
+# and /data/vendor/wifi/wpa but nothing else under /data/vendor/wifi, so without
+# this line the directory init.xenvm-hwsim.rc creates falls back to the generic
+# vendor label and hostapd cannot use it.
+#
+# Reusing hostapd_data_file rather than inventing a type is deliberate: hal_wifi_hostapd_
+# default already has the rules it needs for that type (22 references in the built
+# vendor_sepolicy.cil), so the apex hostapd works with no policy of its own.
+/data/vendor/wifi/shadow(/.*)?   u:object_r:hostapd_data_file:s0

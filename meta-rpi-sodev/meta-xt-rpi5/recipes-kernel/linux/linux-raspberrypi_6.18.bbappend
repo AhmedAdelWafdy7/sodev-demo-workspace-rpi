@@ -127,3 +127,14 @@ python __anonymous() {
 # no external IP/SSH. This bbappend is a shared layer parsed by both the dom0/domd builds,
 # so add it here to align the Dom0 kernel to 4K too and match the boot Image's CRC with its modules.
 SRC_URI:append = " file://xen-config-a4b-frontend.cfg"
+
+# DomA/DomU -> internet NAT. This board's defconfig builds none of the legacy
+# iptables tables (ip_tables.ko / iptable_nat.ko / iptable_filter.ko), so
+# without this fragment domd-flatbridge-up cannot install its rules and DomA
+# comes up "connected, no internet" (the wlan0 NetworkAgentInfo never gains
+# VALIDATED). The Pi 4 builds the same set from
+# meta-xt-rpi4/recipes-kernel/linux/files/bcm2711-domd-hw.cfg, and the
+# userspace half (modules-load.d/domd-nat.conf and domd-flatbridge-up) comes
+# from meta-xt-common for both boards. See files/bcm2712-domd-nat.cfg for the
+# measurements that pinned it down.
+SRC_URI:append = " file://bcm2712-domd-nat.cfg"

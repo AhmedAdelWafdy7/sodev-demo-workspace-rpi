@@ -1,0 +1,232 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Shadow-AP Wi-Fi for AAOS: simulated radios in this guest, beaconing the SSIDs DomD
+# really sees. See /vendor/bin/doma-shadow-ap for the full rationale.
+#
+# STARTED AT sys.boot_completed. The service stays `disabled` so init's
+# class_start never touches it; the property trigger below is the only thing
+# that starts it.
+#
+# THE OWNER OF wlan0 IS SELECTED BEFORE ANYTHING IS TOUCHED, because taking
+# wlan0 from virt_wifi is one-way for a running system: doma-shadow-ap's first
+# act is to read persist.vendor.doma.shadow_ap (default true) and, if it is not
+# true, to `exec setup_wifi --interface=eth1`. Recovery on hardware is then
+#
+#     setprop persist.vendor.doma.shadow_ap false && reboot
+#
+# which costs a reboot and no SD rewrite, and lands on virt_wifi.
+#
+# CONSEQUENCE -- DomA's address. eth1 becomes a br-shadow port at boot, so the
+# .10.13 reservation DomD's dnsmasq pins to eth1's MAC is never answered; DomA
+# takes its lease on wlan0 instead. The Xen PV console is unaffected.
+#
+# DomD's dnsmasq reserves 192.168.10.15 for wlan0 (sodev-net.inc defines
+# XT_DOMA_WLAN0_{MAC,PERM_MAC,IP} and the dnsmasq bbappend ships the dhcp-host
+# line), but only for the MACs that line lists, and the station does not use the
+# hwsim perm_addr: CuttlefishWifiOverlay (inherited via
+# cuttlefish/shared/device.mk -> trout -> epam) sets
+# config_wifi_connected_mac_randomization_supported=true, so the station
+# associates with a per-SSID PERSISTENT RANDOMIZED MAC. XT_DOMA_WLAN0_MAC ships
+# empty (sodev-net.inc says why), so by default DomA takes an address from the
+# DHCP range; `adb connect 192.168.10.15:5555` works once XT_DOMA_WLAN0_MAC is
+# set to the MAC the station uses for that SSID (sodev-net.inc says how). adb
+# over vsock does not depend on any of this. Do not read wlan0's MAC while
+# disconnected -- the framework parks a fresh random address on the interface
+# then (ClientModeImpl CMD_DELAYED_MAC_RANDOMIZATION and the disconnect path),
+# so it looks like it rotates every time. Read it while associated.
+#
+# Manual control:
+#     stop doma_shadow_ap ; start doma_shadow_ap
+#     logcat -s doma-shadow-ap
+#
+# The AP list is read from /data/vendor/wifi/shadow/aps.conf (one
+# "<SSID>TAB<PSK>" per line, empty PSK = open); the shipped seed fills it on a
+# first boot and doma-wifi-relay keeps it in sync with DomD's scan.
+#
+# SELINUX. This board boots PERMISSIVE --
+# device/epam/aosp-xenvm-trout/xenvm_trout_arm64/BoardConfig.mk:31 adds
+# androidboot.selinux=permissive and :56 sets BOARD_KERNEL_CMDLINE =
+# enforcing=0, and androidboot.selinux=permissive really is present in the built
+# vendor-bootconfig.img (so the := on :23 does not clobber it, unlike the
+# bluetooth_checker entry). Denials are logged, not enforced, so
+# `start doma_shadow_ap` execs fine.
+#
+# The device tree ships sepolicy: ../sepolicy/{file_contexts,doma_shadow_ap.te},
+# wired up by BOARD_VENDOR_SEPOLICY_DIRS in BoardConfig.mk. Its purpose is
+# attribution rather than permission -- without an exec type the script keeps
+# the generic vendor_file label and every avc line names init, which leaves
+# audit2allow nothing to work with. The rule set is deliberately incomplete and
+# each rule cites a step of doma-shadow-ap.sh; finish it from real denials with
+#     adb shell dmesg | grep 'avc: .*doma_shadow_ap'
+# Read the .te header before adding anything. Bypassing init from a root shell
+# also works:
+#     sh /vendor/bin/doma-shadow-ap
+#
+service doma_shadow_ap /vendor/bin/doma-shadow-ap
+    user root
+    group root wakelock wifi net_admin net_raw
+    disabled
+    oneshot
+
+# The relay: the piece that makes an AP whose PSK is NOT in aps.conf connectable.
+#
+# WITHOUT IT, the Wi-Fi screen lists only the seed's placeholder and no real AP
+# is connectable: the shadow AP validates the typed passphrase locally and
+# cannot learn it from the 4-way handshake -- only a MIC crosses the air. The
+# relay keeps aps.conf in sync with DomD's scan and hands the passphrase
+# DomaWifiRelay reads to the shadow AP and to DomD.
+#
+# Besides this service, the relay needs the DAC traversal that the chmod/mkdir
+# 0771 block further down grants. Without that traversal every AP fails, because
+# the app cannot reach the request drop-box (the measurement is in the
+# sys.boot_completed block below).
+#
+# The companion app, DomaWifiRelay, comes from device/agl/doma-common, and
+# stage-aosp-device.sh asserts that exactly one Android.bp under device/ defines
+# it (soong module names are unique across the whole tree). The RPi4 product
+# builds its own copy from device/sodev/xenvm-cf; the two copies are kept
+# identical by hand.
+#
+# WHY IT IS SEPARATE FROM doma_shadow_ap. doma_shadow_ap is oneshot -- it creates the
+# radios, writes hostapd.conf and starts hostapd, then exits. The relay is a long-lived
+# loop that reads DomD's virtio-serial channel and the request drop-box, so it cannot be
+# folded into a oneshot.
+#
+# IT FOLLOWS THE SETTINGS WI-FI TOGGLE. It starts at sys.boot_completed, right
+# after doma_shadow_ap (the actions after that block below), and asks DomD for
+# nothing while the toggle is off -- sta_is_up() in the script. The property is
+# the off switch: unset (the default) or true runs it, and
+#     setprop persist.vendor.doma.wifi_relay false
+# stops it. In the virt_wifi fallback it starts and then idles; see the script.
+# The companion app (DomaWifiRelay, /system_ext/priv-app) reads the SAME
+# property and the same toggle: `false` stops both halves at once, and any value
+# other than unset or true keeps the app idle and the relay from starting at the
+# next boot.
+service doma_wifi_relay /vendor/bin/doma-wifi-relay
+    user root
+    group root wakelock wifi net_admin net_raw
+    disabled
+
+on property:persist.vendor.doma.wifi_relay=false
+    stop doma_wifi_relay
+
+# ==========================================================================
+# hostapd, as its own service.
+# ==========================================================================
+# WHY IT IS NOT LAUNCHED BY doma_shadow_ap. That service is `oneshot`, so init
+# SIGKILLs its entire process group the moment the script exits -- measured on the
+# board, verbatim from dmesg:
+#     init: Service 'doma_shadow_ap' (pid 1567) exited with status 0 oneshot ...
+#     init: Sending SIGKILL to service 'doma_shadow_ap' (pid 1567) process group...
+# hostapd -B stays in that group and dies with it; as an init service it
+# survives, and init restarts it if it crashes.
+#
+# NOT oneshot, on purpose: this is a daemon. No -B either -- init wants it in the
+# foreground so it can supervise it.
+#
+# The binary lives in an apex, so this can only be started after apexd has mounted it.
+# doma_shadow_ap starts it, and doma_shadow_ap itself runs at sys.boot_completed, which
+# is well after that. `disabled` keeps init's class_start away from it.
+#
+# The config path is hardcoded here because init has no variables; it must stay in sync
+# with CONF_DIR/hostapd.conf in doma-shadow-ap.sh (/data/vendor/wifi/shadow).
+# THE `vendor.` PREFIX ON THE SERVICE NAME IS THERE SO THAT THE STATUS PROPERTY CAN
+#   BE READ (established from primary sources):
+#     init.svc.<name>          -> the `init.svc.` prefix at
+#                                 system/sepolicy/private/property_contexts:1019
+#                                 -> init_service_status_private_prop
+#                                 -> private/property.te:39 makes it a system_internal_prop
+#                                 -> public/te_macros:932-937
+#                                    `neverallow { domain -coredomain } $1:file no_rw_file_perms;`
+#                                 => NO ALLOW CAN BE WRITTEN FOR A VENDOR DOMAIN
+#                                    (writing one is a hard secilc failure and breaks the
+#                                    build, the same shape as /system/bin/iw).
+#                                 What domain.te:534 grants to all of domain is only the
+#                                 PUBLIC init_service_status_prop, which is a different
+#                                 type.
+#     init.svc.vendor.<name>   -> property_contexts:282 in the same file
+#                                 -> VENDOR_DEFAULT_PROP
+#                                 -> private/domain.te:511 has
+#                                    `get_prop({domain -coredomain -appdomain}, vendor_default_prop)`
+#                                 => READABLE WITHOUT ADDING ANY RULE.
+#   The relay's restart_hostapd() / confirm_hostapd_running() read this status to decide
+#   whether hostapd stays running, so if it cannot be read they wait 10 s under enforcing
+#   and then always treat it as a failure (safe, but the feature is dead).
+#   On the `setprop ctl.restart vendor.doma_shadow_hostapd` side the prefix
+#   changes nothing: it lands on ctl_default_prop all the same, because
+#   property_service.cpp:477 builds the legacy-check name
+#   `ctl.` + value = `ctl.vendor.doma_shadow_hostapd`, which matches the `ctl.` prefix at
+#   property_contexts:183 -> ctl_default_prop (a system_public_prop at
+#   public/property.te:218, so an allow can be written for it; `ctl_restart_prop` is a
+#   system_internal_prop at public/property.te:31, SO DO NOT WRITE IT AGAINST THAT ONE).
+#   Precedent: vendor.dlkm_loader in
+#   device/google/cuttlefish/shared/config/init.vendor.rc:105.
+service vendor.doma_shadow_hostapd /apex/com.google.cf.wpa_supplicant/bin/hw/hostapd /data/vendor/wifi/shadow/hostapd.conf
+    user root
+    group root wakelock wifi net_admin net_raw
+    disabled
+
+# The only thing that starts doma_shadow_ap. sys.boot_completed rather than
+# `on boot` because the script execs setup_wifi in the fallback case, and
+# setup_wifi renames eth1 (SIOCSIFNAME), so eth1 has to exist and still be
+# down. Nothing measured shows eth1 present as early as `on boot`, which fired
+# at about 13 s on this board (init.xenvm-buried-eth0.rc). At
+# sys.boot_completed eth1 is normally registered already (step 4 of
+# doma-shadow-ap.sh still waits for it), and EthernetService claims
+# interfaces only at about 200 s (the TIMING note in doma-shadow-ap.sh).
+on property:sys.boot_completed=1
+    # THIS IS WHAT LETS DomaWifiRelay (android.uid.system) REACH the request drop-box
+    #   shadow/req. req itself is created 0770 wifi:system below, but REACHING IT NEEDS
+    #   x ON BOTH PARENT DIRECTORIES, and with both of them 0770 wifi:wifi the result is
+    #   EACCES. uid system cannot be put in the wifi group (platform.xml has no
+    #   <permission> granting gid="wifi").
+    #
+    #   MEASURED ON THE BOARD, 2026-09-21 -- the symptom when this block was absent:
+    #     I DomaWifiRelay: repairing netId=1 ssid=<SSID-B>
+    #     E DomaWifiRelay: /data/vendor/wifi/shadow/req is not reachable -- either
+    #                      doma-wifi-relay has not created it yet, or a parent lacks ...
+    #   Immediately after running `chmod o+x /data/vendor/wifi` by hand,
+    #     domd-wifi-agent: connect request for '<SSID-B>' (psk given)
+    #   arrived on the DomD side => THESE TWO LINES DECIDE whether an AP that is not in
+    #   the seed list can be connected to at all.
+    #   (The RPi4 counterpart's block records the PC measurement that o+x on
+    #    /data/vendor/wifi alone is STILL denied -- both levels are needed. o+x opens
+    #    TRAVERSAL ONLY; it does not spread the PSK.)
+    #
+    #   WHY THIS IS RE-APPLIED HERE rather than at post-fs-data: init's mkdir
+    #   RE-APPLIES mode/owner TO AN EXISTING DIRECTORY TOO, and cuttlefish's
+    #   shared/config/init.vendor.rc:85 issues
+    #   `mkdir /data/vendor/wifi 0770 wifi wifi` in its unconditional `on boot`
+    #   block, which always runs after post-fs-data, so the mkdir below would be
+    #   undone on every boot.
+    chmod 0771 /data/vendor/wifi
+    chmod 0771 /data/vendor/wifi/shadow
+    start doma_shadow_ap
+
+# The relay, AFTER the block above: actions on one trigger run in the order they were
+# parsed (action_manager.cpp:79-83), so doma_shadow_ap is already running when the relay
+# starts, and the relay skips DomD's publications until the oneshot has exited. `=`
+# matches the property unset (action.cpp:199-206), which is the default. Both wait for
+# boot_completed because before it init counts every crash of a process with updatable
+# components, with no time window, towards sys.init.updatable_crashing
+# (service.cpp:374-413).
+on property:sys.boot_completed=1 && property:persist.vendor.doma.wifi_relay=
+    start doma_wifi_relay
+
+on property:sys.boot_completed=1 && property:persist.vendor.doma.wifi_relay=true
+    start doma_wifi_relay
+
+on post-fs-data
+    # hostapd's ctrl_interface and the AP list live here. Same owner/mode as the
+    # hostapd directories cuttlefish's init.vendor.rc creates for its own hwsim path.
+    mkdir /data/vendor/wifi 0771 wifi wifi
+    mkdir /data/vendor/wifi/shadow 0771 wifi wifi
+    mkdir /data/vendor/wifi/shadow/sockets 0770 wifi wifi
+    # The relay's request drop-box. GROUP system, not wifi, and that is the whole point:
+    # DomaWifiRelay runs as android.uid.system (it needs NETWORK_SETTINGS and
+    # READ_WIFI_CREDENTIAL, which are signature permissions), so it cannot create a file
+    # in a 0770 wifi:wifi directory. Everything else under shadow/ stays wifi:wifi so the
+    # passphrase file is not reachable more widely than it already is.
+    # doma-wifi-relay also chowns this directory itself as a fallback, for a
+    # /data where the directory exists with another owner.
+    mkdir /data/vendor/wifi/shadow/req 0770 wifi system

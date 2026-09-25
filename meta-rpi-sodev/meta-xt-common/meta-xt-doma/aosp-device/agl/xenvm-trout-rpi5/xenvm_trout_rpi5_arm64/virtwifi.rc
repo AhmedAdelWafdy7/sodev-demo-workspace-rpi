@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Replaces device/google/trout/trout_arm64/wifi/virtwifi.rc: the product makefile lists
+# this copy before the trout inherit, and for one destination the first PRODUCT_COPY_FILES
+# entry wins. trout's trout-virtwifi-setup ran `cmd wifi set-wifi-enabled enabled` at
+# every boot, which also saves Wi-Fi ON, so the Settings toggle could neither start off
+# nor stay off across a reboot. Nothing is defined here: Wi-Fi starts as the user left
+# it, and off on a fresh /data (def_wifi_on=false).

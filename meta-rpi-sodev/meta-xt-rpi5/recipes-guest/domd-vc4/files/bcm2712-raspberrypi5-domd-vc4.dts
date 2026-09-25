@@ -4,10 +4,10 @@
  * Architecture: thin Dom0 (control; Zephyr by default, or Linux) + Linux DomD
  * (GPU driver) + DomU (AGL cluster) + DomA (AAOS).
  *
- * This DTS is shared by both Dom0 flavours. domd-vc4.bb strips the SD/GPIO block
- * between the SODEV-LINUX-DOM0-SD-STRIP markers when DOM0_OS=linux, because there
- * Dom0 owns the SD; with DOM0_OS=zephyr (the default) the block stays and DomD
- * owns it.
+ * This DTS is shared by both Dom0 flavours. domd-vc4.bb strips every block
+ * between a pair of SODEV-LINUX-DOM0-SD-STRIP markers when DOM0_OS=linux; the
+ * comment at the start of each block says why that flavour's DomD must not have
+ * it. With DOM0_OS=zephyr (the default) every block stays.
  *
  * Source DT references:
  *   arch/arm64/boot/dts/broadcom/bcm2712.dtsi
@@ -40,8 +40,34 @@
 /dts-v1/;
 
 / {
+
 	#address-cells = <0x2>;
 	#size-cells = <0x2>;
+
+	/* SODEV-LINUX-DOM0-SD-STRIP-BEGIN: domd-vc4.bb strips this node for
+	 * DOM0_OS=linux, where DomD has neither of the two mmc controllers it
+	 * names: the SD card and the Wi-Fi SDIO controller both stay with the
+	 * Linux Dom0. */
+	/*
+	 * Pin the mmc host numbering.
+	 *
+	 * Linux assigns mmc indices in probe order unless /aliases pins them,
+	 * and the Wi-Fi SDIO controller can win that race:
+	 *     mmc1: SDHCI controller on 1000fff000.mmc    <- the SD card
+	 *     mmc0: SDHCI controller on 1001100000.mmc    <- the Wi-Fi SDIO
+	 *     Waiting for root device /dev/mmcblk0p2...
+	 * and DomD hangs in rootwait because root= names the wrong controller.
+	 * With `quiet` that message is invisible: the symptom is an
+	 * intermittent silent hang about a second into the DomD boot.
+	 *
+	 * The host DT pins mmc0 the same way. Path strings, not &phandles, so
+	 * that this node does not depend on labels the strip blocks remove.
+	 */
+	aliases {
+		mmc0 = "/passthrough/mmc@1000fff000";
+		mmc1 = "/passthrough/mmc@1001100000";
+	};
+	/* SODEV-LINUX-DOM0-SD-STRIP-END */
 
 	gic: gic {
 		#interrupt-cells = <0x3>;
@@ -1006,13 +1032,413 @@
 			};
 		};
 
+		/* gio: the 32+4-bit GPIO bank at 0x7d508500. WL_ON is line 28
+		 * (gpio-line-names index 28 in the host DT), and wl_on_reg below
+		 * drives it.
+		 *
+		 * A PLAIN NODE ON PURPOSE -- no xen,path, no xen,reg, no
+		 * xen,force-assign-without-iommu. Its MMIO page (0x7d508000) is already
+		 * mapped by ddc0 above, and every host page must be mapped exactly once
+		 * across this partial DT. dom0less also requires xen,reg on any node
+		 * that HAS xen,path (dom0less-build.c:481), so the two must be dropped
+		 * together. Exactly the ddc1 situation, handled the same way. The host
+		 * side is released by boot.cmd's `fdt set ... gpio@7d508500
+		 * xen,passthrough`.
+		 *
+		 * interrupts are omitted: the host node's interrupt-parent is the L2
+		 * intc at 0x7d508400, not the GIC, so Xen routes nothing, and
+		 * wl_on_reg only needs an output.
+		 *
+		 * bcm2712-raspberrypi5-wifi.dtso declared a second
+		 * gpio@107d508500 of its own; that duplicate is NOT carried over -- the
+		 * dtso content was merged into this file instead of being applied as an
+		 * overlay (the partial DT is compiled without dtc -@, so it has no
+		 * __symbols__ and no overlay can target &passthrough).
+		 *
+		 * gpio-line-names is copied from the host DTB. It is documentation only
+		 * -- nothing resolves a line by name here -- but it is what lets a reader
+		 * check line 28 without going back to the host tree.
+		 */
+		/* SODEV-LINUX-DOM0-SD-STRIP-BEGIN: domd-vc4.bb strips everything from here to
+		 * the matching end marker below wl_on_reg for DOM0_OS=linux:
+		 * gio, the SCMI shared memory and protocol nodes with their pin
+		 * groups, the Wi-Fi SDIO controller and wl_on_reg. That flavour
+		 * applies no SCMI host overlay, so there is no SCMI server for
+		 * these nodes to reach, the Wi-Fi pins cannot be muxed and the
+		 * shared-memory page is not set aside. The Wi-Fi SDIO
+		 * controller stays with the Linux Dom0, which also takes its
+		 * interrupt (SPI 274): a DomD that claimed it too would make
+		 * Xen panic at DomD creation (route_irq_to_guest -EBUSY).
+		 * Nothing outside this block may refer to a label inside it. */
+		gio: gpio@107d508500 {
+			compatible = "brcm,brcmstb-gpio";
+			reg = <0x10 0x7d508500 0x0 0x40>;
+			gpio-controller;
+			#gpio-cells = <0x02>;
+			brcm,gpio-direct;
+			brcm,gpio-bank-widths = <32 4>;
+			gpio-line-names =
+				"",                 /*  0 */
+				"2712_BOOT_CS_N",   /*  1 */
+				"2712_BOOT_MISO",   /*  2 */
+				"2712_BOOT_MOSI",   /*  3 */
+				"2712_BOOT_SCLK",   /*  4 */
+				"", "", "", "", "", "", "", "",     /*  5-12 */
+				"",                 /* 13 */
+				"PCIE_SDA",         /* 14 */
+				"PCIE_SCL",         /* 15 */
+				"", "",             /* 16-17 */
+				"-", "-",           /* 18-19 */
+				"PWR_GPIO",         /* 20 */
+				"2712_G21_FS",      /* 21 */
+				"-", "-",           /* 22-23 */
+				"BT_RTS",           /* 24 */
+				"BT_CTS",           /* 25 */
+				"BT_TXD",           /* 26 */
+				"BT_RXD",           /* 27 */
+				"WL_ON",            /* 28 <- wl_on_reg */
+				"BT_ON",            /* 29 */
+				"WIFI_SDIO_CLK",    /* 30 */
+				"WIFI_SDIO_CMD",    /* 31 */
+				"WIFI_SDIO_D0",     /* 32 */
+				"WIFI_SDIO_D1",     /* 33 */
+				"WIFI_SDIO_D2",     /* 34 */
+				"WIFI_SDIO_D3";     /* 35 */
+		};
+
+		/* ===== SCMI: how DomD muxes its pins on the pin controller =====
+		 *
+		 * pinctrl@7d504100 (the pin controller that muxes these pins and sets their
+		 * pulls) is not given to DomD. Measured, twice: putting the node in this
+		 * partial DT with the C0 compatible (brcm,bcm2712c0-pinctrl) panics DomD
+		 * with an Asynchronous SError Interrupt inside brcmstb_pull_config_set(), and
+		 * reading a pad register (0x107d504124) from the U-Boot prompt SErrors the
+		 * same way. A blind `mw.l` premux from boot.cmd left the console dead. Both
+		 * SErrors are C0 pad offsets past the end of the 0x20 D0 block (see the
+		 * TF-A D0 patch), so the in-tree route is SCMI: DomD asks EL3 to do the mux.
+		 *
+		 * The server is TF-A's (xen-troops fork, plat/rpi/rpi5/scmi/* plus
+		 * drivers/scmi-msg/scmi_pinctrl.c, protocol 0x19). It is compiled in by
+		 * SCMI_SERVER_SUPPORT=1, which the xt-prod-devel-rpi5-domd bbappend ties to
+		 * MACHINE_FEATURES += "scmi" -- the same switch that pulls scmi-config.cfg
+		 * (CONFIG_ARM_SCMI_PROTOCOL / CONFIG_PINCTRL_SCMI) into this kernel.
+		 *
+		 * Why DomD may drive it at all, and why no permission handshake appears
+		 * here: Xen 4.22's mediator (xen/arch/arm/firmware/scmi-smc.c)
+		 * forwards exactly ONE SMC function ID -- the host DT's arm,smc-id -- and
+		 * only from the single domain that has xen,sci_type = "scmi_smc". boot.cmd
+		 * puts that on /chosen/domD and adds `scmi-smc-passthrough` to the
+		 * hypervisor command line (without it scmi_smc_domain_init() returns
+		 * -EINVAL for a non-hardware domain and DomD is never created). TF-A maps
+		 * 0x82000002 to agent 0 (plat/rpi/rpi5/rpi5_svc_setup.c), and
+		 * plat_scmi_pinctrl_{pin,group}_permitted() in scmi_policy.c return true
+		 * unconditionally for agent 0. So DomD is agent 0 and every pin is already
+		 * permitted; scmi_policy.c needs no change, and neither the
+		 * `access-controllers` binding nor the EPAM multi-agent
+		 * `epam,secondary-agents` extension (absent from upstream Xen) is used.
+		 *
+		 * protocol@16 (reset) is deliberately NOT declared: nothing in this guest
+		 * consumes it -- pciex takes its resets from reset_controller119500, which
+		 * is proven on this board -- and an unused protocol is one more thing that
+		 * can fail at probe.
+		 */
+		scmi_shm0: scmi_shm@3ff00000 {
+			compatible = "arm,scmi-shmem";
+			reg = <0x00 0x3ff00000 0x00 0x1000>;
+			/*
+			 * Agent 0's channel. Base and layout are TF-A's, not ours:
+			 * plat/rpi/rpi5/platform.mk sets RPI_SCMI_SHMEM_BASE := 0x3ff00000
+			 * and scmi.c places agent n at base + n * PAGE_SIZE. The host DT
+			 * overlay (bcm2712-raspberrypi5-scmi-host.dtso) reserves the whole
+			 * 64 KiB window; only this one page is mapped here.
+			 *
+			 * xen,reg WITHOUT xen,path is legal and intentional: dom0less-build.c
+			 * requires xen,reg whenever xen,path is present, but accepts xen,reg
+			 * alone when xen,force-assign-without-iommu is set (handle_prop_pfdt(),
+			 * and handle_passthrough_prop() returns 0 early for a NULL path). That
+			 * is what we want -- this is a RAM carve-out with no interrupts and no
+			 * IOMMU stream ID, so there is nothing for xen,path to resolve.
+			 * Mapped 1:1 (DomD is direct-mapped), as p2m_mmio_direct_dev, which
+			 * matches the devm_ioremap() the arm,scmi-shmem consumer does.
+			 */
+			xen,force-assign-without-iommu;
+			xen,reg = <0x00 0x3ff00000 0x00 0x1000 0x00 0x3ff00000>;
+		};
+
+		scmi: scmi {
+			compatible = "arm,scmi-smc";
+			/* = RPI5_SIP_SMC_SCMI (plat/rpi/rpi5/include/rpi5_smc.h). Xen matches
+			 * this against the host DT's arm,smc-id and forwards only that fid. */
+			arm,smc-id = <0x82000002>;
+			#address-cells = <0x01>;
+			#size-cells = <0x00>;
+			shmem = <&scmi_shm0>;
+
+			scmi_pinctrl: protocol@19 {
+				reg = <0x19>;
+				#pinctrl-cells = <0x00>;
+
+				/*
+				 * The group's name and contents mirror pinctrl@7d504100's
+				 * sdio2_30_pins in the shipped
+				 * bcm2712-rpi-5-b.dtb, with one difference: the function
+				 * string carries the f_ prefix. The native
+				 * brcm,bcm2712c0-pinctrl driver calls it "sd2";
+				 * TF-A's SCMI server builds its names with FUNC(f) =
+				 * "f_" #f (bcm2712_pinctrl.c), so over SCMI it is
+				 * "f_sd2".
+				 *
+				 * The nested pin_* subnode form is what
+				 * pinconf_generic_dt_node_to_map_all() wants (pinctrl-scmi
+				 * sets it as .dt_node_to_map): it maps the group node AND
+				 * each child. `pins` + `function` yields a mux map keyed by
+				 * the pin name, which resolves because TF-A exposes a 1:1
+				 * pin-to-group mapping with identical names (see the comment
+				 * in plat_scmi_pinctrl_group_permitted()). Upstream's
+				 * bcm2712-raspberrypi5-domd-scmi.dtso leaves these groups
+				 * EMPTY and relies on a Linux Dom0 having applied the host
+				 * DT's copy; this board's Dom0 is Zephyr, so the settings
+				 * have to be here or nothing is muxed at all.
+				 *
+				 * bias-* IS written here, which is safe only with TF-A's D0 tables.
+				 * Both the mux and the pad registers of this block moved between
+				 * BCM2712 steppings, and the xen-troops TF-A this build fetches
+				 * carries only the C0 map: on this D0 board it aims the pull writes
+				 * for these pins at offset 0x24, four bytes past the end of the 0x20
+				 * window the firmware's bcm2712d0.dtbo declares. That
+				 * is an unrecoverable abort in EL3 -- release builds have
+				 * CRASH_REPORTING=0 -- so the CPU that issued the request simply never
+				 * came back: RCU reported a stall on it, the IPI from the other CPU was
+				 * never taken, and because the console is synchronous the whole board
+				 * went silent. meta-xt-rpi5's
+				 * 0001-plat-rpi5-pinctrl-add-BCM2712-D0-stepping-tables.patch adds the
+				 * D0 map (pads land at 0x14/0x18) and RPI5_PINCTRL_D0=1 selects it.
+				 *
+				 * The pulls are not optional. Measured on this board, mux-only vs
+				 * mux+pulls, with everything else identical:
+				 *   mux only : brcmfmac: F1 signature read @0x18000000=0xffffffff
+				 *              brcmf_chip_recognition: MMIO read failed -> probe -52
+				 *   mux+pulls: brcmfmac: F1 signature read @0x18000000=0x15264345
+				 *              using brcm/brcmfmac43455-sdio for chip BCM4345/6
+				 * i.e. without the pull-ups on CMD and DAT0-3 the card answers CMD5 but
+				 * every backplane read comes back all-ones.
+				 */
+				scmi_sdio2_30_pins: scmi_sdio2_30_pins {
+					pin_clk {
+						function = "f_sd2";
+						pins = "gpio30";
+						bias-disable;
+					};
+					pin_cmd {
+						function = "f_sd2";
+						pins = "gpio31";
+						bias-pull-up;
+					};
+					pins_dat {
+						function = "f_sd2";
+						pins = "gpio32", "gpio33", "gpio34", "gpio35";
+						bias-pull-up;
+					};
+				};
+
+			};
+		};
+
+		/* ===== Wi-Fi: SDIO controller + WL_ON regulator -> DomD =====
+		 * Merged from meta-xt-driver-domain/recipes-kernel/linux/files/
+		 * bcm2712-raspberrypi5-wifi.dtso rather than applied as an overlay. Two
+		 * reasons: the partial DT is compiled without `dtc -@` (on BOTH boards,
+		 * so this is not an rpi5 gap to fix) and therefore carries no
+		 * __symbols__ for &passthrough to bind to; and the dtso's own
+		 * gpio@107d508500 / clk_emmc2 would collide with the nodes this file
+		 * already has. Merging resolves both by construction. The dtso also had
+		 * an unresolved apply-order dependency on scmi_sdio2_30_pins, which
+		 * disappears here.
+		 *
+		 * Radio: BCM43455 (same part as RPi4 -- rpm -qlp
+		 * linux-firmware-rpidistro-bcm43455 ships
+		 * brcmfmac43455-sdio.raspberrypi,5-model-b.bin), driven by brcmfmac over
+		 * SDIO. This is a DIFFERENT controller from the SD card
+		 * (mmc@1000fff000): SPI 274 vs SPI 273, and separate MMIO.
+		 * Unlike RPi4 -- where mmcnr and emmc2 share SPI 126 -- there
+		 * is no interrupt to arbitrate here. The block is stripped for
+		 * DOM0_OS=linux all the same, because that flavour has no SCMI
+		 * to mux the SDIO pins (see the marker above gio).
+		 *
+		 * pinctrl IS wired, through SCMI. GPIO30-35 must be muxed to
+		 * f_sd2 or the controller sees no card: left to the VideoCore
+		 * firmware, on the assumption that it pre-muxes them before Xen
+		 * starts, the radio did not enumerate. scmi_sdio2_30_pins above
+		 * makes DomD do the mux itself via EL3.
+		 *
+		 * xen,reg maps 0x1100000 page-rounded. The host reg is two windows
+		 * (host @0x1100000 len 0x260, cfg @0x1100400 len 0x200); both fall in
+		 * the single 4 KiB page, and no other node in this file maps it. BOTH
+		 * windows are required: sdhci-brcmstb keeps its vendor registers in the
+		 * "cfg" window (priv->cfg_regs), so dropping it would break probe.
+		 * boot.cmd releases the host side with
+		 *   fdt set /axi/mmc@1100000 xen,passthrough
+		 * (the gio half of wifi-passthrough.dtso is already done for BT).
+		 *
+		 * ===== DMA: ADMA2 IS ENABLED HERE, DELIBERATELY =====
+		 * This is the one DMA-capable passthrough path in the Wi-Fi/BT set, and
+		 * it works for a reason specific to BCM2712. Traced end to end:
+		 *
+		 *  - sdhci-brcmstb.c:693 calls sdhci_read_caps(), i.e. the REAL hardware
+		 *    capabilities register at offset 0x40 is read. Nothing in the 2712
+		 *    path substitutes hardcoded caps.
+		 *  - sdhci-brcmstb.c:694-695 clears SDHCI_CAN_64BIT only when the match
+		 *    data sets BRCMSTB_MATCH_FLAGS_NO_64BIT. match_priv_2712.flags is
+		 *    BRCMSTB_MATCH_FLAGS_USE_CARD_BUSY alone, so 64-bit ADMA survives.
+		 *  - The host DT's sdhci-caps-mask = <0xc000 0x00> does NOT touch DMA.
+		 *    __sdhci_read_caps() reads that property as a u64
+		 *    (sdhci.c:4181-4184), so <0xc000 0x00> is 0x0000c000_00000000:
+		 *    lower_32_bits() = 0 leaves caps(0x40) -- and therefore
+		 *    SDHCI_CAN_DO_ADMA2 (bit 19, 0x00080000) and SDHCI_CAN_DO_SDMA
+		 *    (bit 22, 0x00400000) -- completely untouched. upper_32_bits() =
+		 *    0xc000 masks caps1 bits 14-15 = SDHCI_RETUNING_MODE_MASK, which is
+		 *    a tuning concern, not a DMA one. The mask is carried over verbatim.
+		 *  - No external DMA controller is involved, so unlike RPi4 there is
+		 *    nothing extra to pass through. See the contrast note below.
+		 *
+		 * WHY THIS IS SAFE WITHOUT AN IOMMU. xen,force-assign-without-iommu
+		 * means the controller's bus-master writes land at GUEST physical
+		 * addresses. DomD is direct-mapped in dom0less, so guest PA == host PA
+		 * and the descriptors are valid. /axi's dma-ranges on the host is an
+		 * identity map for the low 64 GiB anyway (measured), so moving the node
+		 * under /passthrough (which has no dma-ranges) changes no translation.
+		 * ==> DomD's direct-map is a PRECONDITION for Wi-Fi DMA. Removing it
+		 * would not disable DMA, it would corrupt memory silently.
+		 *
+		 * CONTRAST WITH RPI4. RPi4's Wi-Fi SDIO is mmcnr@7e300000, an
+		 * Arasan block with no usable internal bus master: bound as
+		 * brcm,bcm2835-sdhci (sdhci-iproc.c's bcm2835_data sets .caps
+		 * without ADMA2 or SDMA and .missing_caps = true, so the
+		 * capabilities register is never read) it is PIO by driver
+		 * design. DomD binds it with the downstream bcm2835-mmc.c
+		 * instead, which does DMA through an EXTERNAL engine,
+		 * dma-controller@7e007000, passed to DomD alongside it. This
+		 * controller has ADMA2 built in, so nothing extra is passed
+		 * through.
+		 * RPi4's SD CARD is a different controller and a different story: emmc2
+		 * is brcm,bcm2711-emmc2 -> bcm2711_data, which sets no caps override at
+		 * all, so it reads real hardware caps and ADMA2 works. That path is
+		 * already enabled in the RPi4 partial DT.
+		 *
+		 * IF ADMA MISBEHAVES ON THIS BOARD, the escape hatch is a DT property,
+		 * not a code change -- but MIND THE EXISTING VALUE. This node already
+		 * carries sdhci-caps-mask = <0xc000 0x00> (inherited from the host, for
+		 * the retuning bits), and a DT property is single-valued, so the ADMA
+		 * bits have to be COMBINED into it, not written over it:
+		 *
+		 *     sdhci-caps-mask = <0xc000 0x00480000>;
+		 *       upper 32 bits 0xc000     -> caps1 bits 14-15, retuning (KEEP)
+		 *       lower 32 bits 0x00480000 -> caps(0x40): SDHCI_CAN_DO_ADMA2
+		 *                                   (bit 19) | SDHCI_CAN_DO_SDMA (bit 22)
+		 *
+		 * Writing the bare <0x0 0x00480000> here would silently drop the
+		 * retuning mask. <0x0 0x00480000> is the correct form only for RPi4's
+		 * emmc2, which has no pre-existing mask. That is the same property and
+		 * the same ADMA bits that were needed for RPi4's emmc2 with one
+		 * particular SD card (SanDisk 512 GiB SDXC ST512, manfid 0x03: ADMA
+		 * failed every transfer with "mmc0: ADMA error: 0x02000000" -> error -5
+		 * -> infinite retry, and DomD hung in rootwait). That was judged
+		 * media/individual dependent and deliberately kept OUT of the source
+		 * tree. Do NOT add the
+		 * mask pre-emptively here. Wi-Fi is not on the rootfs path, so a failure
+		 * here degrades the radio rather than hanging the boot -- check
+		 * `dmesg | grep -iE "mmc.*(ADMA|SDMA|PIO)"` on the board and only then
+		 * decide.
+		 */
+		sdio2: mmc@1001100000 {
+			#address-cells = <0x01>;
+			#size-cells = <0x00>;
+			compatible = "brcm,bcm2712-sdhci";
+			reg = <0x10 0x1100000 0x00 0x260 0x10 0x1100400 0x00 0x200>;
+			reg-names = "host", "cfg";
+			interrupts = <0x00 0x112 0x04>;		/* GIC SPI 274 */
+			interrupt-parent = <&gic>;
+			clocks = <&clk_emmc2>;
+			sdhci-caps-mask = <0xc000 0x00>;
+			sdhci-caps = <0x00 0x00>;
+			supports-cqe;
+			mmc-ddr-3_3v;
+			bus-width = <0x04>;
+			vmmc-supply = <&wl_on_reg>;
+			sd-uhs-ddr50;
+			non-removable;
+			pinctrl-names = "default";
+			pinctrl-0 = <&scmi_sdio2_30_pins>;
+			xen,path = "/axi/mmc@1100000";
+			xen,force-assign-without-iommu;
+			xen,reg = <0x10 0x1100000 0x00 0x1000 0x10 0x1100000>;
+			status = "okay";
+
+			wifi@1 {
+				reg = <0x01>;
+				compatible = "brcm,bcm4329-fmac";
+				/*
+				 * WITHOUT THIS brcmfmac NEVER FINDS ITS FIRMWARE. The driver builds
+				 * the firmware filename from the board type, and in a dom0less guest
+				 * there is nothing to derive it from: brcmf_of_probe() reads
+				 * brcm,board-type from this node and otherwise falls back to the DT
+				 * root compatible -- which a partial DT does not have (that same
+				 * missing root compatible is why of_have_populated_dt() is false here
+				 * and the regulator core refuses dummy supplies). So it asked for the
+				 * generic brcm/brcmfmac43455-sdio.bin, which linux-firmware does not
+				 * ship: only per-board names exist. Measured, once the SCMI pinmux
+				 * made the chip reachable at all:
+				 *   brcmfmac: F1 signature read @0x18000000=0x15264345   <- chip OK
+				 *   brcmfmac: using brcm/brcmfmac43455-sdio for chip BCM4345/6
+				 *   Direct firmware load for brcm/brcmfmac43455-sdio.bin failed -2
+				 * The three files that DO exist on the rootfs are
+				 * brcmfmac43455-sdio.raspberrypi,5-model-b.{bin,txt,clm_blob}, which is
+				 * exactly the string below.
+				 */
+				brcm,board-type = "raspberrypi,5-model-b";
+				local-mac-address = [00 00 00 00 00 00];
+			};
+		};
+
+		/* WL_ON: powers the radio. gio line 28. The 25 ms startup delay is the
+		 * dtso's value (0x249f0 us) -- brcmfmac probes the SDIO card right after
+		 * the regulator enables, so this delay is what keeps the first CMD from
+		 * racing the chip's power-on reset.
+		 * 0x325aa0 = 3300000 uV.
+		 */
+		wl_on_reg: wl_on_reg {
+			compatible = "regulator-fixed";
+			regulator-name = "wl-on-regulator";
+			regulator-min-microvolt = <0x325aa0>;
+			regulator-max-microvolt = <0x325aa0>;
+			gpio = <&gio 0x1c 0x00>;		/* line 28 = WL_ON */
+			startup-delay-us = <0x249f0>;
+			enable-active-high;
+		};
+		/* SODEV-LINUX-DOM0-SD-STRIP-END */
+
 		/* SODEV-LINUX-DOM0-SD-STRIP-BEGIN: domd-vc4.bb strips this whole SD/GPIO
-		 * block for DOM0_OS=linux. In the linux flavour the thin Linux Dom0 is the
-		 * hardware domain and KEEPS the SoC SDHCI (mmc@fff000) + AON GPIO, mounting
-		 * /dev/mmcblk0p1 and block-attaching p3/p4 to DomD (xvdb/xvdc). Only the
-		 * zephyr flavour hands the SD to DomD, so only there does DomD need this
-		 * block (which claims mmc IRQ SPI273 -> route_irq_to_guest). Comments are
-		 * dropped by dtc, so the zephyr DTB is byte-identical with these markers. */
+		 * block for DOM0_OS=linux. In the linux flavour the thin Linux
+		 * Dom0 is the hardware domain and KEEPS the SoC SDHCI
+		 * (mmc@fff000) + AON GPIO, mounting /dev/mmcblk0p1 and
+		 * block-attaching p3/p4 to DomD (xvdb/xvdc). Only the zephyr
+		 * flavour hands the SD to DomD, so only there does DomD need
+		 * this block (which claims mmc IRQ SPI273 ->
+		 * route_irq_to_guest). Comments are dropped by dtc, so the
+		 * zephyr DTB is byte-identical with these markers. */
+		/* ===== emmc2 clock (200 MHz), shared by TWO controllers =====
+		 * It feeds mmc@1000fff000 (the SoC SD card controller, below)
+		 * and mmc@1001100000 (the Wi-Fi SDIO controller, above).
+		 * DOM0_OS=linux strips both, so it goes with them. 0xbebc200 =
+		 * 200000000. Same value the host DTB gives emmc2.
+		 */
+		clk_emmc2: clk_emmc2 {
+			compatible = "fixed-clock";
+			#clock-cells = <0x0>;
+			clock-output-names = "emmc2-clock";
+			clock-frequency = <0xbebc200>;
+		};
+
 		/* ------------------------------------------------------------------
 		 * SoC-internal SDHCI (SD card slot) passthrough
 		 * to DomD. In the disaggregated topology the Dom0 is Zephyr (no blkback), so DomD owns the SD
@@ -1053,13 +1479,6 @@
 			xen,reg = <0x10 0xfff000 0x0 0x1000 0x10 0xfff000
 				   0x10 0x1520000 0x0 0x1000 0x10 0x1520000>;
 			status = "okay";
-		};
-
-		clk_emmc2: clk_emmc2 {
-			compatible = "fixed-clock";
-			#clock-cells = <0x0>;
-			clock-output-names = "emmc2-clock";
-			clock-frequency = <0xbebc200>;
 		};
 
 		sd_io_1v8_reg: sd_io_1v8_reg {

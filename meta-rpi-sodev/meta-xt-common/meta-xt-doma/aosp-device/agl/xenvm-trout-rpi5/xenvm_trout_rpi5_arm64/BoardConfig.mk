@@ -51,6 +51,11 @@ include device/epam/aosp-xenvm-trout/xenvm_trout_arm64/BoardConfig.mk
 TARGET_ARCH_VARIANT := armv8-a
 TARGET_CPU_VARIANT := cortex-a76
 
+# The shadow-AP sepolicy. Same content as the RPi4 board's; see
+# ../sepolicy/doma_shadow_ap.te for why it exists even though this product boots
+# permissive.
+BOARD_VENDOR_SEPOLICY_DIRS += device/agl/xenvm-trout-rpi5/sepolicy
+
 # ---------------------------------------------------------------------------
 # Build the Venus ICD.
 #

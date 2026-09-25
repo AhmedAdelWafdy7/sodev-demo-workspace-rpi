@@ -315,6 +315,27 @@ echo "passthrough: /soc/pinctrl@7d504100 (pinmux: sd2 + uart0 pins -> DomD)"
 fdt set /soc@107c000000/pinctrl@7d504100 xen,passthrough
 
 # ------------------------------------------------------------------
+# Wi-Fi SDIO -> DomD
+# ------------------------------------------------------------------
+# /axi/mmc@1100000 is the BCM43455's SDIO host controller (alias sdio2; the
+# /aliases entry wifi0 = "/axi/mmc@1100000/wifi@1" is what identifies it). It is
+# a DIFFERENT controller from the SD card at /soc@107c000000/mmc@fff000: SPI 274
+# vs SPI 273, separate MMIO, so DomD can own it independently of the SD card. On
+# RPi4 the equivalent pair (mmcnr and emmc2) SHARE SPI 126, which is why that
+# board needed a different arrangement. The linux flavour does not hand it over
+# at all: it has no SCMI to mux the SDIO pins, so domd-vc4.bb strips the
+# controller from DomD's partial DT there, and that script leaves the node with
+# Dom0.
+#
+# The WL_ON side needs nothing extra: it is gio line 28, and gio is already
+# marked above for BT_ON on line 29. That is the whole of what
+# meta-xt-driver-domain/recipes-kernel/linux/files/wifi-passthrough.dtso does
+# (`&sdio2` + `&gio`); that overlay is not applied, and these two `fdt set`
+# lines take its place.
+echo "passthrough: /axi/mmc@1100000 (Wi-Fi SDIO -> DomD, SPI 274)"
+fdt set /axi/mmc@1100000 xen,passthrough
+
+# ------------------------------------------------------------------
 # Disable the Bluetooth UART: nothing in this configuration uses it.
 # ------------------------------------------------------------------
 fdt set /soc@107c000000/serial@7d50c000 status "disabled"

@@ -15,8 +15,9 @@
 #
 # The inherit has to come first for PRODUCT_* : the upstream makefile ends with its own
 # PRODUCT_NAME / PRODUCT_DEVICE / PRODUCT_MODEL assignments, so ours have to be written
-# after it to win. The block below is the exact opposite and has to come BEFORE, for a
-# reason worth spelling out because it is easy to get backwards:
+# after it to win. (The one PRODUCT_COPY_FILES line above the inherit is the opposite
+# case on purpose; its comment says why.) The block below is the exact opposite and has
+# to come BEFORE, for a reason worth spelling out because it is easy to get backwards:
 #
 #   $(call inherit-product) does not include anything at the point it appears. It only
 #   pushes an $(INHERIT_TAG)<path> marker onto every product variable
@@ -53,6 +54,14 @@
 # re-declared: level-1/version-1_3/compute-0 describe gfxstream, not Venus over
 # V3D. RenderEngine and HWUI reach the loader directly and do not read them.
 TARGET_VULKAN_SUPPORT := false
+
+# ABOVE the inherit, on purpose: for one destination the first PRODUCT_COPY_FILES entry
+# wins (build/make/core/Makefile:139-156), and inherit-product puts the parent's entries
+# where the inherit line is (product.mk:539-540), so a line below it would be dropped
+# silently. This replaces trout's virtwifi.rc, which enabled Wi-Fi at every boot; see
+# the file.
+PRODUCT_COPY_FILES += \
+    device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/virtwifi.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/virtwifi.rc
 
 $(call inherit-product, device/epam/aosp-xenvm-trout/aosp_xenvm_trout_arm64.mk)
 
@@ -93,6 +102,96 @@ PRODUCT_COPY_FILES += \
 # animations off (the device model, not the GPU, pays for them). The overlay file
 # carries the measurements and the runtime equivalents for an existing /data.
 DEVICE_PACKAGE_OVERLAYS += device/agl/common/overlay
+
+# Shadow-AP Wi-Fi: simulated radios in this guest beaconing the SSIDs DomD really
+# sees, so the Settings Wi-Fi screen lists real access points instead of virt_wifi's
+# single synthetic "VirtWifi".
+#
+# IT STARTS AUTOMATICALLY at sys.boot_completed (measured on the board,
+# 2026-08-29), and the product ships no rc that starts virt_wifi: the two must
+# never both own wlan0. The RPi4 product does the same. No hand-typed command is
+# needed to bring the Wi-Fi path up.
+#
+# WHY NOT SHIPPING THE virt_wifi rc IS NOT MERELY TIDY. Such an rc runs
+# `setup_wifi --interface=eth1` at `on boot`, which renames eth1 to buried_eth1 with
+# SIOCSIFNAME. Dropping the upper virt_wifi link does NOT undo that rename, so
+# doma-shadow-ap finds no eth1, logs "WARNING: eth1 absent; not enslaving", and
+# br-shadow comes up with NO UPLINK -- the station associates and never gets a DHCP
+# lease, with nothing in the log pointing at the cause. doma-shadow-ap.sh also
+# renames it back (its step 1), so both halves of that failure are closed.
+#
+# The service is declared `disabled`; the only thing that starts it is
+# `on property:sys.boot_completed=1` in the rc. The script reads
+# persist.vendor.doma.shadow_ap (default true) at its TOP, and when it is not true it
+# execs setup_wifi --interface=eth1 instead, handing wlan0 back to virt_wifi. So the
+# risky part -- hostapd and the Wi-Fi HAL coexisting in one guest -- is recovered from
+# on hardware with
+#     setprop persist.vendor.doma.shadow_ap false && reboot
+# rather than with an SD rewrite. setup_wifi itself lives in the com.google.cf.wifi
+# apex, so not shipping the rc does not remove the fallback.
+#
+# THE SCAN RELAY. doma-shadow-ap only beacons what is in
+# /data/vendor/wifi/shadow/aps.conf, and with nothing keeping that file current it
+# stays at the seeded doma-shadow-aps.conf below, so the AAOS Wi-Fi screen lists a
+# fixed set of SSIDs regardless of what DomD can see. doma-wifi-relay consumes the
+# DomD agent's scan feed on /dev/hvc4 and the companion app's PSK drop-box, and keeps
+# aps.conf in sync with the current scan. init.xenvm-hwsim.rc declares it `disabled`
+# and starts it at sys.boot_completed; it follows the Settings Wi-Fi toggle, and
+#     setprop persist.vendor.doma.wifi_relay false
+# turns it off.
+#
+# These four are board-specific and stay in this board's own directory.
+PRODUCT_COPY_FILES += \
+    device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/init.xenvm-hwsim.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/init.xenvm-hwsim.rc \
+    device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/doma-shadow-ap.sh:$(TARGET_COPY_OUT_VENDOR)/bin/doma-shadow-ap \
+    device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/doma-shadow-aps.conf:$(TARGET_COPY_OUT_VENDOR)/etc/doma-shadow-aps.conf \
+    device/agl/xenvm-trout-rpi5/xenvm_trout_rpi5_arm64/doma-wifi-relay.sh:$(TARGET_COPY_OUT_VENDOR)/bin/doma-wifi-relay
+
+# The DomA half of the relay, built from device/agl/doma-common/DomaWifiRelay.
+# The RPi4 product builds its own copy from device/sodev/xenvm-cf; the two
+# copies are kept identical by hand. It is the only component that can learn the
+# passphrase the user typed. NETWORK_SETTINGS is signature-level, but
+# READ_WIFI_CREDENTIAL is signature|privileged, so the module ships a privapp
+# allowlist entry (its Android.bp). It installs to /system_ext/priv-app, not
+# /vendor: soong rejects platform_apis on a vendor module. It reads the same
+# persist.vendor.doma.wifi_relay property and the same Settings Wi-Fi toggle as
+# the shell daemon: `false` stops both.
+PRODUCT_PACKAGES += \
+    DomaWifiRelay
+
+# WHY doma-shadow-aps.conf IS SHIPPED AT ALL.
+# doma-shadow-ap dies with "$APS is empty" if /data/vendor/wifi/shadow/aps.conf
+# has no content, and /data is empty on a first boot, so on a freshly flashed
+# card the AAOS Wi-Fi screen would list nothing and there would be nothing to
+# select. The script merges this file into aps.conf on every boot, adding only
+# the SSIDs aps.conf lacks, so a row the relay or the user has written is never
+# overwritten.
+#
+# IT CARRIES ONE PLACEHOLDER ROW, EXAMPLE-SSID, AND NO REAL PASSPHRASE: this
+# file is in the source tree and in the vendor image. A real AP's passphrase is
+# typed on the Wi-Fi screen and reaches the shadow AP through DomaWifiRelay; the
+# file's own header says how, and why a shadow AP cannot learn it any other way.
+
+# wificond. WifiNative talks to it over binder to do the nl80211 setup of wlan0, so
+# without it enabling Wi-Fi fails at exactly one line -- "Failed to setup iface in
+# nl80211=wlan0" -- and the vendor HAL then tears the interface straight back down.
+#
+# It is missing from the inherited set for a subtle reason worth writing down: that set
+# DOES include wificond_compat_symlink_module, which installs
+# /system/bin/wificond -> /system/system_ext/bin/wificond, but it does NOT include
+# wificond itself. The result is a DANGLING SYMLINK and no wificond.rc anywhere in
+# /system, so `start wificond` answers "Could not find 'wificond'". Verified on the
+# running guest and in the build: product_packages.txt lists only
+# wificond_compat_symlink_module, while all_modules.txt has wificond -- buildable,
+# just never selected.
+#
+# Measured on hardware before adding this (logcat, DomA):
+#   android.hardware.wifi-service: Adding interface handle for wlan0
+#   android.hardware.wifi-service: Configured chip in mode 3      <- vendor HAL is fine
+#   WifiNative: Failed to setup iface in nl80211=wlan0            <- wificond missing
+#   WifiVendorHal: onIfaceRemoved 0, name: wlan0
+#   WifiActiveModeWarden: ClientModeManager start failed!
+PRODUCT_PACKAGES += wificond
 
 # Render with Vulkan (Venus) by default: SurfaceFlinger's RenderEngine and HWUI in every
 # app. Both are debug.* properties, which is the only switch either has -- SurfaceFlinger
