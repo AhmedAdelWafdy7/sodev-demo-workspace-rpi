@@ -1,0 +1,73 @@
+From aa775834b1ba47701160a0c5617649d1716c2746 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 26 Aug 2026 23:20:41 +0900
+Subject: [PATCH] xen-virtual-device: ship mac80211_hwsim so the guest can host
+ shadow APs
+
+virt_wifi can only ever synthesise one fake network called "VirtWifi", so AAOS's Wi-Fi
+screen can never list real access points with it. The plan is to give the guest
+mac80211_hwsim radios instead: wlan0 as the station AAOS uses, and further radios on
+which hostapd beacons SSIDs mirrored from what DomD's real Wi-Fi actually sees, so the
+user picks a genuine SSID on screen.
+
+mac80211_hwsim, mac80211 and libarc4 were all built but left in _IMPLICIT_MODULES, i.e.
+not distributed -- and the guest cannot load what the image does not ship. Confirmed on
+the running DomA: /vendor_dlkm/lib/modules and /vendor/lib/modules contain neither
+mac80211.ko nor mac80211_hwsim.ko, and lsmod showed no 802.11 stack at all. Move all
+three to _VIRT_COMMON_MODULES, keeping the list in ASCII order. This is the same move
+that was already made for virt_wifi/cfg80211/rfkill and proven to reach the guest.
+
+No host-side component is needed. The .ko carries both transports, and with no virtio
+hwsim device and no wmediumd netlink registrant present it falls back to its own
+in-kernel "perfect channel medium" -- which is what matters here, because
+neither qemu 7.0 nor qemu 10.0 has a virtio mac80211-hwsim device model (no file
+matching hwsim in hw/ of either), so the
+Cuttlefish arrangement of putting the APs in a separate VM is not available.
+
+Radios are not created by the module: BOARD_KERNEL_CMDLINE already carries
+mac80211_hwsim.radios=0, and /apex/com.google.cf.wifi/bin/mac80211_create_radios makes
+them at runtime over the MAC80211_HWSIM genl family. That binary is already in the image
+(com.google.cf.wifi.apex), as is hostapd (com.google.cf.wpa_supplicant.apex).
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [yhamamachi/android_kernel_xen-virtual-device]
+---
+ BUILD.bazel | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/BUILD.bazel b/BUILD.bazel
+index 4e401c1..ceca6db 100644
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -61,6 +61,20 @@ filegroup(
+ _VIRT_COMMON_MODULES = [
+     "cfg80211.ko",
+     "failover.ko",
++    # mac80211_hwsim simulates 802.11 radios inside the guest, so AAOS can be given a
++    # real cfg80211 station (wlan0) plus extra radios to run shadow APs on. Distributed
++    # rather than left implicit because the guest cannot load what the image does not
++    # ship: mac80211_hwsim needs mac80211, which needs libarc4.
++    #
++    # The module is loaded with radios=0 (BOARD_KERNEL_CMDLINE already carries
++    # mac80211_hwsim.radios=0) and the radios are created at runtime by
++    # /apex/com.google.cf.wifi/bin/mac80211_create_radios, the same way Cuttlefish does
++    # it. No host-side component is required: with no virtio hwsim device and no wmediumd
++    # netlink registrant the driver falls back to its own in-kernel "perfect channel
++    # medium", which is what the shadow APs ride on.
++    "libarc4.ko",
++    "mac80211.ko",
++    "mac80211_hwsim.ko",
+     "net_failover.ko",
+     "rfkill.ko",
+     "rpmsg_ns.ko",
+@@ -163,9 +177,6 @@ _IMPLICIT_MODULES = [
+     "kunit.ko",
+     "l2tp_core.ko",
+     "l2tp_ppp.ko",
+-    "libarc4.ko",
+-    "mac80211.ko",
+-    "mac80211_hwsim.ko",
+     "mac802154.ko",
+     "macsec.ko",
+     "mii.ko",

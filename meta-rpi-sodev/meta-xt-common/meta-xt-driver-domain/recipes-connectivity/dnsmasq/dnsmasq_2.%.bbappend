@@ -29,6 +29,21 @@ do_install:append() {
     # doma eth1 (vif-emu1) = the AAOS management NIC -> .10.13 (adb)
     echo "dhcp-host=${XT_DOMA_MAC},doma,${XT_DOMA_IP},infinite" >> ${D}${sysconfdir}/dnsmasq.conf
     echo "dhcp-host=${XT_DOMA_ETH0_MAC},doma-eth0,${XT_DOMA_ETH0_IP},infinite" >> ${D}${sysconfdir}/dnsmasq.conf
+    # doma wlan0 (hwsim station on the in-guest shadow AP) -> .10.15, for the
+    # MACs this line lists: the persistent randomized MAC the framework actually
+    # uses (only when XT_DOMA_WLAN0_MAC is set; it ships empty) and the hwsim
+    # perm_addr it falls back to if randomization is ever turned off. The shadow
+    # AP makes eth1 a br-shadow port at boot, so the .13 line above is never
+    # answered. See sodev-net.inc for how each MAC is derived and for the SSID
+    # dependency of the first one.
+    # The randomized MAC is optional (sodev-net.inc explains why it ships empty), and
+    # dnsmasq REFUSES TO START on a dhcp-host line whose MAC it cannot parse, so build
+    # the address list instead of interpolating a possibly-empty variable into it.
+    wlan0_macs="${XT_DOMA_WLAN0_PERM_MAC}"
+    if [ -n "${XT_DOMA_WLAN0_MAC}" ]; then
+        wlan0_macs="${XT_DOMA_WLAN0_MAC},${XT_DOMA_WLAN0_PERM_MAC}"
+    fi
+    echo "dhcp-host=$wlan0_macs,doma-wlan0,${XT_DOMA_WLAN0_IP},infinite" >> ${D}${sysconfdir}/dnsmasq.conf
     # domu keeps a static 192.168.10.12 in its rootfs; this mapping is a
     # consistent fallback should it ever DHCP.
     echo "dhcp-host=${XT_DOMU_MAC},domu,${XT_DOMU_IP},infinite" >> ${D}${sysconfdir}/dnsmasq.conf

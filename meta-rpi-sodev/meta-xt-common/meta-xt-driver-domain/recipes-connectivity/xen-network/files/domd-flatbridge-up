@@ -66,7 +66,7 @@ ip link set eth0 master xenbr0 2>/dev/null && log "eth0 -> xenbr0"
 ip addr add "$XENBR0_ADDR" dev xenbr0 2>/dev/null
 xsr "addr-set eth0master=$([ -e /sys/class/net/eth0/master ] && echo y || echo n)"
 ip link set eth0 up 2>/dev/null
-ip route replace default via "$UPLINK_GW" dev xenbr0 2>/dev/null
+ip route replace default via "$UPLINK_GW" dev xenbr0 metric 1024 2>/dev/null
 # DomA's DHCP lease (.10.13) is served by the system dnsmasq.service: its
 # /etc/dnsmasq.conf (dnsmasq bbappend) carries the flat-bridge range and the
 # static guest mappings, and it binds wildcard so it answers once xenbr0 is
@@ -117,5 +117,66 @@ else
     done
     [ "$pending" -eq 0 ] || log "WARNING: $pending of [$expected ] not enslaved after ~90s"
 fi
+# ---------------------------------------------------------------------------
+# NAT the flat bridge out through DomD's real Wi-Fi.
+#
+# The bridge gives the guests L2 access to eth0's wired network, which needs no
+# NAT. Wi-Fi is different: DomD's wlan0 gets its own address from the AP's DHCP
+# server, the AP knows nothing about 192.168.10.0/24, and Xen guests
+# cannot be bridged onto a station-mode wireless interface at all -- 802.11 headers carry
+# one address per direction, so a bridge port would have to send frames with the guest's
+# MAC as source and the AP would drop them. Routing plus source NAT is the only way out.
+#
+# Measured on RPi4 2026-08-26: DomD itself reached the internet over wlan0 (ping
+# 8.8.8.8 10 ms, an https page fetched), but DomA could not, because nothing
+# translated its addresses. iptables is an RDEPENDS of this recipe for that
+# reason.
+#
+# Rules are installed unconditionally, not gated on wlan0 existing: iptables resolves
+# interface names when a packet is matched, not when the rule is added, so they simply do
+# nothing until wpa_supplicant brings the interface up. That matters because this unit is
+# Type=oneshot and finishes long before Wi-Fi associates. -C before -A/-I keeps it
+# idempotent, which this script has to be -- xl-create-doma.service re-runs it on every
+# DomA (re)create.
+UPLINK_WIFI_IF=wlan0
+if command -v iptables >/dev/null 2>&1; then
+    # 192.168.10.10/24 -> 192.168.10.0/24
+    _net="$(printf '%s' "${XENBR0_ADDR%%/*}" | sed 's|\.[0-9]*$|.0|')/${XENBR0_ADDR##*/}"
+    sysctl -qw net.ipv4.ip_forward=1 2>/dev/null || true
+    # ipt_add <table-args...> -- add the rule only if an identical one is absent.
+    # Written as a helper so the -C/-A pair cannot drift apart, and so the exit status
+    # of the whole thing is the ADD's, not a confusing `||`/`&&` precedence chain.
+    # DO NOT hide the add's stderr. A failed add is otherwise invisible: the
+    #   only symptom is DomA with no internet (ping 8.8.8.8 100% loss, DNS still
+    #   fine because dnsmasq answers locally) and `iptables -t nat -S` empty,
+    #   which is how a missing nat table presented on the board. The nat table
+    #   is a module in these kernels; modules-load.d/domd-nat.conf loads it at
+    #   boot.
+    ipt_add() {
+        _t=""
+        if [ "$1" = "-t" ]; then _t="-t $2"; shift 2; fi
+        _op="$1"; shift
+        # shellcheck disable=SC2086
+        if iptables $_t -C "$@" 2>/dev/null; then return 0; fi
+        # shellcheck disable=SC2086
+        _err=$(iptables $_t "$_op" "$@" 2>&1) && return 0
+        log "WARNING: iptables $_t $_op $* failed: ${_err:-(no message)}"
+        return 1
+    }
+    ipt_add -t nat -A POSTROUTING -s "$_net" -o "$UPLINK_WIFI_IF" -j MASQUERADE \
+        && log "nat: MASQUERADE $_net -> $UPLINK_WIFI_IF"
+    ipt_add -I FORWARD -i xenbr0 -o "$UPLINK_WIFI_IF" -j ACCEPT
+    # The stateful return rule is OPTIONAL: it needs the xt_conntrack module,
+    # and the FORWARD policy is ACCEPT, so replies come back without it.
+    ipt_add -I FORWARD -i "$UPLINK_WIFI_IF" -o xenbr0 \
+        -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT \
+        || log "note: stateful return rule skipped (no xt_conntrack); FORWARD policy is $(iptables -S FORWARD | sed -n 's/^-P FORWARD //p')"
+    xsr "nat-installed net=$_net out=$UPLINK_WIFI_IF"
+else
+    log "iptables not present; guests will have no route out through $UPLINK_WIFI_IF"
+    xsr "nat-skipped-no-iptables"
+fi
+# ---------------------------------------------------------------------------
+
 xsr "done addrs=$(ip -br -4 a | tr '\n' '|')"
 log "done (DomD=${XENBR0_ADDR%%/*} on xenbr0)"

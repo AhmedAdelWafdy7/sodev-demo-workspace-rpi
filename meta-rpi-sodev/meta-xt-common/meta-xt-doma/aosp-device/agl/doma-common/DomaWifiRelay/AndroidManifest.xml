@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.android.xt.domawifirelay"
+    android:sharedUserId="android.uid.system">
+
+    <!-- NETWORK_SETTINGS: required by WifiManager.connect(int, ActionListener)
+         (WifiServiceImpl:7569 isPrivileged) and it is also what short-circuits every
+         location/nearby check inside getPrivilegedConfiguredNetworks. -->
+    <uses-permission android:name="android.permission.NETWORK_SETTINGS" />
+    <!-- READ_WIFI_CREDENTIAL: enforceReadCredentialPermission() in
+         getPrivilegedConfiguredNetworks (WifiServiceImpl:3980). -->
+    <uses-permission android:name="android.permission.READ_WIFI_CREDENTIAL" />
+    <!-- ACCESS_WIFI_STATE: the permission the CONFIGURED_NETWORKS_CHANGED broadcast is
+         sent with (WifiConfigManager's
+         sendConfiguredNetworkChangedBroadcast()). -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- android:persistent keeps the process alive so the RUNTIME-registered
+         CONFIGURED_NETWORKS_CHANGED receiver stays live; a runtime receiver dies with
+         its process, and the wrong-password status change is the one event that must
+         not be missed. It is an <application> attribute, not a <service> one, and only
+         an android.uid.system app may ask for it. START_STICKY on the service is the
+         belt to this braces: if the process is killed anyway, init/AMS restarts it and
+         onCreate re-registers and re-sweeps, so a missed event is recovered at the next
+         config change rather than lost forever. -->
+    <application
+        android:label="DomA Wi-Fi Relay"
+        android:allowBackup="false"
+        android:persistent="true"
+        android:directBootAware="true">
+
+        <!-- BOOT_COMPLETED is one of the few implicit broadcasts a manifest receiver
+             may still register for; CONFIGURED_NETWORKS_CHANGED is not, which is why
+             that one is registered at RUNTIME by the service below. -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <service
+            android:name=".RelayService"
+            android:exported="false"
+            android:directBootAware="true" />
+    </application>
+</manifest>

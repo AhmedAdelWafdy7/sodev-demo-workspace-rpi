@@ -11,5 +11,12 @@
 #                           single, flavour-independent producer that the p1 aaos
 #                           boot items consume (rpi5-sodev.yaml ENABLE_ANDROID=yes
 #                           declares them as domd target_images).
-IMAGE_INSTALL:append = " xt-aaos-host-services xt-xen-cfg-doma"
+# xt-doma-wifi-agent is the DomD half of DomA's shadow-AP Wi-Fi: it publishes
+# the real scan results over a qemu virtio-serial chardev and performs the real
+# association on DomA's behalf. Its two units start at boot and poll twice a
+# second, wpa_supplicant's until wlan0 appears and the agent's until both the
+# virtio-serial socket qemu creates when DomA starts and wpa_supplicant's wlan0
+# control socket exist; from then on the agent scans every 20 s and publishes
+# the result whether or not anything in DomA reads it.
+IMAGE_INSTALL:append = " xt-aaos-host-services xt-xen-cfg-doma xt-doma-wifi-agent"
 do_image[depends] += " aaos-guest-binaries:do_deploy"

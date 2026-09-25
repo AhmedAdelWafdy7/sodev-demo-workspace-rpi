@@ -86,6 +86,18 @@ rpi4)
 	# (Bluetooth on, animations at 100%), so say so here where it is cheap to notice.
 	[ -f "$OVERLAY_XML" ] || { echo "ERROR: $OVERLAY_XML is missing." >&2; exit 1; }
 	check_overlay_xml "$OVERLAY_XML"
+	# The device installs DomaWifiRelay from its own copy. A checkout that was
+	# staged for rpi5 still has device/agl/doma-common with the same module
+	# name, and soong rejects a duplicate module name.
+	for m in DomaWifiRelay; do
+		n=$(grep -rl --include=Android.bp "name: \"$m\"" "$ROOT/device" 2>/dev/null | wc -l)
+		if [ "$n" != "1" ]; then
+			echo "ERROR: found $n Android.bp defining $m under $ROOT/device (expected 1)." >&2
+			echo "       soong rejects a duplicate module name, and a stage for rpi5 leaves" >&2
+			echo "       device/agl/doma-common behind in a checkout both boards share." >&2
+			exit 1
+		fi
+	done
 	echo ">> stage-aosp-device: board=rpi4 device/sodev/xenvm-cf comes from the manifest (device $DEVICE)"
 	;;
 rpi5)
@@ -112,6 +124,25 @@ rpi5)
 		echo "ERROR: device/agl/common/overlay SettingsProvider defaults not staged." >&2; exit 1; }
 	check_overlay_xml "$OVERLAY_XML"
 
+	# device/agl/doma-common holds what the product installs by MODULE name
+	# (DomaWifiRelay). soong rejects a duplicate module name across the
+	# whole tree, so there must be exactly one Android.bp defining each. The
+	# rpi4 does not stage this directory: its device repository carries its
+	# own copies of the modules it installs, kept identical to these by
+	# hand.
+	rm -rf "$ROOT/device/agl/doma-common"
+	cp -a "$here/aosp-device/agl/doma-common" "$ROOT/device/agl/doma-common"
+	for m in DomaWifiRelay; do
+		# --include=Android.bp: without it a comment in an .rc file that merely names
+		# the module would count as a second definition.
+		n=$(grep -rl --include=Android.bp "name: \"$m\"" "$ROOT/device" 2>/dev/null | wc -l)
+		if [ "$n" != "1" ]; then
+			echo "ERROR: found $n Android.bp defining $m under $ROOT/device (expected 1)." >&2
+			echo "       soong rejects a duplicate module name and the build would fail." >&2
+			exit 1
+		fi
+	done
+
 	# Replace rather than merge, so a file deleted here does not linger in the checkout
 	# and keep taking part in the build. Idempotent: re-running restages the same content.
 	rm -rf "$DST"
@@ -123,7 +154,7 @@ rpi5)
 	# directory. See the DEVICE comment above for why rpi5 owns one.
 	[ -f "$DST/$DEVICE/BoardConfig.mk" ] || {
 		echo "ERROR: $DST/$DEVICE/BoardConfig.mk not staged." >&2; exit 1; }
-	echo ">> stage-aosp-device: board=rpi5 staged device/agl/xenvm-trout-rpi5 + device/agl/common (device $DEVICE)"
+	echo ">> stage-aosp-device: board=rpi5 staged device/agl/xenvm-trout-rpi5 + device/agl/common + device/agl/doma-common (device $DEVICE)"
 	;;
 *)
 	echo "ERROR: unknown board '$BOARD' (expected rpi5 or rpi4)." >&2

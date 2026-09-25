@@ -563,7 +563,7 @@ pip install git+https://github.com/xen-troops/moulin.git@83e80587c4b1348714237d3
 ```
 
 This project provides additional parameters; check them with `--help-config`. There is one
-yaml per board -- `rpi5-sodev.yaml` and `rpi4-sodev.yaml` -- and they take the same eight
+yaml per board -- `rpi5-sodev.yaml` and `rpi4-sodev.yaml` -- and they take the same nine
 parameters, differing only in the SKUs `--BOARD_RAM` accepts:
 
 ```
@@ -574,6 +574,7 @@ usage: moulin rpi5-sodev.yaml [--DOM0_OS {zephyr,linux}]
                               [--ENABLE_ANDROID {no,yes}]
                               [--ENABLE_DOMZ {no,yes}] [--GPU {gl,vulkan}]
                               [--ENABLE_DEVEL {no,yes}]
+                              [--ACCEPT_SYNAPTICS_KILLSWITCH {no,yes}]
 
 Config file description: Raspberry Pi 5 + Xen 4.22 — AGL SoDeV disaggregated
 cockpit (Zephyr or thin-Linux Dom0)
@@ -616,6 +617,11 @@ options:
                         and the diagnostic virglrenderer/Xen patches.
                         Diagnostics only -- never part of a shipping image.
                         (default: no)
+  --ACCEPT_SYNAPTICS_KILLSWITCH {no,yes}
+                        Accept linux-firmware-rpidistro's synaptics-killswitch
+                        licence flag, so the DomD image gets the BCM43455 Wi-
+                        Fi firmware. yaml default no; build.sh sets it with
+                        --accept-synaptics-killswitch. (default: no)
 ```
 
 Moulin will generate a `build.ninja` file; then run ninja to build and to

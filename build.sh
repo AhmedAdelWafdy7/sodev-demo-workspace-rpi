@@ -35,6 +35,7 @@ GPU="${GPU:-vulkan}"                               # --gpu=vulkan|gl : guest gra
                                                    #   Vulkan over virtio-gpu) for DomA and DomU on qemu 10.0.2-xt; gl = the
                                                    #   pre-Venus OpenGL stack on qemu 7.0.0-xt
 ENABLE_DEVEL="${ENABLE_DEVEL:-no}"                 # --devel      : add meta-rpi-sodev-devel to the DomD build (diagnostics; never ships)
+ACCEPT_SYNAPTICS_KILLSWITCH="${ACCEPT_SYNAPTICS_KILLSWITCH:-no}"  # --accept-synaptics-killswitch : accept linux-firmware-rpidistro's licence flag (DomD's Wi-Fi firmware; see README)
 NINJA_TARGET="${NINJA_TARGET-image-full}"          # --domains-only => "" (build domains, skip SD assembly)
 AAOS_SRC_DIR="${AAOS_SRC_DIR:-}"                    # --aaos-src=<dir>       (reuse an AOSP checkout, source mode)
 AAOS_MODE="${AAOS_MODE:-}"                          # --aaos=off|auto|source|prebuilt (empty: derived from -a — off, or auto when -a given)
@@ -134,6 +135,13 @@ Domain options:
                          gate (sodev-venus-gate.sh), the Vulkan reproducers, the VRAM/CMA
                          tools, and the diagnostic virglrenderer and Xen patches.
                          Diagnostics only -- never part of a shipping image.
+      --accept-synaptics-killswitch
+                         Accept the synaptics-killswitch licence flag of
+                         linux-firmware-rpidistro (meta-raspberrypi), the recipe
+                         that carries the BCM43455 Wi-Fi firmware. Not accepted
+                         by default: the DomD image is then built without Wi-Fi
+                         firmware and DomD has no wlan0. See README, "Wi-Fi
+                         firmware licence".
 
 DomA (AAOS) options:
       --aaos=<mode>      off | auto | source | prebuilt   (default: off; -a => auto)
@@ -251,6 +259,7 @@ while [ $# -gt 0 ]; do
     --gpu)              needval $# "$1"; GPU="$2"; shift ;;
     --gpu=*)            GPU="${1#*=}" ;;
     --devel)            ENABLE_DEVEL=yes ;;
+    --accept-synaptics-killswitch) ACCEPT_SYNAPTICS_KILLSWITCH=yes ;;
     --board)            needval $# "$1"; BOARD="$2"; shift ;;
     --board=*)          BOARD="${1#*=}" ;;
     -z|--domz)          ENABLE_DOMZ=yes ;;
@@ -314,6 +323,8 @@ case "$ENABLE_DOMZ" in no|yes) ;; *) echo "ERROR: ENABLE_DOMZ must be 'no' or 'y
 # GPU is not namespaced like the other knobs, so name the environment in the error.
 case "$GPU" in vulkan|gl) ;; *) echo "ERROR: --gpu must be 'vulkan' or 'gl' (got '$GPU'; from the GPU environment variable?)" >&2; exit 1 ;; esac
 case "$ENABLE_DEVEL" in no|yes) ;; *) echo "ERROR: ENABLE_DEVEL must be 'no' or 'yes' (got '$ENABLE_DEVEL'); use --devel" >&2; exit 1 ;; esac
+# ACCEPT_SYNAPTICS_KILLSWITCH reaches moulin verbatim as well.
+case "$ACCEPT_SYNAPTICS_KILLSWITCH" in no|yes) ;; *) echo "ERROR: ACCEPT_SYNAPTICS_KILLSWITCH must be 'no' or 'yes' (got '$ACCEPT_SYNAPTICS_KILLSWITCH'); use --accept-synaptics-killswitch" >&2; exit 1 ;; esac
 
 # --- Board selection (which product yaml) --------------------------------------
 # One yaml per board, named <board>-sodev.yaml. They are siblings, not variants of one
@@ -1762,7 +1773,7 @@ if [ "$AAOS_MODE" = prebuilt ]; then
   [ "$ENABLE_DOMZ" = yes ] && dom_targets="$dom_targets domz"
   NINJA_CMD="ninja $dom_targets"
   if [ "$NINJA_TARGET" = "image-full" ]; then
-    ROUGE_CMD="rouge '${MOULIN_YAML}' --DOM0_OS '${DOM0_OS}' --ENABLE_ANDROID yes --ENABLE_DOMU '${ENABLE_DOMU}' --ENABLE_DOMU_RESERVED '${ENABLE_DOMU_RESERVED}' --ENABLE_DOMZ '${ENABLE_DOMZ}' --BOARD_RAM '${BOARD_RAM}' --GPU '${GPU}' --ENABLE_DEVEL '${ENABLE_DEVEL}' -fi full -o full.img"
+    ROUGE_CMD="rouge '${MOULIN_YAML}' --DOM0_OS '${DOM0_OS}' --ENABLE_ANDROID yes --ENABLE_DOMU '${ENABLE_DOMU}' --ENABLE_DOMU_RESERVED '${ENABLE_DOMU_RESERVED}' --ENABLE_DOMZ '${ENABLE_DOMZ}' --BOARD_RAM '${BOARD_RAM}' --GPU '${GPU}' --ENABLE_DEVEL '${ENABLE_DEVEL}' --ACCEPT_SYNAPTICS_KILLSWITCH '${ACCEPT_SYNAPTICS_KILLSWITCH}' -fi full -o full.img"
   else
     ROUGE_CMD=":"
   fi
@@ -1951,7 +1962,7 @@ in_docker "$XT_DOCKER" "
   # ENABLE_ANDROID=yes run) would otherwise be reused, so a later --dom0/-a/-u
   # change would build against the wrong bblayers.conf.
   rm -rf yocto/build-dom*/conf
-  moulin '${MOULIN_YAML}' --DOM0_OS '${DOM0_OS}' --ENABLE_ANDROID '${ENABLE_ANDROID}' --ENABLE_DOMU '${ENABLE_DOMU}' --ENABLE_DOMU_RESERVED '${ENABLE_DOMU_RESERVED}' --ENABLE_DOMZ '${ENABLE_DOMZ}' --BOARD_RAM '${BOARD_RAM}' --GPU '${GPU}' --ENABLE_DEVEL '${ENABLE_DEVEL}'
+  moulin '${MOULIN_YAML}' --DOM0_OS '${DOM0_OS}' --ENABLE_ANDROID '${ENABLE_ANDROID}' --ENABLE_DOMU '${ENABLE_DOMU}' --ENABLE_DOMU_RESERVED '${ENABLE_DOMU_RESERVED}' --ENABLE_DOMZ '${ENABLE_DOMZ}' --BOARD_RAM '${BOARD_RAM}' --GPU '${GPU}' --ENABLE_DEVEL '${ENABLE_DEVEL}' --ACCEPT_SYNAPTICS_KILLSWITCH '${ACCEPT_SYNAPTICS_KILLSWITCH}'
   # Zephyr source cache (Yocto DL_DIR analogue): when XT_WEST_CACHE_DIR points at a
   # pre-populated west reference workspace, pull the manifest+projects from it so the
   # west fetches run offline (past a blocking proxy). 'west update' projects come via
@@ -2065,7 +2076,7 @@ in_docker "$XT_DOCKER" "
 "
 }
 
-echo ">> moulin BOARD=${BOARD} (${MOULIN_YAML}) DOM0_OS=${DOM0_OS} BOARD_RAM=${BOARD_RAM} ENABLE_ANDROID=${ENABLE_ANDROID} ENABLE_DOMU=${ENABLE_DOMU} ENABLE_DOMU_RESERVED=${ENABLE_DOMU_RESERVED} ENABLE_DOMZ=${ENABLE_DOMZ} GPU=${GPU} ENABLE_DEVEL=${ENABLE_DEVEL} AAOS_MODE=${AAOS_MODE} ninja='${AOSP_CMD:+$AOSP_CMD ; }${NINJA_CMD}'${rouge_note} in ${XT_DOCKER}"
+echo ">> moulin BOARD=${BOARD} (${MOULIN_YAML}) DOM0_OS=${DOM0_OS} BOARD_RAM=${BOARD_RAM} ENABLE_ANDROID=${ENABLE_ANDROID} ENABLE_DOMU=${ENABLE_DOMU} ENABLE_DOMU_RESERVED=${ENABLE_DOMU_RESERVED} ENABLE_DOMZ=${ENABLE_DOMZ} GPU=${GPU} ENABLE_DEVEL=${ENABLE_DEVEL} ACCEPT_SYNAPTICS_KILLSWITCH=${ACCEPT_SYNAPTICS_KILLSWITCH} AAOS_MODE=${AAOS_MODE} ninja='${AOSP_CMD:+$AOSP_CMD ; }${NINJA_CMD}'${rouge_note} in ${XT_DOCKER}"
 if [ -n "$AOSP_CMD" ]; then
   echo ">> [1/2] AOSP components (DomA source build) in ${XT_DOCKER}${XT_DOCKER_RUN_OPTS_AOSP:+, extra docker run opts: $XT_DOCKER_RUN_OPTS_AOSP}"
   STAGE_RUN_OPTS=( ${XT_DOCKER_RUN_OPTS_AOSP:-} )

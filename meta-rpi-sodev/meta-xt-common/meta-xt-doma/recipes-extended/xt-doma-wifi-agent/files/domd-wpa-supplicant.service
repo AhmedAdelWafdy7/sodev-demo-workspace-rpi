@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=wpa_supplicant on DomD's real radio (control-socket only; networks come from domd-wifi-agent)
+# WHY NOT poky's wpa_supplicant.service OR wpa_supplicant@.service.
+#   wpa_supplicant.service runs `wpa_supplicant -u` -- D-Bus mode with NO -i, so
+#   it never creates /run/wpa_supplicant/wlan0 and the agent waits forever.
+#   wpa_supplicant@.service would work but reads /etc/wpa_supplicant-wlan0.conf
+#   and both units ship SYSTEMD_AUTO_ENABLE = "disable" in
+#   poky/meta/recipes-connectivity/wpa-supplicant/wpa-supplicant_2.11.bb:129,
+#   so enabling one from here would mean an enable-only bbappend against poky.
+#   A unit owned by this recipe keeps the whole shadow-AP Wi-Fi path -- config,
+#   supplicant, agent -- in one place.
+After=network.target
+# Same reasoning as domd-wifi-agent.service: a start that fails before the
+# brcmfmac probe completes must not latch the unit permanently failed.
+StartLimitIntervalSec=0
+
+[Service]
+# wlan0 appears when brcmfmac finishes loading its firmware, which is well after
+# network.target on this board. Wait rather than race; Restart=always would
+# otherwise spin on "Could not read interface wlan0 flags: No such device". The
+# wait has no bound, so neither has the start: ExecStartPre counts against
+# TimeoutStartSec, and at the default 90 s a board with no radio would fail the
+# unit and restart it every 2 s for good.
+TimeoutStartSec=infinity
+ExecStartPre=/bin/sh -c 'while [ ! -e /sys/class/net/wlan0 ]; do sleep 0.5; done'
+ExecStart=/usr/sbin/wpa_supplicant -i wlan0 -c /etc/wpa_supplicant-wlan0.conf
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

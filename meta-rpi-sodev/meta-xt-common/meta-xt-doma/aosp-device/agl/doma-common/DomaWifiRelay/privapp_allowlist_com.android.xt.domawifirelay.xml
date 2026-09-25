@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0
+
+     Privileged permission allowlist for DomaWifiRelay.
+
+     WHY THIS FILE IS REQUIRED.
+     READ_WIFI_CREDENTIAL is signature|privileged, not signature:
+
+         frameworks/base/core/res/AndroidManifest.xml
+           2402  <permission android:name="android.permission.READ_WIFI_CREDENTIAL"
+           2403      android:protectionLevel="signature|privileged" />
+
+     Once a permission carries the privileged flag, the allowlist check becomes an AND
+     gate placed IN FRONT of the signature grant, so holding the platform key is not
+     enough:
+
+         AppIdPermissionPolicy.kt
+           1143  val mayGrantByPrivileged =
+           1144      !permission.isPrivileged ||
+           1145          requestingPackageStates.anyIndexed { _, it ->
+           1146              checkPrivilegedPermissionAllowlistIfNeeded(it, permission)
+           1147          }
+           ...
+           1157  if (
+           1158      mayGrantByPrivileged &&
+           1159          (shouldGrantBySignature || shouldGrantByProtectionFlags)
+
+     and with ro.control_privapp_permissions=enforce (vendor/build.prop) a package that
+     is system AND privileged and is not listed here makes that helper return false
+     (:1613), which lands the package in privilegedPermissionAllowlistViolations and
+     makes onSystemReady() throw:
+
+           1922  if (!privilegedPermissionAllowlistViolations.isEmpty()) {
+           1923      throw IllegalStateException(
+
+     That is a system_server crash at every boot. AOSP documents the consequence
+     plainly: "In Android 9 and higher, privileged permissions must be allowlisted or
+     the device can't boot."
+     https://source.android.com/docs/core/permissions/perms-allowlist
+
+     The counter-example that settles it is in this same image: com.android.systemui is
+     built with certificate: "platform" (frameworks/base/packages/SystemUI/Android.bp)
+     and STILL carries an allowlist entry for this exact permission, in
+     system_ext/etc/permissions/com.android.systemui.xml. Platform signing does not
+     exempt a privileged app from the privileged allowlist.
+
+     NETWORK_SETTINGS IS DELIBERATELY ABSENT. It is signature only
+     (AndroidManifest.xml:2489-2490), so it is granted by the platform key and needs no
+     entry. Listing a non-privileged permission here is not harmless: it is what
+     CtsPrivappPermissionsTest reports as an error.
+
+     HOW THIS FILE IS INSTALLED. Android.bp sets privapp_allowlist, and soong installs
+     it with android.PathForModuleInstall(ctx, "etc", "permissions") using
+     installApkName + ".xml" (build/soong/java/app.go:1230-1234). Because the module is
+     system_ext_specific, that resolves to
+     /system_ext/etc/permissions/DomaWifiRelay.xml. Note that the file name is the
+     MODULE name, not the package name. SystemConfig reads every xml in the directory,
+     so only the package attribute below has to match.
+
+     NOTE for whoever edits this file: an XML comment may not contain two
+     consecutive hyphens, and a comment that does fails the build.
+-->
+<permissions>
+    <privapp-permissions package="com.android.xt.domawifirelay">
+        <permission name="android.permission.READ_WIFI_CREDENTIAL"/>
+    </privapp-permissions>
+</permissions>

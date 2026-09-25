@@ -85,11 +85,11 @@
 # Trout sets the property because trout wants eth0 for its own virtwifi
 # (DEVICE_VIRTWIFI_PORT := eth0, two lines above it). Overriding that is
 # deliberate here, for two reasons measured on this board:
-#   - trout's virtwifi does not actually produce a wlan0 on this product. Its
-#     setup service is a oneshot that runs `cmd wifi set-wifi-enabled` /
-#     `connect-network VirtWifi`, and cuttlefish's setup_wifi, which is what
-#     creates the interface, is gated on ro.boot.wifi_impl=virt_wifi -- empty
-#     here. There is no wlan0 to protect.
+#   - trout's virtwifi does not produce a wlan0 on this product. Its setup
+#     service only runs `cmd wifi set-wifi-enabled` / `connect-network VirtWifi`
+#     (the product installs an empty virtwifi.rc over it), and cuttlefish's
+#     setup_wifi, which is what creates the interface, is gated on
+#     ro.boot.wifi_impl=virt_wifi -- empty here. There is no wlan0 to protect.
 #   - doma.cfg gives DomA two vifs on the same bridge, so eth0 and eth1 were both
 #     taking a lease out of 192.168.10.0/24 (.14 and .13) and
 #     ConnectivityService carried two ETHERNET networks, one of which never

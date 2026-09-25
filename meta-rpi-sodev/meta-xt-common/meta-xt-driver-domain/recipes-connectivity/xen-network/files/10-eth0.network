@@ -7,4 +7,6 @@ Name=eth0
 # after xendriverdomain and gated on its own wait-for-vif-emu loop) moves this
 # address onto xenbr0 and enslaves eth0 only once the guest vifs exist.
 Address=192.168.10.11/24
-Gateway=192.168.10.10
+# No Gateway here: domd-flatbridge-up enslaves eth0 into xenbr0, and networkd
+# applied a Gateway= on eth0 as a metric-0 default that beat the wlan0 uplink
+# (measured on the board).

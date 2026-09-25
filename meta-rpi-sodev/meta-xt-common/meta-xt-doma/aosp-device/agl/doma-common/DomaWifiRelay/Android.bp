@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// DomaWifiRelay -- closes the last gap in the shadow-AP Wi-Fi path: it is the only
+// component that can learn the passphrase the user typed on the AAOS Wi-Fi screen.
+//
+// WHY AN APP AT ALL. The shadow AP on wlan2 validates the typed password locally, and
+// it cannot recover that password from the 4-way handshake -- only a MIC crosses the
+// air. The framework is the only place the plaintext exists after the user types it,
+// and WifiManager.getPrivilegedConfiguredNetworks() is the only sanctioned way to read
+// it (WifiServiceImpl:3978 -> getConfiguredNetworksWithPasswords()). That API is
+// @SystemApi and permission-gated, so the reader has to be a platform app.
+//
+// WHY platform_apis AND NOT sdk_version: "system_current".
+//
+// Not the API surface: every member this app uses is @SystemApi (the
+// NetworkSelectionStatus class of WifiConfiguration and SystemProperties.get()
+// and getBoolean()), and both sources compile against
+// android_system_stubs_current.jar with 0 errors (measured on the PC). The
+// reason is the one recorded below next to system_ext_specific: soong refuses
+// platform_apis on a vendor/product module, this app is device-specific and
+// built in-tree with the platform, and pinning an API surface buys nothing
+// here.
+//
+// WHY certificate: "platform" + privileged, AND WHY THAT IS NOT SUFFICIENT ON ITS OWN.
+// NETWORK_SETTINGS is signature-level, so the platform key grants it, but
+// READ_WIFI_CREDENTIAL is signature|privileged, and an unlisted privileged
+// package keeps this image from booting. Measured:
+//
+//     NETWORK_SETTINGS       signature             frameworks/base/core/res/
+//     READ_WIFI_CREDENTIAL   signature|privileged      AndroidManifest.xml:2489, :2402
+//
+// The privileged flag turns the allowlist check into an AND gate placed in FRONT of the
+// signature grant (AppIdPermissionPolicy.kt:1143-1159), so the platform key does not
+// get past it; with ro.control_privapp_permissions=enforce an unlisted package throws
+// out of onSystemReady() (:1613, :1922). The proof that signing is irrelevant here is
+// in the same image: com.android.systemui is certificate: "platform" and still carries
+// an allowlist entry for READ_WIFI_CREDENTIAL, in
+// system_ext/etc/permissions/com.android.systemui.xml.
+//
+// Hence privapp_allowlist below. See that file for the full derivation.
+//
+// WHY NO NEARBY_WIFI_DEVICES / ACCESS_FINE_LOCATION RUNTIME GRANT. Both permission
+// paths inside getPrivilegedConfiguredNetworks short-circuit for a NETWORK_SETTINGS
+// holder -- measured: WifiPermissionsUtil.enforceCanAccessScanResults() returns
+// immediately when checkNetworkSettingsPermission(uid) is true, and so does
+// enforceNearbyDevicesPermission(). A headless app cannot show a grant dialog, so this
+// is what makes the app possible without default-grant plumbing.
+android_app {
+    name: "DomaWifiRelay",
+    srcs: ["src/**/*.java"],
+    platform_apis: true,
+    certificate: "platform",
+    privileged: true,
+    // Required, not optional: READ_WIFI_CREDENTIAL is signature|privileged. Installed
+    // to /system_ext/etc/permissions/DomaWifiRelay.xml -- soong names the installed
+    // file after the MODULE, and PathForModuleInstall follows system_ext_specific
+    // (build/soong/java/app.go:1230-1234). Needs privileged: true above
+    // (app.go:396-400).
+    privapp_allowlist: "privapp_allowlist_com.android.xt.domawifirelay.xml",
+    // Installs to /system_ext/priv-app, NOT /vendor/priv-app.
+    //
+    // MEASURED: soong refuses `platform_apis: true` on a vendor- or product-partition
+    // module -- "sdk_version must have a value when the module is located at vendor or
+    // product".
+    //
+    // system_ext is also the correct Treble placement independently of that: this app
+    // holds signature permissions, runs as android.uid.system and only talks to the
+    // framework, so it is coredomain -- and a coredomain app does not belong on the
+    // vendor partition. The vendor half of the relay is the shell daemon
+    // (/vendor/bin/doma-wifi-relay); the two communicate through a file in
+    // /data/vendor/wifi/shadow/req, not across a partition-crossing interface.
+    system_ext_specific: true,
+    optimize: {
+        enabled: false,
+    },
+}

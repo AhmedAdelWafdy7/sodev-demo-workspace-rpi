@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=DomA shadow-AP Wi-Fi agent (DomD side: publishes real scan results, performs the real association)
+# Without this, a start that fails before wpa_supplicant exists (early boot, or a board
+# with no Wi-Fi) latches the unit permanently failed and it never comes back. Same
+# reasoning as gnss_replay.service and cluster-service.service in this layer.
+StartLimitIntervalSec=0
+
+[Service]
+# Both endpoints are created by someone else and this agent is the client of
+# each, so wait rather than race: qemu creates the virtio-serial socket when
+# DomA starts, and wpa_supplicant creates its control socket when it comes up.
+# The wait has no bound on purpose -- there is no useful work to do before both
+# exist -- so the start must not time out either: ExecStartPre counts against
+# TimeoutStartSec, and at the default 90 s a board with no radio, or a boot with
+# no DomA, would fail the unit and have Restart=always retry it every 2 s for
+# good.
+TimeoutStartSec=infinity
+ExecStartPre=/bin/sh -c 'while [ ! -e /run/android_vm_virtconsole5 ]; do sleep 0.5; done'
+ExecStartPre=/bin/sh -c 'while [ ! -e /run/wpa_supplicant/wlan0 ]; do sleep 0.5; done'
+ExecStart=/usr/bin/python3 /usr/bin/domd_wifi_agent.py \
+    --socket /run/android_vm_virtconsole5 \
+    --ctrl /run/wpa_supplicant/wlan0 \
+    --iface wlan0 \
+    --top 8
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

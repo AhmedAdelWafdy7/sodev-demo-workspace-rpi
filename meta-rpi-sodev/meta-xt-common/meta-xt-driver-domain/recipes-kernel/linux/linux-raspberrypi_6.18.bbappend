@@ -115,10 +115,11 @@ SRC_URI:append = " \
 # source tree and names added to the deploy list, not patches — so scoping them
 # leaves the expanded values for raspberrypi5 unchanged.
 #
-# What a board without these needs to be true instead: no SCMI (BCM2711 has no SCMI
-# firmware interface at all; clocks and power come from the VideoCore mailbox) and no
-# WiFi passthrough (on Raspberry Pi 4 the SDIO WiFi shares GIC SPI 126 with the SD
-# controller, so it cannot be handed to a different domain than the SD card).
+# What a board without these needs to be true instead: no SCMI (BCM2711 has no
+# SCMI firmware interface at all; clocks and power come from the VideoCore
+# mailbox) and no Wi-Fi overlay (on Raspberry Pi 4 the SDIO Wi-Fi shares GIC SPI
+# 126 with the SD controller, so it can only go to the domain that owns the SD
+# card).
 RPI_KERNEL_DEVICETREE:append:raspberrypi5 = " \
     broadcom/${SCMI_XEN_DT_NAME}.dtbo \
     broadcom/${SCMI_DOMD_DT_NAME}.dtbo \

@@ -140,7 +140,7 @@ disables the heavy Android/Flatcar guests by default).
 | Flag (env var) | Default | Effect |
 |---|---|---|
 | `--board=<board>` (`BOARD`) | **rpi5** | Which board to build: `rpi5` or `rpi4`. Selects `<board>-sodev.yaml`, and with it the SoC, MACHINE, Zephyr Dom0 board, passthrough set, physical memory map and board layer (`meta-xt-rpi5` or `meta-xt-rpi4` — never both). Raspberry Pi 5 is the reference platform; see *meta-xt-rpi4/README.md* for what the Raspberry Pi 4 configuration is verified against |
-| `--dom0=<os>` (`DOM0_OS`) | **zephyr** | Selects the entire Dom0 component body: Zephyr xenstore-only Dom0 (disaggregated; DomD owns the toolstack) or the thin Linux control Dom0 (classic; Dom0 owns xl). Both flavours are HW-verified on a real RPi5, at both `--ram` values; the Zephyr flavour is the shipping default. See the verification note in *Boot process* (`docs/DESIGN.md`). |
+| `--dom0=<os>` (`DOM0_OS`) | **zephyr** | Selects the entire Dom0 component body: Zephyr xenstore-only Dom0 (disaggregated; DomD owns the toolstack) or the thin Linux control Dom0 (classic; Dom0 owns xl). The Zephyr flavour is the shipping default. On the RPi5 the linux flavour gives DomD no Wi-Fi: its pins need muxing over SCMI, which only the Zephyr flavour sets up. On the RPi4 the linux flavour gives DomD no Wi-Fi either: the Wi-Fi SDIO controller shares GIC SPI 126 with the SD card controller, which that flavour's Dom0 keeps, so it stays with Dom0 as well. What has been run on hardware, and with which flavour, is in *Build & hardware verification (RPi5)* below. |
 | `--ram=<sku>` (`BOARD_RAM`) | **16g** (rpi5) / **8g** (rpi4) | Board SKU; the valid values and the default depend on `--board`. **rpi5: `16g`\|`8g`.** `16g` = the full 4-domain map (Dom0 512 + DomD 4096 + DomU 1024 + DomA 4096 = 9728 MiB). `8g` takes **DomD to 3072 MiB** (static-mem bank4 at `0x180000000` dropped) **and DomA to 3072 MiB**; Dom0/DomU keep their sizes, so the four total 7680 MiB and fit an 8 GB board. Splitting the reduction is measured, not a preference — see *Board RAM size* (`docs/DESIGN.md`). **rpi4: `8g`\|`4g`.** `8g` = Dom0 128 (zephyr, the default) or 256 (linux) + DomD 1920 + DomU 1024 + DomA 2560; `4g` drops bank2 and shrinks DomD (the per-lane DomD and DomA sizes are in *meta-xt-rpi4/README.md*), and DomA and DomU can no longer RUN at the same time — each fits alone, and `build.sh` says so |
 | `-u`, `--domu` (`ENABLE_DOMU`) | **off** | Adds the AGL instrument-cluster DomU: Xen-aware kernel `linux-virtio-armv8` (p1) + AGL rootfs (p3). V4H-aligned minimal domu layer set (kernel via moulin; AGL rootfs via `build.sh`'s AGL bitbake) |
 | `-a`, `--android` (`ENABLE_ANDROID`) | **off** | Include DomA (AAOS, p4 nested GPT). Alias for `--aaos=auto` — the mode chooses how DomA is produced |
@@ -148,6 +148,7 @@ disables the heavy Android/Flatcar guests by default).
 | `--domains-only` (`NINJA_TARGET=""`) | off | Build the domains but skip SD-image assembly |
 | `--gpu=<stack>` (`GPU`) | **vulkan** | Which graphics stack the guests get. **`vulkan`** (default): DomA and DomU render with Vulkan through Venus — device model qemu 10.0.2-xt, virglrenderer's venus backend plus `render-server`/`minigbm_allocation`, `hostmem=256M,blob=true,venus=true` on the guests' `virtio-gpu-gl`, the Vulkan runtime in the DomD and DomU rootfs, DomA compositing with SkiaVk and the DomU cluster on the Vulkan (Impeller) embedder. On the rpi4 4g SKU it also moves memory from DomA to DomD (sizes in *meta-xt-rpi4/README.md*), because a host-visible blob window is unreclaimable device-model memory. **`gl`**: the pre-Venus OpenGL stack — qemu 7.0.0-xt with its six device-model patches, no venus backend, no blob window, the pre-Venus memory split (rpi4 4g SKU only). Two things it does **not** revert: DomD's mesa is 26.2.2 in both lanes (the pin is a v3dv fix both lanes use), and DomA's AOSP-side settings (the Venus ICD and SkiaVk compositing), which this tree applies whatever `--gpu` says, so a pre-Venus DomA needs them reverted. [`docs/VULKAN-VENUS.md`](docs/VULKAN-VENUS.md) has the authoritative per-lane table |
 | `--devel` (`ENABLE_DEVEL`) | **off** | Add `meta-rpi-sodev-devel` to the DomD build: the Venus phase 0–3 gate (`sodev-venus-gate.sh`), the three Vulkan reproducers, the VRAM/CMA tools, and the **diagnostic** virglrenderer and Xen patches (command-stream dump with a live sanity assert, a log line per guest allocation ≥ 64 MiB, and Xen's injected-abort paths made loud on a release hypervisor). Diagnostics only — never part of a shipping image |
+| `--accept-synaptics-killswitch` (`ACCEPT_SYNAPTICS_KILLSWITCH`) | **off** | Accept the `synaptics-killswitch` licence flag of `linux-firmware-rpidistro`, the recipe that carries the BCM43455 Wi-Fi firmware. Off, the DomD image is built without Wi-Fi firmware and DomD has no `wlan0`. See *Wi-Fi firmware licence* below |
 | `--aaos=<mode>` (`AAOS_MODE`) | off (`-a`⇒auto) | `off` \| `auto` \| `source` \| `prebuilt`. **auto** = prebuilt if a bundle is found (default probe `<workspace>/aaos-prebuilt-<board>`, then `<workspace>/aaos-prebuilt`), else source if an AOSP checkout is found, else off (or a hard error when DomA was required via `-a`) |
 | `--aaos-prebuilt=<dir>` (`AAOS_PREBUILT_DIR`) | `<ws>/aaos-prebuilt-<board>`, then `<ws>/aaos-prebuilt` | Prebuilt AAOS bundle (`files/` + `images/` + `BUNDLE-INFO`, plus an optional `MANIFEST.md5`); consumed by `prebuilt`/`auto`. **Skips the AOSP source build entirely.** See *AAOS build modes* |
 | (`AAOS_PREBUILT_ASSUME_BOARD`) | — | Accept a prebuilt bundle that has **no** `BUNDLE-INFO`, asserting -- unverified -- that it was built by this tree for this `--board`. A bundle without `BUNDLE-INFO` is otherwise refused; add the file instead (`board=`, `device=`, `android=`, `guest_kernel=`) |
@@ -175,6 +176,25 @@ DomU / DomA gating follows the V4H `prod-devel-rcar4_new.yaml` idiom: the
 its recipes via `BBMASK` (`XT_DOMA_BBMASK`), so a guest-less build never parses
 the AAOS-prebuilt SRC_URI and never references an unbuildable provider. See the
 in-file comments of `rpi5-sodev.yaml` (the authoritative documentation).
+
+### Wi-Fi firmware licence
+
+The BCM43455 Wi-Fi firmware comes from meta-raspberrypi's
+`linux-firmware-rpidistro`, and that recipe declares
+`LICENSE_FLAGS = "synaptics-killswitch"`: it also carries firmware under the
+Synaptics licence, one clause of which can, at least in theory, be used as a
+kill switch (meta-raspberrypi's `docs/ipcompliance.md` explains it and links the
+upstream report). As in meta-raspberrypi, nothing here accepts the flag for you:
+bitbake builds the recipe only once the build accepts it, and the DomD image
+installs the firmware only then.
+
+Accept it with `--accept-synaptics-killswitch` (or
+`ACCEPT_SYNAPTICS_KILLSWITCH=yes`), which adds `LICENSE_FLAGS_ACCEPTED:append =
+" synaptics-killswitch"` to the `conf/moulin.conf` that moulin writes for DomD
+(DomD's `local.conf` requires it). Editing either file by hand does not last:
+`build.sh` regenerates DomD's `conf/` on every run. Without the flag the image
+still builds, but DomD has no Wi-Fi firmware and no `wlan0`, so DomA's shadow-AP
+Wi-Fi has nothing to relay.
 
 ## Build — details & options
 The *Quick start* above is the happy path (`./build.sh` → `full.img`); *Build
@@ -372,7 +392,9 @@ the AGL cluster renders on HDMI-A-1 and the shipping **`--aaos=prebuilt` AAOS**
 renders on HDMI-A-2 (all guest modules load, SurfaceFlinger up) — the guest
 kernel and the `super.img` vendor_dlkm modules must come from one coherent build
 (same `module_layout` ABI; see *How the DomA artifacts are produced* (`docs/BUILD.md`)). The **thin Linux-Dom0** flavour
-has since been booted end to end on both boards on this tree (P2 and P3 below).
+has been booted end to end on both boards, in the Xen 4.22 run of 2026-08-18
+described below. That run does not cover DomD's Wi-Fi, which the linux flavour
+does not give DomD on the RPi5.
 The Zephyr full-image HW checklist. **[4.22] The list below was first measured on Xen
 4.21.** On **Xen 4.22** the four verification patterns of this tree were run on hardware
 on 2026-08-18 and all passed -- RPi4 and RPi5 x Zephyr-Dom0 and thin-Linux-Dom0 -- with

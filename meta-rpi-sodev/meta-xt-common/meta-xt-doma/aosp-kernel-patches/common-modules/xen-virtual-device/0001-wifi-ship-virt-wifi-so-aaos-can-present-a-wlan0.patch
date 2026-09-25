@@ -1,0 +1,65 @@
+From 8e5c88685be0a192288acb0b6436668b505996f7 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 26 Aug 2026 07:55:27 +0900
+Subject: [PATCH] xen-virtual-device: ship virt_wifi so AAOS can present a
+ wlan0
+
+virt_wifi.ko, cfg80211.ko and rfkill.ko were built but left in
+_IMPLICIT_MODULES, so they never reached the guest image. AAOS's WifiService
+needs a real wlan0 interface before the Settings UI will let anything be
+operated, and virt_wifi is how cuttlefish supplies one on top of an ethernet
+link. Move the three to _VIRT_COMMON_MODULES.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [yhamamachi/android_kernel_xen-virtual-device]
+---
+ BUILD.bazel | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/BUILD.bazel b/BUILD.bazel
+index e00d334..4e401c1 100644
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -59,14 +59,17 @@ filegroup(
+ # In-tree modules explicitly copied to the distribution directory.
+ # Keep this list sorted by module basename.
+ _VIRT_COMMON_MODULES = [
++    "cfg80211.ko",
+     "failover.ko",
+     "net_failover.ko",
++    "rfkill.ko",
+     "rpmsg_ns.ko",
+     "snd-aloop.ko",
+     "system_heap.ko",
+     "usbip-core.ko",
+     "v4l2-tpg.ko",
+     "vhci-hcd.ko",
++    "virt_wifi.ko",
+     "virtio-gpu.ko",
+     "virtio-rng.ko",
+     "virtio_balloon.ko",
+@@ -132,7 +135,6 @@ _IMPLICIT_MODULES = [
+     "cdc_eem.ko",
+     "cdc_ether.ko",
+     "cdc_ncm.ko",
+-    "cfg80211.ko",
+     "clk-gate_test.ko",
+     "clk-test.ko",
+     "clk_kunit_helpers.ko",
+@@ -202,7 +204,6 @@ _IMPLICIT_MODULES = [
+     "regmap-ram.ko",
+     "regmap-raw-ram.ko",
+     "rfcomm.ko",
+-    "rfkill.ko",
+     "rtc-test.ko",
+     "rtl8150.ko",
+     "rust_binder.ko",
+@@ -218,7 +219,6 @@ _IMPLICIT_MODULES = [
+     "usbserial.ko",
+     "vcan.ko",
+     "vcpu_stall_detector.ko",
+-    "virt_wifi.ko",
+     "virtual-cpufreq.ko",
+     "wwan.ko",
+     "xen-pciback.ko",

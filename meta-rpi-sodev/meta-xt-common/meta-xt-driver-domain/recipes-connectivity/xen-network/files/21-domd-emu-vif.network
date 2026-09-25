@@ -1,0 +1,35 @@
+# Bridge the qemu device-model taps (DomA/DomU virtio-net backends) into xenbr0.
+#
+# WHY THIS FILE EXISTS
+# qemu is started with `-netdev type=tap,...,br=xenbr0,script=no,downscript=no`. With
+# script=no qemu only OPENS the tap -- it never attaches it to a bridge; `br=` is read
+# only by the default helper script, which is disabled. So nothing in qemu bridges these
+# interfaces.
+#
+# domd-flatbridge-up does enslave them, but only when IT runs. It is a Type=oneshot unit
+# that completes at boot, so a DomA destroyed and recreated later (xl destroy +
+# systemctl restart xl-create-doma) gets BRAND NEW taps that no one enslaves, and the
+# guest loses its network entirely with no error anywhere. Measured on RPi4 2026-08-26:
+# after a DomA recreate, `ip link show master xenbr0` listed only eth0, DomA could not
+# reach DomD at all, and `ping -I eth1 192.168.10.10` from the guest gave "+2 errors".
+#
+# networkd handles the recreate case for free, because it acts on every device
+# that appears. xl-create-doma.service also re-runs domd-flatbridge-up; the two
+# overlap deliberately -- both converge on the same state and both are
+# idempotent.
+#
+# WHY Name= AND NOT Driver=
+# 20-domd-vif.network matches `Driver=vif xen-netfront`, and the emulated taps are
+# neither: they are plain `tun` devices. Adding `tun` to that file would be wrong twice
+# over -- it carries `Address=192.168.0.11/24` for the Dom0 link, which must not land on
+# a qemu tap, and `Driver=tun` would also catch any unrelated tun device. Matching the
+# names qemu is configured to create (vif-emu, vif-emu1, vif-emu2 -- see doma.cfg and
+# domu.cfg) says exactly what is meant.
+#
+# NOTE: no Address= and no DHCP here on purpose. A bridge port must stay addressless;
+# xenbr0 carries the address (assigned late by domd-flatbridge-up).
+[Match]
+Name=vif-emu*
+
+[Network]
+Bridge=xenbr0

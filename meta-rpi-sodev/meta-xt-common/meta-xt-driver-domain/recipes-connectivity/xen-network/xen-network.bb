@@ -14,6 +14,8 @@ LIC_FILES_CHKSUM = "file://${COREBASE}/meta/COPYING.MIT;md5=3da9cfbcb788c80a0384
 #                              the static 10-eth0.network below always applies.
 #   - 10-eth0.network       : RP1 eth0 static .10.11 (boot-time; NOT bridged).
 #   - 20-domd-vif.network    : Dom0-link xen-netfront static .0.11 (NOT bridged).
+#   - 21-domd-emu-vif.network : qemu device-model taps (vif-emu*) -> xenbr0, so a
+#                              DomA/DomU recreated after boot gets bridged too.
 #   - 50-xenbr0.network      : xenbr0 up, addressless (flatbridge assigns .10.10
 #                              late; .0.1 here would shadow Dom0's vif .0.1).
 #   - bridge.conf            : modules-load bridge.ko (CONFIG_BRIDGE=m).
@@ -31,8 +33,10 @@ SRC_URI = " \
     file://xenbr0.netdev \
     file://10-eth0.network \
     file://20-domd-vif.network \
+    file://21-domd-emu-vif.network \
     file://50-xenbr0.network \
     file://bridge.conf \
+    file://domd-nat.conf \
     file://xenbr0-systemd-networkd.conf \
     file://systemd-networkd-wait-online.conf \
     file://domd-sshd-fix.service \
@@ -64,7 +68,9 @@ FILES:${PN}-flatbridge = " \
     ${sysconfdir}/systemd/network/00-rp1-eth0.link \
     ${sysconfdir}/systemd/network/10-eth0.network \
     ${sysconfdir}/systemd/network/20-domd-vif.network \
+    ${sysconfdir}/systemd/network/21-domd-emu-vif.network \
     ${sysconfdir}/modules-load.d/bridge.conf \
+    ${sysconfdir}/modules-load.d/domd-nat.conf \
     ${systemd_system_unitdir}/domd-sshd-fix.service \
     ${systemd_system_unitdir}/domd-flatbridge.service \
     ${bindir}/domd-flatbridge-up \
@@ -86,12 +92,16 @@ RDEPENDS:${PN} = " \
     xen-tools-xenstore \
 "
 
-# DomD-only runtime deps: dnsmasq (DomA eth1 DHCP lease on the flat bridge) and
-# haveged (entropy for the first-boot ssh-keygen in domd-sshd-fix).
+# DomD-only runtime deps: dnsmasq (DomA eth1 DHCP lease on the flat bridge),
+# haveged (entropy for the first-boot ssh-keygen in domd-sshd-fix) and iptables
+# (the source NAT domd-flatbridge-up installs so guests can reach the internet
+# through DomD's Wi-Fi -- without it the script logs a warning and the guests
+# have no route out).
 RDEPENDS:${PN}-flatbridge = " \
     ${PN} \
     dnsmasq \
     haveged \
+    iptables \
 "
 
 # Guest reachability on the flat L2 bridge is handled by the dnsmasq bbappend
@@ -120,6 +130,10 @@ do_install() {
     # create xenbr0.
     install -d ${D}${sysconfdir}/modules-load.d
     install -m 0644 ${S}/bridge.conf ${D}${sysconfdir}/modules-load.d/bridge.conf
+    # The legacy nat table's modules. Without them a boot can reach
+    # domd-flatbridge-up's MASQUERADE add with no nat table available, and DomA
+    # has no internet. See the header of domd-nat.conf.
+    install -m 0644 ${S}/domd-nat.conf ${D}${sysconfdir}/modules-load.d/domd-nat.conf
 
     # sshd fix + late flat-bridge services (formerly the DomD
     # image install_domd_network/flatbridge postprocess).

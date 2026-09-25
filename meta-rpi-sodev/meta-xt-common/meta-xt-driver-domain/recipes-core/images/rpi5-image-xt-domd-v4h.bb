@@ -34,7 +34,8 @@ IMAGE_INSTALL:append = " \
 
 # xt-rpi5-domain (boot-time vCPU pinning) already comes from the vc4 base above.
 
-# Exclude license-restricted packages (RPi5 Wi-Fi firmware not needed).
+# Exclude the licence-restricted Wi-Fi firmware packages. A board whose radio
+# needs one of them takes it back out of both lists in its bbappend.
 BAD_RECOMMENDATIONS += "linux-firmware-rpidistro-bcm43455 linux-firmware-rpidistro-bcm43456 linux-firmware-rpidistro-bcm43430"
 PACKAGE_EXCLUDE += "linux-firmware-rpidistro-bcm43455 linux-firmware-rpidistro-bcm43456 linux-firmware-rpidistro-bcm43430"
 
