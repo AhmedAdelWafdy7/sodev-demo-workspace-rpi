@@ -25,8 +25,11 @@ HOW IT WORKS
    but do not fail: prose is expected to diverge.
 3. FUNCTIONAL differences -- anything that is not a comment or blank -- are compared
    against a recorded baseline of the differences that are there by design (the memory
-   map, the layer list, the SKU parameter, the absent SCMI wiring, ...). Anything not in
+   map, the layer list, the SKU parameter, the Pi 5's SCMI wiring, ...). Anything not in
    the baseline fails.
+4. A short list of REQUIRED lines is checked per file, because a comparison between the
+   two yamls cannot see a line that is missing from BOTH: absent everywhere normalises
+   to "identical". See REQUIRED below for what that hides and why it matters.
 
 The SKUs are deliberately NOT normalised. 16g/8g and 8g/4g overlap on "8g", so mapping
 them would make genuinely different budgets compare equal -- exactly the class of bug
@@ -50,14 +53,12 @@ BASELINE = os.path.join(ROOT, "tools", "yaml-drift-baseline.txt")
 # Applied in order, longest/most specific first: raspberrypi4-64 has to be rewritten
 # before a bare raspberrypi4 would match part of it.
 NORMALISE = [
-    # Both boards now name their own AOSP product: rpi4 needs one for its CPU
-    # variant, rpi5 for the vendor init.rc that minradio's data call depends on. So
-    # the product NAME normalises rpi4 -> rpi5 like any other board token.
-    #
-    # The DEVICE deliberately does NOT normalise. rpi5's product keeps the upstream
-    # xenvm_trout_arm64 device while rpi4 needs a device of its own, and that is a
-    # real asymmetry rather than a board-token spelling: rewriting it here would hide
-    # it, so it is left to show up as drift and is recorded in the baseline instead.
+    # Both boards name their own AOSP product and device: rpi4 for its CPU variant,
+    # rpi5 for a BoardConfig.mk of its own. So the product NAME normalises rpi4 ->
+    # rpi5 by the rule below, and the DEVICE name by the generic "rpi4" rule further
+    # down. A board that went back to the upstream xenvm_trout_arm64 device would show
+    # up as drift, which is the point: that is a real asymmetry, not a board-token
+    # spelling.
     ("aosp_xenvm_trout_rpi4_arm64", "aosp_xenvm_trout_rpi5_arm64"),
     # No rule for the staged device DIRECTORY name: the Pi 4's device is a repo
     # project now (device/sodev/xenvm-cf, from the AOSP manifest), so only the Pi 5
@@ -103,6 +104,53 @@ def diff_lines(a_text, b_text):
         if line[:1] in "+-":
             out.append(line)
     return out
+
+
+# Lines that must be PRESENT in a given file, which a diff between the two files
+# cannot express.
+#
+# WHY THIS SECTION EXISTS. Steps 1-3 only compare the two yamls with each other, so a
+# line missing from BOTH of them is indistinguishable from agreement -- the check stays
+# green while the feature is gone from the product. The SCMI wiring below is exactly
+# that shape: the Pi 4 has no SCMI at all, so "no scmi in either file" reads as a match.
+#
+# And the consequence is not cosmetic. On the Pi 5, DomD muxes the Wi-Fi SDIO
+# and BT-UART pins by asking TF-A over SCMI to program the pin controller
+# (pinctrl@7d504100). With the MACHINE_FEATURE unset, neither the armstub's SCMI
+# server nor the kernel's SCMI pinctrl is built (Xen 4.22 builds its SCMI_SMC
+# mediator either way), and the board has neither Wi-Fi nor Bluetooth. The host
+# overlay that publishes the server has to be both a domd target_image and a p1
+# boot item as well, hence four entries rather than one.
+#
+# Add to this list only for the same reason: a line whose ABSENCE is invisible to a
+# two-file diff and expensive at run time.
+REQUIRED = [
+    (YAML_A, r'^\s*- \[MACHINE_FEATURES:append, " scmi"\]',
+     "the scmi MACHINE_FEATURE, without which TF-A's SCMI server and the "
+     "kernel's SCMI pinctrl are not built and this board has no way to mux "
+     "its Wi-Fi/Bluetooth pins"),
+    (YAML_A, r'^\s*XT_SCMI_HOST_DTBO_NAME:',
+     "the name of the host overlay that publishes the TF-A SCMI server to Xen"),
+    (YAML_A, r'^\s*- "tmp/deploy/images/%\{MACHINE\}/'
+             r'%\{XT_SCMI_HOST_DTBO_NAME\}"',
+     "that overlay as a domd target_image, so that the DomD build deploys it"),
+    (YAML_A, r'^\s*"%\{XT_SCMI_HOST_DTBO_NAME\}":',
+     "that overlay as a p1 boot item, which is where boot.cmd loads it from"),
+]
+
+
+def check_required():
+    """Return the number of REQUIRED entries that are missing."""
+    missing = 0
+    for path, pattern, why in REQUIRED:
+        text = open(path, encoding="utf-8").read()
+        if not re.search(pattern, text, re.M):
+            missing += 1
+            print("\nFAIL: %s does not contain %s" % (os.path.basename(path), pattern))
+            print("      This is %s." % why)
+            print("      A diff against the other board cannot catch this: the line is")
+            print("      absent there too, which compares equal.")
+    return missing
 
 
 def main():
@@ -172,8 +220,12 @@ def main():
         if len(gone) > 20:
             print("        ... and %d more" % (len(gone) - 20))
 
+    missing = check_required()
+    if missing:
+        rc = 1
+
     if rc == 0 and not gone:
-        print("\nOK: no unrecorded drift.")
+        print("\nOK: no unrecorded drift, and every required line is present.")
     return rc
 
 

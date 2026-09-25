@@ -18,12 +18,13 @@
 #       this board. What is left here is the checking: without the group flag the project
 #       is simply absent and `lunch` fails with "Can't find a product spec", which points
 #       at neither the manifest nor the flag.
-# rpi5: staged from this layer. The Pi 5 uses the upstream product plus one file
-#       (init.xenvm-buried-eth0.rc) and an overlay, and the only mechanism that installs
-#       them is PRODUCT_COPY_FILES / DEVICE_PACKAGE_OVERLAYS in a product makefile;
-#       device/epam/aosp-xenvm-trout is repo-managed, so a line added there is undone by
-#       the next `repo sync`. When that rc is upstreamed as an opt-in, this branch and
-#       the two staged files go away and the Pi 5 goes back to the upstream product.
+# rpi5: staged from this layer. The Pi 5 has a product of its own,
+#       aosp_xenvm_trout_rpi5_arm64, with its own device and BoardConfig.mk
+#       (xenvm_trout_rpi5_arm64; the rpi5 branch below says why), extending
+#       device/epam/aosp-xenvm-trout. That project is repo-managed, so a line
+#       added there is undone by the next `repo sync`; what the Pi 5 adds --
+#       init.xenvm-buried-eth0.rc, the overlay and the DomA feature set -- is
+#       installed by this layer's product makefile instead.
 #
 # WHY THE PI 4 HAS A DEVICE OF ITS OWN
 # The Raspberry Pi 4 needs a different compiler ISA baseline for the guest: a virtio
@@ -88,12 +89,13 @@ rpi4)
 	echo ">> stage-aosp-device: board=rpi4 device/sodev/xenvm-cf comes from the manifest (device $DEVICE)"
 	;;
 rpi5)
-	# rpi5 changes no board property: its product exists only to install the shared
-	# init.xenvm-buried-eth0.rc and overlay, which needs PRODUCT_COPY_FILES /
-	# DEVICE_PACKAGE_OVERLAYS and therefore a product this tree owns. It keeps the
-	# upstream PRODUCT_DEVICE and ships NO BoardConfig.mk of its own, so
-	# out/target/product/xenvm_trout_arm64 stays the same tree.
-	DEVICE="xenvm_trout_arm64"
+	# rpi5's product exists to install what device/epam/aosp-xenvm-trout cannot carry
+	# (it is repo-managed): the shared init.xenvm-buried-eth0.rc and overlay, and the
+	# DomA feature set. It owns a BoardConfig.mk, because some of those features are
+	# BoardConfig-only variables -- BOARD_VENDOR_SEPOLICY_DIRS for the shadow-AP policy
+	# among them -- and owning a BoardConfig means owning a PRODUCT_DEVICE, since
+	# AOSP's board_config.mk rejects two configs for one device name.
+	DEVICE="xenvm_trout_rpi5_arm64"
 	SRC="$here/aosp-device/agl/xenvm-trout-rpi5"
 	DST="$ROOT/device/agl/xenvm-trout-rpi5"
 	[ -d "$SRC" ] || { echo "ERROR: missing device source $SRC" >&2; exit 1; }
@@ -115,13 +117,12 @@ rpi5)
 	rm -rf "$DST"
 	cp -a "$SRC" "$DST"
 
-	# The opposite assertion to the Pi 4's: a BoardConfig.mk here would be the SECOND for
-	# this device name, and AOSP's board_config.mk fails on that with a message that
-	# points at the device rather than at this script.
-	if find "$DST" -name BoardConfig.mk | grep -q .; then
-		echo "ERROR: $DST ships a BoardConfig.mk, but rpi5 reuses the upstream one." >&2
-		exit 1
-	fi
+	# The BoardConfig has to BE there: without it build/make/core/board_config.mk
+	# stops `lunch` with "No config file found for TARGET_DEVICE
+	# xenvm_trout_rpi5_arm64", which names neither this script nor the staged
+	# directory. See the DEVICE comment above for why rpi5 owns one.
+	[ -f "$DST/$DEVICE/BoardConfig.mk" ] || {
+		echo "ERROR: $DST/$DEVICE/BoardConfig.mk not staged." >&2; exit 1; }
 	echo ">> stage-aosp-device: board=rpi5 staged device/agl/xenvm-trout-rpi5 + device/agl/common (device $DEVICE)"
 	;;
 *)

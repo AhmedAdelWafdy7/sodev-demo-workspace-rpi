@@ -477,8 +477,18 @@ if [ "$BOARD" = "rpi4" ] && [ "$BOARD_RAM" = "4g" ] \
 fi
 
 if [ "$BOARD" = "rpi5" ] && [ "$BOARD_RAM" = "8g" ] && [ "$ENABLE_ANDROID" = "yes" ]; then
-  echo ">> --ram=8g memory budget: Dom0 512 + DomD 3072 + DomU 1024 + DomA 3072"
-  echo "   = 7680 MiB (+ Xen ~64) of roughly 8180 MiB usable => ~436 MiB headroom."
+  # Sum what this invocation actually asks for: DomU only with -u, DomZ only
+  # with -z.
+  _mem_note="Dom0 512 + DomD 3072 + DomA 3072"
+  _mem_total=6656
+  if [ "$ENABLE_DOMU" = "yes" ]; then
+    _mem_note="$_mem_note + DomU 1024"; _mem_total=$((_mem_total + 1024))
+  fi
+  if [ "$ENABLE_DOMZ" = "yes" ]; then
+    _mem_note="$_mem_note + DomZ 16"; _mem_total=$((_mem_total + 16))
+  fi
+  echo ">> --ram=8g memory budget: $_mem_note"
+  echo "   = $_mem_total MiB (+ Xen ~64) of roughly 8180 MiB usable => ~$((8180 - _mem_total - 64)) MiB headroom."
   echo "   The 8180 MiB figure is extrapolated, not measured on an 8 GB board."
   echo "   It only fits because Dom0 is 512M; at 1024M the same set came to 8256 MiB."
   echo "   The reduction is split across DomD and DomA because DomD 2048 alone was"
@@ -1532,10 +1542,37 @@ if [ "${ENABLE_DOMU}" = "yes" ]; then
   # sstate across rebuilds — and the cache persists beyond the disposable agl/
   # checkout. External --dl/--sstate win; otherwise the in-workspace common_data.
   # Both are reachable in the AGL container: $workdir is mounted, and external
-  # cache dirs were added to CACHE_MOUNTS above. sstate is hash-keyed, so the
-  # scarthgap-era AGL and wrynose moulin entries coexist in one dir safely.
+  # cache dirs were added to CACHE_MOUNTS above.
+  #
+  # DL_DIR is shared: a source tarball is the same file whatever consumes it.
+  #
+  # SSTATE IS NOT, even though sstate is hash-keyed. The two bitbakes are
+  # different Yocto releases (the AGL side is poky scarthgap), and a recipe that
+  # carries the same name and version in both -- there are many -- hashes
+  # closely enough that one release will happily restore the other's native
+  # sysroot. Measured on an rpi5 --ram=8g -u build against a cache a moulin
+  # build had populated:
+  #
+  #   agl-compositor do_compile: protoc: symbol lookup error: libprotobuf.so.25.8.0:
+  #   undefined symbol: _ZN4absl12lts_20240116..._str_format_internal...string_view...
+  #
+  # Both abseil-cpp-native 20240116.3 and protobuf-native 4.25.8 came out of the
+  # shared dir by setscene (their workdirs held only *_setscene logs and no
+  # build/), and they disagreed about what absl::string_view is: the installed
+  # libabsl exports FormatArgImpl::Dispatch instantiated on std::string_view,
+  # i.e. it was built as C++17, while libprotobuf asks for the same template on
+  # absl's own string_view. Neither is broken on its own; they cannot be linked
+  # together. Nothing in the failure names sstate, which is what makes it
+  # expensive to find.
+  #
+  # So give the AGL bitbake its own subdirectory. Rebuilding its natives costs
+  # far less than one occurrence of the above.
   AGL_DL_DIR="${XT_DL_DIR:-$workdir/yocto/common_data/downloads}"
-  AGL_SSTATE_DIR="${XT_SSTATE_DIR:-$workdir/yocto/common_data/sstate}"
+  if [ -n "$XT_SSTATE_DIR" ]; then
+    AGL_SSTATE_DIR="$XT_SSTATE_DIR/agl-$AGL_BRANCH"
+  else
+    AGL_SSTATE_DIR="$workdir/yocto/common_data/sstate-agl-$AGL_BRANCH"
+  fi
   mkdir -p "$AGL_DL_DIR" "$AGL_SSTATE_DIR"
   echo ">> DomU(AGL) in ${AGL_DOCKER}: branch=${AGL_BRANCH} image=${AGL_IMAGE}"
   echo ">>   AGL cache: DL_DIR=${AGL_DL_DIR}  SSTATE_DIR=${AGL_SSTATE_DIR}"
@@ -1567,6 +1604,7 @@ fi
 #    input not built here. --domains-only (NINJA_TARGET="") => domains only.
 APPLY_ZEPHYR="meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr/apply-zephyr-patches.sh"
 STAGE_AOSP_DEVICE="meta-rpi-sodev/meta-xt-common/meta-xt-doma/stage-aosp-device.sh"
+APPLY_AOSP="meta-rpi-sodev/meta-xt-common/meta-xt-doma/apply-aosp-patches.sh"
 STAGE_DOMA_KERNEL="meta-rpi-sodev/meta-xt-common/meta-xt-doma/stage-doma-kernel.sh"
 # In-container build step. prebuilt mode never invokes doma/doma_kernel: it builds the
 # domains (dom0/domd[/domu]) then assembles full.img with rouge directly from the staged
@@ -1684,7 +1722,20 @@ else
     # must not have (XT_DOCKER_RUN_OPTS_AOSP: the nsjail relaxations, which on an Ubuntu
     # 24.04 host break bitbake's user-namespace check). They were one ${NINJA_CMD} before;
     # the ordering argument above holds either way, the AOSP container simply runs first.
-    AOSP_CMD="ninja fetch-doma_kernel fetch-doma && '${STAGE_AOSP_DEVICE}' \"\$PWD/${AAOS_DIR_NAME}\" '${BOARD}' && ninja doma_kernel && '${STAGE_DOMA_KERNEL}' \"\$PWD/${AAOS_KERNEL_DIR_NAME}/${AAOS_KERNEL_DEPLOY_DIR}\" \"\$PWD/${AAOS_DIR_NAME}\" '${AAOS_KERNEL_STAGE_DIR}' && ninja doma"
+    # apply-aosp-patches.sh between the fetch and the device staging, for the same
+    # reason apply-zephyr-patches.sh runs after `ninja fetch-dom0`: moulin's repo
+    # source has no apply_patch hook and `repo sync` hard-resets every project, so
+    # anything edited in the checkout before the fetch is undone by it. It is
+    # idempotent, so a build.sh reinvocation (fetch already stamped, no re-sync)
+    # does not double-apply.
+    #
+    # It runs TWICE, on the two trees repo populates here. The second call carries
+    # the guest kernel's patch set (aosp-kernel-patches) and has to come before
+    # `ninja doma_kernel`, because bazel reads those sources. Note that
+    # --aaos-src only redirects the AOSP tree: the kernel is always built at
+    # $AAOS_KERNEL_DIR_NAME inside the workspace, so this call always targets
+    # the workspace copy.
+    AOSP_CMD="ninja fetch-doma_kernel fetch-doma && '${APPLY_AOSP}' \"\$PWD/${AAOS_DIR_NAME}\" && '${APPLY_AOSP}' \"\$PWD/${AAOS_KERNEL_DIR_NAME}\" aosp-kernel-patches && '${STAGE_AOSP_DEVICE}' \"\$PWD/${AAOS_DIR_NAME}\" '${BOARD}' && ninja doma_kernel && '${STAGE_DOMA_KERNEL}' \"\$PWD/${AAOS_KERNEL_DIR_NAME}/${AAOS_KERNEL_DEPLOY_DIR}\" \"\$PWD/${AAOS_DIR_NAME}\" '${AAOS_KERNEL_STAGE_DIR}' && ninja doma"
   fi
   # NG-2 class hole, DomZ edition. --domains-only leaves NINJA_TARGET empty, so the
   # bare `ninja` builds moulin's DEFAULT target -- and the domz component is not in

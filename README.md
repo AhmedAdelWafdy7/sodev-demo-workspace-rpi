@@ -214,6 +214,9 @@ assembled the V4H way from the `doma`/`doma_kernel` moulin components).
   full 4-domain build comes to 9728 MiB on 16g and 7680 MiB on 8g — see *Board RAM size*
   (`docs/DESIGN.md`). Official 27 W (5 A) PSU required — 3 A supplies negotiate low
   current and corrupt the HDMI scanout.
+  Only boards with the BCM2712 **D0** stepping are supported: TF-A is built with
+  the D0 pin controller tables, see
+  `meta-rpi-sodev/meta-xt-rpi5/recipes-bsp/trusted-firmware-a/`.
 - Raspberry Pi 4 Model B (BCM2711), via `--board=rpi4`. **8 GB** and **4 GB** SKUs;
   four domains need the 8 GB board. Every USB-A port is behind the VL805 xHCI, so the
   touch panel depends on passing that controller through. What is and is not verified on
@@ -238,7 +241,7 @@ Moved to [`docs/DESIGN.md`](docs/DESIGN.md) — the 16 GB and 8 GB memory maps, 
 | Component | Version |
 |---|---|
 | Yocto / OpenEmbedded | Wrynose 6.0 LTS (bitbake 2.18, oe-core `wrynose`, meta-raspberrypi master @6d81e22c) |
-| Hypervisor | **Xen 4.22.0 — interim local `xen_4.22.bb`** (meta-virtualization master at `526c9725` stops at 4.21; the copy lives in `meta-xt-common/meta-xt-domx` so both board products see it, and is to be submitted upstream and deleted once accepted) + an ordered patch series in the shared `recipes-extended/xen-common` recipe (29 `.patch` files, required by both Dom0 flavours' Xen bbappends) plus the `0025` dom0less static-mem xenstore-page patch, which each board layer carries a copy of and both apply (**30 applied on rpi5, 29 on rpi4** -- that board excludes `4.22-0002`, which routes the BCM2712 MIP MSI it has no equivalent of; the exclusion and its reasoning are in `meta-xt-rpi4`'s bbappend). Of the 29, **23 come from the xen-troops fork** — 14 carried verbatim and 9 (`0004`, `0008`, `0010`, `0013`, `0016`, `0018`, `0019`, `0022`, `0024`) with local modifications declared on a `Local-Modifications:` line — and **6 are authored here** (`4.22-000{1..6}`). Moving 4.21 → 4.22 left 25 of the 29 untouched: `0008`/`0018` were regenerated against stable-4.22 (context drift only, emitted code identical) and `0022`/`4.22-0001` were rebased, each recording it on its `Local-Modifications:` line. The fork-derived patches keep their original authors and carry `Upstream-Status: Inappropriate` with an `Origin:` line naming the fork commit, because xen-troops is a downstream fork and not the upstream of Xen. The six authored here are build-verified (compile+link clean on arm64 Xen 4.22.0); three carry `Upstream-Status: Pending` (`0002`, `0005`, `0006` -- `0006` is the 4.22 dom0less phandle regression fix this series exists on top of, measured on hardware) and three carry `Upstream-Status: Inappropriate` because they are deliberately downstream: `0001` is the RPi5/BCM2712 working delta, `0003` reverts upstream hardening `2fbd7e609e` to re-permit bufioreq on Arm for this virtio-heavy configuration -- a security relaxation for the demo, not for upstream -- and `0004` locks a field that only the fork's legacy-PCI series (`0013`/`0019`) creates, so it cannot be submitted as-is |
+| Hypervisor | **Xen 4.22.0 — interim local `xen_4.22.bb`** (meta-virtualization master at `526c9725` stops at 4.21; the copy lives in `meta-xt-common/meta-xt-domx` so both board products see it, and is to be submitted upstream and deleted once accepted) + an ordered patch series in the shared `recipes-extended/xen-common` recipe (30 `.patch` files, required by both Dom0 flavours' Xen bbappends) plus the `0025` dom0less static-mem xenstore-page patch, which each board layer carries a copy of and both apply. Which of them a board applies, and in what order, is listed in its own `xen_4.22.bbappend`: the rpi4 one leaves out `4.22-0002`, which routes the BCM2712 MIP MSI that board has no equivalent of, and gives the reasoning. Of the 30, **6 are authored here** (`4.22-000{1..6}`), **1 is a backport** from upstream Xen (`4.22-0013`, the SMCCC argument fix of stable-4.22 `781b60f951`, which keeps its original author and carries `Upstream-Status: Backport`), and **23 come from the xen-troops fork** — 14 carried verbatim and 9 (`0004`, `0008`, `0010`, `0013`, `0016`, `0018`, `0019`, `0022`, `0024`) with local modifications declared on a `Local-Modifications:` line. Moving 4.21 → 4.22 left 25 of the 29 it carried then untouched: `0008`/`0018` were regenerated against stable-4.22 (context drift only, emitted code identical) and `0022`/`4.22-0001` were rebased, each recording it on its `Local-Modifications:` line. The fork-derived patches keep their original authors and carry `Upstream-Status: Inappropriate` with an `Origin:` line naming the fork commit, because xen-troops is a downstream fork and not the upstream of Xen. The six authored here are build-verified (compile+link clean on arm64 Xen 4.22.0); three carry `Upstream-Status: Pending` (`0002`, `0005`, `0006` -- `0006` is the 4.22 dom0less phandle regression fix this series exists on top of, measured on hardware) and three carry `Upstream-Status: Inappropriate` because they are deliberately downstream: `0001` is the RPi5/BCM2712 working delta, `0003` reverts upstream hardening `2fbd7e609e` to re-permit bufioreq on Arm for this virtio-heavy configuration -- a security relaxation for the demo, not for upstream -- and `0004` locks a field that only the fork's legacy-PCI series (`0013`/`0019`) creates, so it cannot be submitted as-is |
 | Virtualization layer | **meta-virtualization, pinned** (`781735b9`) — fetched by moulin at build time, not vendored. It supplies `xen.inc`/`xen-hypervisor.inc`/`xen-tools.inc` but **not** a 4.22 version recipe, so `xen_4.22.bb` / `xen-tools_4.22.bb` (PV `4.22.0+stable` / `4.22+stable`, xenbits `stable-4.22` @ `d45d5687f1`) are carried locally in `meta-xt-common/meta-xt-domx` and selected via `PREFERRED_VERSION_xen` / `PREFERRED_VERSION_xen-tools`. Both are interim, pending upstream acceptance |
 | Dom0 (zephyr) | Zephyr xenstore server (patch series under `meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr/`, applied on the upstream Zephyr Dom0 tree) |
 | Dom0 (linux) / DomD kernel | Linux 6.18.33 (`linux-raspberrypi`) |
@@ -289,12 +292,23 @@ See also:
     ├── check-memory-map.py         # DomD static-mem + Dom0 bank[0] placement, both --ram values
     ├── check-yaml-drift.py         # the two product yamls share ~750 lines by copy; fails on
     │                                   unrecorded divergence (yaml-drift-baseline.txt records the
-    │                                   74 differences that are there by design)
+    │                                   differences that are there by design)
     ├── check-domz.sh               # every DomZ check that works without hardware, in one
     │                               #   command (check-yaml-drift + the domz.cfg memory invariant +
     │                               #   checkpatch + moulin graph + the xenvm guest build).
     │                               #   To go further and actually BOOT DomZ on a PC, see
     │                               #   domz-qemu/qemu-xen-domz.sh (Xen + Dom0 in QEMU)
+    ├── check-no-internal-refs.py   # lint for text a reader of this tree
+    │                               #   cannot resolve: five generic rules in
+    │                               #   the script (home directories, real
+    │                               #   MACs, CJK text, weekdays, pointers to
+    │                               #   a procedure the reader cannot see),
+    │                               #   site names from a vocabulary file
+    │                               #   outside git; --added REV scans only
+    │                               #   the lines the working tree adds
+    │                               #   relative to REV, and every line of
+    │                               #   the untracked files git does not
+    │                               #   ignore
     ├── compare-sd-image.py         # compare a fresh SD image against one that booted, judging
     │                                   deterministic / timestamp-contaminated / deliberately-
     │                                   different artifacts by different criteria

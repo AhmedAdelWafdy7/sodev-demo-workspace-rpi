@@ -35,6 +35,9 @@
 # Python bytecode (from importing/compiling the committed .py helpers)
 __pycache__/
 *.pyc
+# The site vocabulary tools/check-no-internal-refs.py reads by default (see its
+# --help). It names things that are not published, so it is never committed.
+/tools/.internal-refs
 # Throw-away shims build.sh creates so a bare '*-project-objects' mirror can serve as a
 # repo --reference (--aaos-ref / --aaos-kernel-ref). They hold nothing but a symlink.
 .aaos-ref-shim/
