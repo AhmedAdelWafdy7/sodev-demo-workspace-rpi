@@ -173,13 +173,14 @@ fetch; the Pi 5 checkout has no such project and skips it.
 
 `meta-xt-common/meta-xt-doma/stage-aosp-device.sh` no longer copies anything for this
 board; `build.sh` still runs it between `ninja fetch-doma` and `ninja doma`, where it
-checks that the project, its board config and the two installed files are present and
-that `DomaWifiRelay` and `DomaSettingsProviderRRO` are each defined by exactly one
-`Android.bp` under `device/`. A forgotten group flag otherwise surfaces as `lunch`
-reporting "Can't find a product spec", which points at neither the manifest nor the
-flag. Nothing under `device/epam/aosp-xenvm-trout` is modified either way, so
-`repo sync` has nothing to reset and the pinned manifest revision can move without the
-change rotting.
+checks that the project, its board config, `init.xenvm-buried-eth0.rc`, the overlay's
+`defaults.xml` and the dialer's `config.xml` are present, that every XML under the
+overlay is well formed, and that `DomaWifiRelay` and `DomaSettingsProviderRRO` are each
+defined by exactly one `Android.bp` under `device/`. A forgotten group flag otherwise
+surfaces as `lunch` reporting "Can't find a product spec", which points at neither the
+manifest nor the flag. Nothing under `device/epam/aosp-xenvm-trout` is modified either
+way, so `repo sync` has nothing to reset and the pinned manifest revision can move
+without the change rotting.
 
 Two consequences worth knowing:
 

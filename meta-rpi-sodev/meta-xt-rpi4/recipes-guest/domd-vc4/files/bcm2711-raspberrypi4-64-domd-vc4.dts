@@ -848,6 +848,21 @@
 				 * GPIO provider is already in this partial DT (see the
 				 * `firmware` node), so it resolves inside DomD.
 				 *
+				 * brcm,bt-pcm-int-params routes SCO over the HCI
+				 * transport instead of the chip's PCM pins, which is
+				 * what HFP needs in a guest that has no PCM/I2S wiring
+				 * at all. hci_bcm.c:628-635 sends it during bcm_setup()
+				 * via btbcm_write_pcm_int_params() (HCI opcode 0xfc1c,
+				 * btbcm.c:199-215); the default pcm_int_params[0] = 0xff
+				 * means "leave alone" (hci_bcm.c:1259, :1527). Byte 0 is
+				 * sco-routing: 0 = PCM, 1 = Transport, 2 = Codec,
+				 * 3 = I2S — see
+				 * Documentation/devicetree/bindings/net/bluetooth/brcm,bluetooth.yaml:93-103.
+				 * The remaining four bytes match both in-tree users,
+				 * arch/arm/boot/dts/rockchip/rk3288-veyron-broadcom-bluetooth.dtsi:20
+				 * and arch/arm64/boot/dts/nvidia/tegra210-smaug.dts:1356.
+				 * Harmless for A2DP, required for HFP.
+				 *
 				 * vbat-supply / vddio-supply are NOT optional in a
 				 * dom0less guest, and this is the one difference from a
 				 * stock Raspberry Pi DT, which declares neither.
@@ -873,6 +888,7 @@
 					max-speed = <3000000>;
 					shutdown-gpios = <&expgpio 0 0>;	/* BT_ON */
 					fallback-bd-address;
+					brcm,bt-pcm-int-params = [01 02 00 01 01];
 					vbat-supply = <&bt_vbat_reg>;
 					vddio-supply = <&bt_vbat_reg>;
 					status = "okay";

@@ -1,0 +1,428 @@
+From 261048fca55b3597cb4b643be81eb899b61bef15 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 25 Sep 2026 09:34:40 +0900
+Subject: [PATCH] bt-hf: hand SCO to the audio framework and name the shipped
+ dialer
+
+Two independent gaps, both of which make an incoming HFP call go
+nowhere.
+
+The first is the audio path. The HF client role needs the software data
+path and the audio framework has to own SCO, which is two vendor
+properties: bluetooth.hfp.software_datapath.enabled and
+bluetooth.sco.managed_by_audio. They only work together with the SCO
+ports in bluetooth_audio_policy_configuration.xml and with the HF
+client's own software data path, which comes from patches carried
+outside this repository against packages/modules/Bluetooth; with a
+subset, HFP ends up with neither the legacy setParameters route nor the
+new session route. Measured on the board, 2026-08-27. Bluetooth starting
+off on a fresh /data does not skip this: the HFP software-SCO setup
+runs on every enable (bta_hf_client_api_enable), so turning Bluetooth
+on still sets it up.
+
+The SCO ports come with it. bluetooth_audio_policy_configuration.xml
+gains the "hfp output" and "hfp input" mix ports at 8000, 16000 and
+32000 Hz, mono, 16-bit -- the three rates CVSD, mSBC and LC3 negotiate
+-- the BT SCO, BT SCO Headset and BT SCO Car Kit sinks, the BT SCO
+Headset Mic source and their routes, with a header that says why the
+rates are those. The mic port declares no gains: the port instance the
+phone's connection creates carries none either, and the car audio
+service's patch, carried outside this repository against
+packages/services/Car, accepts a source without a gain controller.
+The bridge itself was measured on the Raspberry Pi 4 (2026-09-19) with
+a JOINT gain declared on that port; the port as declared here, without
+one, has not been run on a board.
+audio_policy_configuration.xml's note on the include says what the file
+now declares.
+
+The second is the incoming-call screen, and it is not a Bluetooth bug
+at all. AOSP leaves config_defaultDialer at com.android.dialer, a
+package no automotive build installs, and PermissionController resolves
+the android.app.role.DIALER default holder from that string. The role
+ends up with no holder, Telecom binds no InCallService, and the call
+rings inside Telecom while the screen stays dark and silent -- no
+screen, no ringtone, no call audio, while A2DP playback works.
+car_product ships no overlay for it.
+
+Diagnosed on a Raspberry Pi 5 board 2026-09-21; the evidence, including
+the Telecom state machine reaching SET_RINGING with
+combinedInCallServiceMap empty, the decisive
+"doesConnectedDialerSupportRinging: no default dialer found" line, and
+the runtime experiment that confirmed it, is in DEFAULT-DIALER.md. This
+board has the same gap.
+
+The string names no board and no hardware, so the overlay goes in this
+repository's existing overlay root, which the product already names.
+
+To measure rather than assume that the overlay lands -- it is a
+framework-res overlay, and the root is a DEVICE_PACKAGE_OVERLAYS one:
+    cmd role get-role-holders --user 10 android.app.role.DIALER
+has to answer com.android.car.dialer.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
+---
+ DEFAULT-DIALER.md                             | 100 ++++++++++++++++++
+ aosp_xenvm_trout_rpi4_arm64.mk                |  58 +++++++++-
+ audio/audio_policy_configuration.xml          |   9 +-
+ .../bluetooth_audio_policy_configuration.xml  |  82 +++++++++++++-
+ .../base/core/res/res/values/config.xml       |  27 +++++
+ 5 files changed, 272 insertions(+), 4 deletions(-)
+ create mode 100644 DEFAULT-DIALER.md
+ create mode 100644 overlay/frameworks/base/core/res/res/values/config.xml
+
+diff --git a/DEFAULT-DIALER.md b/DEFAULT-DIALER.md
+new file mode 100644
+index 0000000..d299bb8
+--- /dev/null
++++ b/DEFAULT-DIALER.md
+@@ -0,0 +1,100 @@
++<!-- SPDX-License-Identifier: Apache-2.0 -->
++# DomA: no incoming-call screen and no ringtone over Bluetooth HFP
++
++Root cause, measured on a Raspberry Pi 5 board on 2026-09-21 with a phone paired over
++HFP.
++
++## Symptom
++
++Incoming call on the paired phone: no incoming-call screen on the head unit, no
++ringtone, no call audio. A2DP music playback worked.
++
++## The chain
++
++`PermissionController/res/xml/roles.xml`:
++
++    <role name="android.app.role.DIALER" ... defaultHolders="config_defaultDialer">
++
++`frameworks/base/core/res/res/values/config.xml:2523`:
++
++    <string name="config_defaultDialer" translatable="false">com.android.dialer</string>
++
++`com.android.dialer` is the phone-form-factor app and is not installed on this
++build; the installed one is `com.android.car.dialer`. Nothing overrides the string
++(zero hits for `config_defaultDialer` under `packages/services/Car/car_product`), so
++the DIALER role is left with no holder at all.
++
++## Measurements before the fix
++
++    # cmd role get-role-holders --user 10 android.app.role.DIALER
++    (empty)
++    # cmd telecom get-default-dialer
++    null
++
++Telecom itself was healthy. `dumpsys telecom` showed the call reaching:
++
++    CREATED -> BIND_CS (HfpClientConnectionService) -> CS_BOUND -> START_CONNECTION
++    -> FILTERING_INITIATED -> BLOCK_CHECK_FINISHED (not blocked)
++    -> SET_RINGING (successful incoming call) -> FILTERING_COMPLETED
++
++but `combinedInCallServiceMap (InCalls registered):` stayed EMPTY, there was no
++`BIND_IN` event for the whole call, and logcat carried the decisive line:
++
++    Telecom : InCallController: doesConnectedDialerSupportRinging:
++              no default dialer found; oh no!
++
++That method is also what decides whether to ring, which is why the ringtone was
++missing for the same reason as the screen.
++
++## Confirmation
++
++Setting the holder at runtime:
++
++    cmd role add-role-holder --user 10 android.app.role.DIALER com.android.car.dialer
++
++made the incoming-call screen appear on the very next call, with
++`com.android.car.carlauncher` and
++`com.android.systemui.car.telecom.InCallServiceImpl` both bound for the call's full
++15.2 s and released on disconnect.
++
++## What was NOT the cause
++
++All of these were already correct and present, and none of them needed changing:
++
++* `packages/modules/Bluetooth` HFP client patches (`config.xml` A2DP focus,
++  `HeadsetClientStateMachine`, `client_interface_aidl.cc`, `hfp_client_interface_aidl.cc`,
++  `bta_hf_client_int.h`, `bta_hf_client_sco.cc`)
++* `frameworks/base` `BtHelper.java` HF-role gate (`sHfClientRole`)
++* `packages/services/Car` `CarAudioService.java` HFP SCO bridge
++* the three sysprops: `bluetooth.profile.hfp.hf.enabled`,
++  `bluetooth.hfp.software_datapath.enabled`, `bluetooth.sco.managed_by_audio`
++* the audio policy XMLs
++
++## Note on call audio
++
++No SCO link is expected until the call is answered ON THE HEAD UNIT. The call used
++for the measurement above ended as `LOG_CALL (... code=MISSED)`, and
++`CallAudioRouteController` correctly reported `isScoConnected=false` throughout.
++Answering on the phone keeps the audio on the phone. Verify call audio by answering
++on the AAOS screen, which was impossible before this fix because no screen appeared.
++
++## Not a porting miss, and not board specific
++
++The defect is in AOSP's own default, not in any board's port. This product has the
++same gap, and it was reached on the board above first only because this product's
++records contain no incoming-call-screen verification at all. The string names no board
++and no hardware, so the overlay lives in `device/sodev/xenvm-cf/overlay`, the one
++overlay root this product names.
++
++## Latent, not fixed here
++
++`dumpsys telecom` reports:
++
++    System Dialer: ComponentInfo{com.android.dialer/
++                   com.android.car.dialer.telecom.InCallServiceImpl}
++
++Telecom builds that from its own `ui_default_package` + `incall_default_class`, and
++the car RRO (`com.android.server.telecom.car.config.rro`, verified STATE_ENABLED)
++overrides only the class. That component serves the system/emergency dialer path,
++not ordinary InCallService binding, so it did not block this fix. It belongs to
++Telecom's RRO rather than to framework-res.
+diff --git a/aosp_xenvm_trout_rpi4_arm64.mk b/aosp_xenvm_trout_rpi4_arm64.mk
+index 510d299..655b980 100644
+--- a/aosp_xenvm_trout_rpi4_arm64.mk
++++ b/aosp_xenvm_trout_rpi4_arm64.mk
+@@ -45,7 +45,7 @@
+ #
+ #   * a2dp_audio_policy_configuration.xml is dropped and
+ #     bluetooth_audio_policy_configuration.xml (also a local fork, so the SCO/HFP
+-#     ports can be added in one place later) is copied instead. The non-_7_0
++#     ports can be added in one place) is copied instead. The non-_7_0
+ #     variant is REQUIRED: the top-level document is version="1.0" and lists
+ #     samplingRates comma-separated, while the _7_0 files use spaces.
+ #
+@@ -280,6 +280,62 @@ PRODUCT_PACKAGES += \
+     android.hardware.bluetooth.audio-impl \
+     audio.bluetooth.default
+ 
++# ---------------------------------------------------------------------------
++# HFP: hand SCO to the audio framework and pick the software data path.
++#
++# These two properties are the last piece of the HFP path and MUST take effect
++# together with the code and policy changes, not before them. The rest of the
++# path, in the order it has to be built:
++#   * bta_hf_client_sco.cc asks for the HCI data path
++#   * bta/hf_client implements the software data path
++#   * audio_bluetooth_hw maps SCO devices to HFP_SOFTWARE_*
++#   * the audio policy declares the SCO ports (audio/ in this device)
++#   * these properties                                            <- here
++# The first three are patches this device's workspace carries against
++# packages/modules/Bluetooth. Setting the properties on their own would leave HFP
++# with neither the legacy setParameters("hfp_enable") route nor the new session
++# route.
++#
++# bluetooth.sco.managed_by_audio
++#   BluetoothProperties.sysprop calls it "Set by vendors overlay, read at
++#   Bluetooth initialization". AudioDeviceBroker.java:225-226 ANDs it with the
++#   android.media.audio sco_managed_by_audio aconfig flag; both that flag and
++#   amsco_available_api are ENABLED in trunk_staging (checked with `aconfig
++#   dump-cache` on all_aconfig_declarations.pb), so this property is the only
++#   remaining switch. It is what makes AudioService own SCO activation and
++#   routing instead of emitting setParameters("hfp_enable=...").
++#
++# bluetooth.hfp.software_datapath.enabled
++#   Read natively with osi_property_get_bool by both the AG
++#   (bta_ag_init_hfp_client_interface() in bta_ag_sco.cc) and, once the HF role
++#   has the software data path, by bta_hf_client_sco.cc as well. Selects
++#   software over offload.
++#
++# WHY PRODUCT_VENDOR_PROPERTIES. The sysprop file names the vendor overlay as
++# the setter, and read-only properties are readable from every process
++# regardless of partition, so both the BT apex (native) and system_server
++# (Java) see them. This is NOT the vendor.ser.bt-uart situation: neither key is
++# assigned anywhere else in the tree (checked across device/,
++# packages/services/Car/ and build/), so there is no duplicate-mandatory
++# collision to work around -- post_process_props.py:127-130 only errors on a
++# repeated mandatory assignment of the SAME key.
++#
++# EFFECT ON THE AG ROLE, which is off on this product. NOT because a parent mk
++# disables it -- this product does NOT inherit
++# device/google_car/common/post_google_car.mk. bluetooth.profile.hfp.ag.enabled is
++# simply UNSET (verified in the built system/product/vendor build.prop), and
++# HeadsetService.java:290 reads it as
++# BluetoothProperties.isProfileHfpAgEnabled().orElse(false), so it defaults to
++# false. AG reads the same software_datapath property, but
++# bta_ag_init_hfp_client_interface() is gated on
++# bta_ag_is_sco_managed_by_audio(), a value pushed down from Java by
++# HeadsetService, which does not run here. So there is no contention for the
++# HfpClientInterface singleton; the HF client code logs and bails if it ever
++# loses that race.
++PRODUCT_VENDOR_PROPERTIES += \
++    bluetooth.sco.managed_by_audio=true \
++    bluetooth.hfp.software_datapath.enabled=true
++
+ # ---------------------------------------------------------------------------
+ # WHY DomaWifiRelay. It is the ONLY component that can learn the passphrase the user
+ # types on the AAOS Wi-Fi screen. The shadow AP on wlan2 validates that passphrase
+diff --git a/audio/audio_policy_configuration.xml b/audio/audio_policy_configuration.xml
+index cc79420..913bdce 100644
+--- a/audio/audio_policy_configuration.xml
++++ b/audio/audio_policy_configuration.xml
+@@ -330,7 +330,14 @@
+ 
+         </module>
+ 
+-        <!-- Bluetooth Audio HAL -->
++        <!-- Bluetooth Audio HAL.
++             The included file declares the SCO/HFP ports as well as A2DP
++             (bluetooth_audio_policy_configuration.xml, the BT SCO / BT SCO Headset /
++             BT SCO Car Kit sinks and the BT SCO Headset Mic source), and
++             audio_bluetooth_hw's SCO implementation is in the shipped image.
++             Declaring them is also harmless on its own: the bluetooth module has no
++             <attachedDevices>, so none of those ports becomes available until
++             something calls setDeviceConnectionState for it. -->
+         <xi:include href="bluetooth_audio_policy_configuration.xml"/>
+ 
+         <!-- Usb Audio HAL -->
+diff --git a/audio/bluetooth_audio_policy_configuration.xml b/audio/bluetooth_audio_policy_configuration.xml
+index 35ba73c..11f161f 100644
+--- a/audio/bluetooth_audio_policy_configuration.xml
++++ b/audio/bluetooth_audio_policy_configuration.xml
+@@ -6,8 +6,8 @@
+      FORKED from frameworks/av/services/audiopolicy/config/bluetooth_audio_policy_configuration.xml
+      for aosp_xenvm_trout_rpi4_arm64.
+ 
+-     The content is upstream's, unchanged. It is a local copy so that the
+-     hands-free (SCO) ports can be added in one place.
++     The SCO/HFP ports below are the fork's reason for existing. Everything else is
++     upstream, unchanged.
+ 
+      WHY IT IS INCLUDED AT ALL. trout's audio_policy_configuration.emulator.xml
+      includes a2dp_audio_policy_configuration.xml instead, whose module is named
+@@ -20,11 +20,58 @@
+      The 1.0 schema is deliberate: the parent document is version="1.0", so
+      samplingRates are COMMA separated here. The *_7_0.xml variant uses spaces and
+      cannot be mixed in.
++
++     SCO/HFP. These ports route into a module that can serve them: with the
++     packages/modules/Bluetooth patch for the HF-client role,
++     device_port_proxy.cc's init_session_type() maps the four SCO device types
++     onto SessionType::HFP_SOFTWARE_{ENCODING,DECODING}_DATAPATH.
++
++     ON THE SAMPLE RATES. kScoMixPortFixedSampleRate = 32000 does not apply
++     here: that constant belongs to a DIFFERENT HAL. It lives only in
++     hardware/interfaces/audio/aidl/default/bluetooth/DevicePortProxy.cpp:140, i.e.
++     the AIDL audio HAL, which resamples between 32 kHz and the codec rate at
++     :447-474. This product uses the HIDL audio HAL with
++     audio.bluetooth.default (packages/modules/Bluetooth/system/audio_bluetooth_hw/),
++     and that module contains NO resampler at all (measured: zero hits for
++     resampl/src_process/speex). It reports whatever the session's
++     PcmConfiguration says, straight through LoadAudioConfig().
++
++     So the mix ports declare the three rates the stack can actually negotiate,
++     taken from the codec mapping in bta_hf_client_sco.cc (which mirrors the AG's
++     codec_uuid_to_sample_rate()):
++         CVSD -> 8000,  mSBC -> 16000,  LC3 -> 32000
++     MONO and PCM_16_BIT are fixed: hfp::pcm_config
++     (bta/include/bta_ag_api.h:295-320) documents channel_mode = MONO and
++     bits_per_sample = 16 as invariants, and only the rate is configurable.
++
++     No conflict with other modules: HwModule::getModuleForDeviceType() gives SCO
++     to whichever module declares it first, and no other module in this policy
++     declares a BLUETOOTH_SCO device port (checked across the primary module and
++     every xi:include; the only other BLUETOOTH_SCO mentions in the tree are
++     volume-curve entries in audio_policy_volumes.xml, which are not device ports).
++
++     STILL NOT ENOUGH ON ITS OWN. Audio flows only once two properties are set
++     as well: bluetooth.sco.managed_by_audio and
++     bluetooth.hfp.software_datapath.enabled, both in the product makefile. They
++     have to take effect together with this file and with audio_bluetooth_hw's
++     SCO mapping, or HFP ends up with neither the legacy setParameters path
++     nor the new session path (measured on the board, 2026-08-27).
+ -->
+ <module name="bluetooth" halVersion="2.0">
+     <mixPorts>
+         <!-- A2DP Audio Ports -->
+         <mixPort name="a2dp output" role="source"/>
++        <!-- HFP (SCO) Audio Ports. See the header for why three rates. -->
++        <mixPort name="hfp output" role="source">
++            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                     samplingRates="8000,16000,32000"
++                     channelMasks="AUDIO_CHANNEL_OUT_MONO"/>
++        </mixPort>
++        <mixPort name="hfp input" role="sink">
++            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                     samplingRates="8000,16000,32000"
++                     channelMasks="AUDIO_CHANNEL_IN_MONO"/>
++        </mixPort>
+         <!-- Hearing AIDs Audio Ports -->
+         <mixPort name="hearing aid output" role="source">
+             <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+@@ -49,6 +96,27 @@
+                      samplingRates="44100,48000,88200,96000"
+                      channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+         </devicePort>
++        <!-- HFP (SCO) Audio Ports -->
++        <devicePort tagName="BT SCO" type="AUDIO_DEVICE_OUT_BLUETOOTH_SCO" role="sink">
++            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                     samplingRates="8000,16000,32000"
++                     channelMasks="AUDIO_CHANNEL_OUT_MONO"/>
++        </devicePort>
++        <devicePort tagName="BT SCO Headset" type="AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET" role="sink">
++            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                     samplingRates="8000,16000,32000"
++                     channelMasks="AUDIO_CHANNEL_OUT_MONO"/>
++        </devicePort>
++        <devicePort tagName="BT SCO Car Kit" type="AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT" role="sink">
++            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                     samplingRates="8000,16000,32000"
++                     channelMasks="AUDIO_CHANNEL_OUT_MONO"/>
++        </devicePort>
++        <devicePort tagName="BT SCO Headset Mic" type="AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET" role="source">
++            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                     samplingRates="8000,16000,32000"
++                     channelMasks="AUDIO_CHANNEL_IN_MONO"/>
++        </devicePort>
+         <!-- Hearing AIDs Audio Ports -->
+         <devicePort tagName="BT Hearing Aid Out" type="AUDIO_DEVICE_OUT_HEARING_AID" role="sink"/>
+     </devicePorts>
+@@ -59,6 +127,16 @@
+                sources="a2dp output"/>
+         <route type="mix" sink="BT A2DP Speaker"
+                sources="a2dp output"/>
++        <!-- HFP (SCO). The three outputs take the mix port as their source; the
++             input route is the other way round, mix port as sink. -->
++        <route type="mix" sink="BT SCO"
++               sources="hfp output"/>
++        <route type="mix" sink="BT SCO Headset"
++               sources="hfp output"/>
++        <route type="mix" sink="BT SCO Car Kit"
++               sources="hfp output"/>
++        <route type="mix" sink="hfp input"
++               sources="BT SCO Headset Mic"/>
+         <route type="mix" sink="BT Hearing Aid Out"
+                sources="hearing aid output"/>
+     </routes>
+diff --git a/overlay/frameworks/base/core/res/res/values/config.xml b/overlay/frameworks/base/core/res/res/values/config.xml
+new file mode 100644
+index 0000000..96dfba9
+--- /dev/null
++++ b/overlay/frameworks/base/core/res/res/values/config.xml
+@@ -0,0 +1,27 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++     SPDX-License-Identifier: Apache-2.0
++
++     Static overlay on framework-res: name the dialer this product actually ships.
++
++     AOSP leaves config_defaultDialer at com.android.dialer, a package no automotive
++     build installs, and PermissionController resolves the android.app.role.DIALER
++     default holder from this string. The role therefore ends up with no holder,
++     Telecom binds no InCallService, and an incoming HFP call rings inside Telecom
++     while the screen stays dark and silent. car_product ships no overlay for it.
++
++     Measured, diagnosed and fixed on a Raspberry Pi 5 board 2026-09-21. Full evidence,
++     including the Telecom log lines and the runtime experiment that confirmed it, is
++     in device/sodev/xenvm-cf/DEFAULT-DIALER.md.
++
++     This file is board independent, so it lives in device/sodev/xenvm-cf/overlay, the
++     one overlay root this product names.
++
++     Keep this comment free of double hyphens: XML forbids them inside a comment and
++     aapt2 rejects the file with "xml parser error: not well-formed (invalid token)"
++     at line 0, which names no useful location. That is why the evidence lives in the
++     Markdown file beside this directory rather than here.
++-->
++<resources>
++    <string name="config_defaultDialer" translatable="false">com.android.car.dialer</string>
++</resources>
