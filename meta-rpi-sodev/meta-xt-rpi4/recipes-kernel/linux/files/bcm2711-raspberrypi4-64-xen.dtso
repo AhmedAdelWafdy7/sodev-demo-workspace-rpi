@@ -17,7 +17,9 @@
  * Every address/SPI here comes from the real bcm2711-rpi-4-b.dtb — see
  * ../../../BCM2711-DT-TRUTH.md. RPi5-isms that DO NOT EXIST on BCM2711 and are
  * therefore absent from this file:
- *   - `&uart10`  (BCM2712 D0 debug UART)     -> RPi4 console is pl011 `&uart0`
+ *   - `&uart10`  (BCM2712 D0 debug UART)     -> RPi4 console is the mini UART
+ *                                               `/soc/serial@7e215040`; `&uart0`
+ *                                               (pl011) goes to DomD for Bluetooth
  *   - `&mip0`    (BCM2712 MSI-in-the-middle) -> RPi4 PCIe MSI lives *inside* the
  *                                               root complex (msi-parent=&pcie0)
  *   - RP1 / pcie2 / the 16 MiB RP1 aperture / the BCM2712 IOMMU
@@ -144,8 +146,33 @@
 
 /*
  * ---------------------------------------------------------------------------
- * Console UART: pl011 serial@7e201000 (phys 0xfe201000, GIC SPI 121).
+ * Bluetooth UART: pl011 serial@7e201000 (phys 0xfe201000, GIC SPI 121) -> DomD.
  * ---------------------------------------------------------------------------
+ * This UART is the one wired to the on-board CYW43455 Bluetooth at 3 Mbaud, and
+ * that bandwidth is why it goes to DomD rather than to the hypervisor console: a
+ * UART at 8N1 carries baud/10 bytes per second, so 3 Mbaud gives 2400 kbps of HCI
+ * payload against A2DP SBC's 229-328 kbps, while the mini UART's 230400 would
+ * give only 184 kbps. Xen's console is the mini UART instead
+ * (dtuart=/soc/serial@7e215040 in both boot scripts). Measured on the board: hci0
+ * binds under fe201000.serial and the controller answers with chip id 107,
+ * BCM4345C0 build 0382.
+ *
+ * The `xen,passthrough` marker is REQUIRED and easy to miss, because Xen probes
+ * only the one node named by dtuart=: xen/drivers/char/uart-init.c
+ * dt_uart_init() resolves that single path and calls device_init() on it, so only
+ * the mini UART is marked used_by DOMID_XEN (ns16550_uart_dt_init()) and
+ * skipped for the hardware domain (handle_node() in arch/arm/domain_build.c).
+ * Without the marker pl011 is handed to Dom0 with SPI 121 routed, and DomD's
+ * claim through xen,path = "/soc/serial@7e201000" then fails —
+ * route_irq_to_guest() returns -EBUSY for a line already routed to another
+ * domain (xen/arch/arm/irq.c).
+ * It is a marker here rather than an `fdt set` in the boot scripts for the reason
+ * spelled out at the pixelvalve1 note below: a mistyped &label makes `fdt apply`
+ * fail loudly, a mistyped path in Hush is silently ignored. It must never become
+ * an `fdt rm` either — handle_passthrough_prop() resolves xen,path against the
+ * HOST DT (xen/common/device-tree/dom0less-build.c:228), so deleting the node
+ * turns DomD's claim into -EINVAL and panics domain construction.
+ *
  * Round the reg size up from 0x200 to a full 4 KiB page. Xen maps MMIO per page
  * and the RPi5 port needed exactly this on uart10 before vpl011 would come up
  * for a dom0less guest; 0xfe201000 is already page-aligned here, so only the
@@ -156,16 +183,17 @@
  * NOT what makes the wider mapping safe — Xen's handle_node() does not look at
  * `status`, so a disabled node still has its IRQ routed and its MMIO mapped to
  * the hardware domain. Two other things make it safe:
- *   1. this page belongs to XEN, not to a domain: boot.cmd passes
- *      `console=dtuart dtuart=/soc/serial@7e201000`, so Xen keeps the pl011 for
- *      its own console and never hands it to Dom0; and
+ *   1. the page belongs to ONE domain, DomD: the marker below withholds it from
+ *      the hardware domain and DomD's partial DT maps the whole page with
+ *      xen,reg; and
  *   2. both boot scripts `fdt rm` all four of uart2..uart5 before booting Xen,
- *      precisely so no domain can claim a device inside this page.
- * (An earlier version of this comment said they were "owned by the same domain",
- * which was neither true nor the reason.)
+ *      precisely so no other domain can claim a device inside this page.
+ * The `fdt rm` is therefore still load-bearing after the console moved off this
+ * page — what changed is which domain owns it, not that it has a single owner.
  */
 &uart0 {
 	reg = <0x7e201000 0x1000>;
+	xen,passthrough;
 };
 
 /*

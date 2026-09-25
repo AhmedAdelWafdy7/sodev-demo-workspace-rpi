@@ -6,8 +6,10 @@
 #
 # Board differences that shape this file (see ../../../../BCM2711-DT-TRUTH.md
 # and PORT-DELTA-rpi5-to-rpi4.md):
-#   * console is the pl011 at /soc/serial@7e201000, not BCM2712's uart10, and
-#     there is no bcm2712d0 stepping overlay to correct its SPI;
+#   * console is the mini UART at /soc/serial@7e215040 (brcm,bcm2835-aux-uart,
+#     GIC SPI 93), not BCM2712's uart10, and there is no bcm2712d0 stepping
+#     overlay to correct its SPI; the pl011 at /soc/serial@7e201000 goes to DomD
+#     because it is the one wired to the on-board Bluetooth at 3 Mbaud;
 #   * no RP1, no MIP MSI controller, no IOMMU — so none of the RPi5
 #     /axi/pcie@1000120000 + /axi/msi-controller@1000130000 + /axi/iommuc@5b00
 #     blocks exist and the corresponding `fdt set` lines are gone;
@@ -377,19 +379,25 @@ fdt rm /soc/fb
 
 # 2. uart2..uart5 (/soc/serial@7e2014{00,600,800,a00}) are `status=disabled` in
 #    the stock DTB, but Xen ignores status and would still assign them to Dom0 —
-#    and they share the 4 KiB page 0xfe201000 with the pl011 that Xen uses as its
-#    own console. Xen's rpi4 blacklist covers the aux UART's page neighbours
-#    (brcm,bcm2835-aux / -aux-spi) but not these, so remove them here. This is
-#    the same hazard, handled the same way.
+#    and they share the 4 KiB page 0xfe201000 with the pl011, which belongs to
+#    DomD (item 3). One owner per page: an unmarked node makes handle_device()
+#    compute own_device = true and route its IRQs to the hardware domain, and
+#    DomD's claim on SPI 121 would then fail with -EBUSY. Xen's rpi4 blacklist
+#    covers the aux UART's page neighbours (brcm,bcm2835-aux / -aux-spi) but not
+#    these, so remove them here.
 fdt rm /soc/serial@7e201400
 fdt rm /soc/serial@7e201600
 fdt rm /soc/serial@7e201800
 fdt rm /soc/serial@7e201a00
 
-# 3. Bluetooth. config.txt carries `dtoverlay=disable-bt` so the pl011 reaches
-#    the GPIO14/15 header for the Xen console; the BT node under it goes to Xen
-#    with the UART. Disable it explicitly in case the overlay is ever dropped.
-fdt set /soc/serial@7e201000/bluetooth status "disabled"
+# 3. pl011 -> DomD (the Bluetooth UART). config.txt carries no dtoverlay, so the
+#    stock wiring holds: pl011 on GPIO30-33 talking to the CYW43455 at 3 Mbaud,
+#    mini UART on the GPIO14/15 header as Xen's console. Nothing is done here —
+#    the Xen host overlay marks &uart0 `xen,passthrough`, which is where every
+#    non-flavour-specific ownership decision lives (see the `fdt apply` note
+#    above); the overlay's own comment carries the full rationale. DomD claims the
+#    node with xen,path = "/soc/serial@7e201000" and runs hci_uart/hci_bcm on it,
+#    and the node's /bluetooth child is left enabled.
 
 # 4. Onboard Wi-Fi SDIO and the legacy DMA engine stay with Dom0 in this flavour
 #    and nothing is done here. /soc/mmcnr@7e300000 shares GIC SPI 126 with the
@@ -522,13 +530,26 @@ fdt rm /framebuffer@3f800000
 # -----------------------------------------------------------------------------
 # Xen hypervisor bootargs
 # -----------------------------------------------------------------------------
-#   console=dtuart dtuart=/soc/serial@7e201000
-#       BCM2711's pl011 (phys 0xfe201000, GIC SPI 121). config.txt must carry
-#       `dtoverlay=disable-bt` so this UART is the one on GPIO14/15; without it
-#       pl011 is wired to the Bluetooth module and the header carries the mini
-#       UART (/soc/serial@7e215040) instead. To use the mini UART instead — the
-#       path meta-virtualization's stock RPi4 boot script takes — set
-#       dtuart=/soc/serial@7e215040 and keep enable_uart=1.
+#   console=dtuart dtuart=/soc/serial@7e215040
+#       BCM2711's mini UART (brcm,bcm2835-aux-uart, phys 0xfe215040, GIC SPI 93).
+#       This is the path meta-virtualization's stock RPi4 boot script takes, and
+#       it is what leaves the fast pl011 (3 Mbaud) for the Bluetooth module —
+#       A2DP needs 229-328 kbps of HCI payload and the mini UART's 230400 baud
+#       carries only 184 kbps, so the assignment cannot be the other way round.
+#       With no dtoverlay in config.txt the stock wiring already puts the mini
+#       UART on GPIO14/15 as the primary UART, so enable_uart=1 has the firmware
+#       initialise it at 115200 and Xen's ns16550 driver adopts that: it matches
+#       brcm,bcm2835-aux-uart, and ns16550_uart_dt_init() derives
+#       reg_width=4/reg_shift=2 from the compatible and uses BAUD_AUTO, so it
+#       reads the divisor rather than reprogramming it.
+#       config.txt must also carry force_turbo=1: the mini UART's parent clock is
+#       aux@7e215000 -> cprman BCM2835_CLOCK_VPU, and enable_uart=1 pins that
+#       clock at 250 MHz — half the stock core_freq — unless turbo is forced. See
+#       rpi-config_git.bbappend for the upstream table.
+#       To go back to a pl011 console, restore `dtoverlay=disable-bt` in
+#       config.txt (overlays/disable-bt.dtbo is still on the boot FAT for exactly
+#       this), drop the &uart0 xen,passthrough marker from the Xen host overlay
+#       and set dtuart=/soc/serial@7e201000 — Bluetooth then stops working.
 #   dom0_mem=1024M
 #       Thin Dom0, but its xl/xenstored footprint grows with each guest (the RPi5
 #       bring-up OOM-killed xl at 512M with three domains). On a 4 GiB board
@@ -553,7 +574,7 @@ fdt rm /framebuffer@3f800000
 #   gnttab_max_frames=512   many virtio backends in DomD
 #   bootscrub=off           cuts several seconds off boot
 #   sync_console            serialises Xen console output while bringing up
-fdt set /chosen xen,xen-bootargs "console=dtuart dtuart=/soc/serial@7e201000 dom0_mem=${dom0mem} dom0_max_vcpus=1 xsm=dummy gnttab_max_frames=512 bootscrub=off loglvl=all guest_loglvl=all sync_console"
+fdt set /chosen xen,xen-bootargs "console=dtuart dtuart=/soc/serial@7e215040 dom0_mem=${dom0mem} dom0_max_vcpus=1 xsm=dummy gnttab_max_frames=512 bootscrub=off loglvl=all guest_loglvl=all sync_console"
 
 # -----------------------------------------------------------------------------
 # Load Xen
@@ -603,6 +624,12 @@ if fatload mmc 0 0xa4000000 Image ; then
     fdt set /chosen/domD/module@0 reg <0x0 0xa4000000 0x0 0x${domd_kernel_size}>
     # DomD cmdline notes:
     #   console=ttyAMA0        the emulated vpl011 (vpl011=<1> in the overlay).
+    #                          DomD now has two pl011-family ports — the vpl011 and
+    #                          the physical pl011 it owns for Bluetooth — so the
+    #                          partial DT pins the physical one with
+    #                          `aliases { serial1 = &uart0; }`, leaving slot 0 to
+    #                          the vpl011 in either probe order. Measured: the
+    #                          physical port comes up as ttyAMA1.
     #                          No earlycon and no ignore_loglevel: on RPi5 a
     #                          synchronous earlycon spun forever in pl011_putc
     #                          once the vpl011 FIFO filled, and the PV console
@@ -670,7 +697,8 @@ fi
 # -----------------------------------------------------------------------------
 # Dom0 Linux bootargs
 # -----------------------------------------------------------------------------
-#   console=hvc0 earlycon=xen   Dom0 has no UART: Xen owns the pl011.
+#   console=hvc0 earlycon=xen   Dom0 has no UART: Xen owns the mini UART and
+#       DomD owns the pl011.
 #   root=/dev/ram0 via rdinit   thin Dom0 runs entirely from its initramfs.
 #   modprobe.blacklist=vc4,v3d,simplefb
 #       Dom0 must not bind the GPU or a firmware framebuffer; DomD owns HDMI.
@@ -739,4 +767,32 @@ fdt set /chosen/dom0/module@1 reg <0x0 0xb0000000 0x0 0x${dom0_initramfs_size}>
 setenv skip_board_fixup 1
 
 setenv fdt_high 0xffffffffffffffff
+# Mux GPIO30-33 to ALT3 (pl011 CTS0/RTS0/TXD0/RXD0) before Xen starts.
+#
+# Measured in U-Boot on the board: the firmware leaves these four pins as plain
+# inputs (GPFSEL3 reads 0x3FFFF000), and a config.txt `gpio=` line only reaches
+# GPIO32/33 -- GPIO30/31 stay 0. DomD's partial DT asserts uart-has-rtscts, so
+# without RTS0 the controller never answers (hci0: command 0xfc18 tx timeout).
+# DomD cannot do the mux itself: the GPIO block at 0xfe200000 is not passed
+# through and DomD has no pinctrl for it. So it happens here, in the last stage
+# that still owns the whole address space.
+#
+# Read-modify-write, so GPIO34-39 (the SDIO Wi-Fi pins, already ALT3 from the
+# firmware) are left untouched: GPFSEL3 bits 0-11 -> 0b111 per pin; pulls 30 up /
+# 31 none in PUP_PDN_CNTRL_REG1 bits 28-31, 32 none / 33 up in
+# PUP_PDN_CNTRL_REG2 bits 0-3 -- upstream's uart0_pins plus uart0_ctsrts_pins.
+# Hush requires the operators escaped as \| and \&; an unescaped | is a pipe and
+# aborts the script.
+#
+# Verified on the board: with GPFSEL3 reading back 0x3FFFFFFF the controller
+# answers (chip id 107, BCM4345C0 build 0382); with GPIO32/33 alone it does not.
+setexpr.l btgpf *0xfe20000c \| 0x00000fff
+mw.l 0xfe20000c ${btgpf} 1
+setexpr.l btpup1 *0xfe2000e8 \& 0x0fffffff
+setexpr.l btpup1 ${btpup1} \| 0x10000000
+mw.l 0xfe2000e8 ${btpup1} 1
+setexpr.l btpup2 *0xfe2000ec \& 0xfffffff0
+setexpr.l btpup2 ${btpup2} \| 0x00000004
+mw.l 0xfe2000ec ${btpup2} 1
+
 booti 0x2000000 - ${fdt_addr}

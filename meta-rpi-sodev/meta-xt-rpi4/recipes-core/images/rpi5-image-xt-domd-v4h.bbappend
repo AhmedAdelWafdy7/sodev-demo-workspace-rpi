@@ -105,3 +105,52 @@ DOMD_WIFI_PACKAGES:raspberrypi4-64 = " \
     iw \
     "
 IMAGE_INSTALL:append = " ${DOMD_WIFI_PACKAGES}"
+
+# ---------------------------------------------------------------------------
+# Bluetooth in DomD, so DomA can use it.
+#
+# The BT side of the CYW43455 hangs off the pl011 (/soc/serial@7e201000) at
+# 3 Mbaud, the Xen host overlay marks that pl011 xen,passthrough, and DomD's
+# partial DT claims it with a brcm,bcm43438-bt child. The hypervisor console is
+# on the mini UART, which is what frees the pl011 for this.
+#
+# WHY 3 Mbaud AND NOT miniuart-bt: a UART at 8N1 carries baud/10 bytes per
+# second. The mini UART's 230400 gives 184 kbps of HCI payload, and A2DP SBC
+# needs 229 kbps (standard) to 328 kbps (high quality) -- which is why
+# overlays/README says miniuart-bt "should only be used with low-bandwidth
+# peripherals". pl011's 3 Mbaud gives 2400 kbps.
+#
+# No kernel rebuild, same as the Wi-Fi stanza above: the kernel
+# built from bcm2711_defconfig already has BT=m, BT_BCM=m, BT_HCIUART=m,
+# BT_HCIUART_SERDEV=y, BT_HCIUART_H4=y and BT_HCIUART_BCM=y. The defconfig names
+# BT, BT_HCIUART and BT_HCIUART_BCM; Kconfig's select and default supply the
+# rest. So kernel-module-{bluetooth,btbcm,hci-uart} are already in
+# tmp/deploy/rpm. They were never packaged, because this image installs
+# packagegroup-core-boot rather than packagegroup-base and so never sees
+# MACHINE_EXTRA_RRECOMMENDS.
+#
+# bluez-firmware-rpidistro-bcm4345c0-hcd is /lib/firmware/brcm/BCM4345C0.hcd, the
+# patchram hci_bcm downloads during bcm_setup(). It is a DIFFERENT recipe from
+# linux-firmware-rpidistro, which carries the Wi-Fi blobs. No PACKAGE_EXCLUDE
+# surgery is needed -- the base recipe only excludes linux-firmware-rpidistro-* --
+# and unlike the Wi-Fi firmware there is no LICENSE_FLAGS to accept; the Cypress
+# licence file comes along via RDEPENDS.
+#
+# bluez5-noinst-tools is here for ONE binary, /usr/bin/btproxy, which bridges
+# hci0 to a Unix socket speaking H4 (see xt-domd-bt-proxy). Checked with
+# `rpm -qp --requires`: it needs only libc, libdbus, libglib, libreadline and
+# libudev -- NOT libbluetooth. So it does not drag in bluez5 itself, and
+# therefore neither pi-bluetooth nor bluetoothd. That is deliberate, not luck:
+# bluetoothd would power hci0 up, and hci_sock_bind() in
+# net/bluetooth/hci_sock.c then refuses the HCI_CHANNEL_USER bind with -EBUSY;
+# that user channel is exactly the interface btproxy needs.
+DOMD_BT_PACKAGES = ""
+DOMD_BT_PACKAGES:raspberrypi4-64 = " \
+    kernel-module-bluetooth \
+    kernel-module-btbcm \
+    kernel-module-hci-uart \
+    bluez-firmware-rpidistro-bcm4345c0-hcd \
+    bluez5-noinst-tools \
+    xt-domd-bt-proxy \
+    "
+IMAGE_INSTALL:append = " ${DOMD_BT_PACKAGES}"

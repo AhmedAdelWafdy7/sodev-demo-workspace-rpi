@@ -1469,11 +1469,12 @@ components:
         - "tmp/deploy/images/%{MACHINE}/bcm2711-rpi-4-b.dtb"
         # Not deployed here: bcm2712d0.dtbo. The D0-stepping overlay is BCM2712-only
         # and has no Raspberry Pi 4 equivalent.
-        # [rpi4] disable-bt.dtbo — the firmware overlay that moves pl011 to GPIO14/15
-        # so `dtoverlay=disable-bt` in config.txt resolves; declared here because a p1
-        # item must be produced by some component. Built because the kernel bbappend
-        # forces KERNEL_DEVICETREE to keep RPI_KERNEL_DEVICETREE_OVERLAYS, and deployed
-        # flat (KERNEL_DTBVENDORED=0 strips the overlays/ prefix). See the p1 item.
+        # [rpi4] disable-bt.dtbo — the firmware overlay that would move pl011 to
+        # GPIO14/15. Not referenced by config.txt; kept as the rollback path for the
+        # UART assignment, and declared here because a p1 item must be produced by some
+        # component. Built because the kernel bbappend forces KERNEL_DEVICETREE to keep
+        # RPI_KERNEL_DEVICETREE_OVERLAYS, and deployed flat (KERNEL_DTBVENDORED=0 strips
+        # the overlays/ prefix). See the p1 item.
         - "tmp/deploy/images/%{MACHINE}/disable-bt.dtbo"
         - "tmp/deploy/images/%{MACHINE}/%{XT_DOMD_IMAGE}-%{MACHINE}.rootfs.ext4"
         - "tmp/deploy/images/%{MACHINE}/Image"
@@ -1773,17 +1774,26 @@ images:
           "Image":          "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/Image"
           "bcm2711-rpi-4-b.dtb": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/bcm2711-rpi-4-b.dtb"
           # REMOVED(rpi4): overlays/bcm2712d0.dtbo — the D0-stepping overlay (uart10 SPI121->120 rewrite)
-          # is BCM2712-only. RPi4 has no D0 stepping and uses pl011 serial@7e201000 directly (no poll-timer
-          # workaround needed). On RPi4 the firmware auto-enables the GIC via config.txt `enable_gic=1`.
+          # is BCM2712-only. RPi4 has no D0 stepping and its console is the mini UART
+          # serial@7e215040, whose SPI 93 needs no rewrite. On RPi4 the firmware auto-enables the
+          # GIC via config.txt `enable_gic=1`.
           "%{XT_XEN_DTBO_NAME}": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/%{XT_XEN_DTBO_NAME}"
-          # [rpi4] overlays/disable-bt.dtbo — REQUIRED for the Xen console.
-          # config.txt carries `dtoverlay=disable-bt`; the VideoCore firmware resolves
-          # that by loading overlays/<name>.dtbo from this FAT partition. Without the
-          # file the overlay is silently skipped, GPIO14/15 keeps the mini UART and
-          # pl011 stays wired to the Bluetooth module — so `console=dtuart
-          # dtuart=/soc/serial@7e201000` would talk to the BT chip and G1 would show
-          # nothing on the header. It cannot be folded into the Xen host overlay that
-          # U-Boot applies, because the firmware has already muxed the pins by then.
+          # [rpi4] overlays/disable-bt.dtbo — NOT referenced by config.txt; kept
+          # deliberately as the rollback path for the UART assignment.
+          #
+          # The assignment it would change: pl011 (/soc/serial@7e201000) belongs to the
+          # Bluetooth module at 3 Mbaud and Xen's console is the mini UART
+          # (dtuart=/soc/serial@7e215040). A2DP needs 229-328 kbps of HCI payload and
+          # only pl011's 3 Mbaud (2400 kbps at 8N1) carries that — the mini UART's
+          # 230400 gives 184 kbps — so disable-bt, which cuts the BT module off its
+          # UART entirely, is not an option while DomA needs Bluetooth. See
+          # rpi-config_git.bbappend and boot.cmd.xen.*.
+          #
+          # Leaving the file here means reverting that decision costs one config.txt
+          # line plus boot.scr, with no change to this FAT layout — and rewriting the SD
+          # card is the expensive step on this board. The overlay also cannot be folded
+          # into the Xen host overlay U-Boot applies, because the firmware has already
+          # muxed the pins by then, so it has to be a p1 item or nothing.
           # Source path is the flat basename: kernel-devicetree.bbclass deploys with
           # KERNEL_DTBVENDORED=0, so `overlays/disable-bt.dtbo` in KERNEL_DEVICETREE
           # lands as `disable-bt.dtbo` in the deploy dir. Same shape as the rpi5

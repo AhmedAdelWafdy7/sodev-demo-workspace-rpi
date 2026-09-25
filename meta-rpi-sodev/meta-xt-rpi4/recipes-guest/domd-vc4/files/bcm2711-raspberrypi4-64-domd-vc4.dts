@@ -130,6 +130,33 @@
 	 * failed (-75)", panic, reboot loop); that is an upstream regression
 	 * fixed here by xen patch 4.22-0006, not a reason to change this value.
 	 */
+	/*
+	 * serial1 = the REAL pl011, so that Xen's emulated vpl011 keeps ttyAMA0 —
+	 * which is what DomD's bootargs say (console=ttyAMA0).
+	 *
+	 * DomD ends up with two pl011-family ports: Xen's vpl011, which appears in
+	 * the generated guest DT as /sbsa-uart@<base> with compatible
+	 * "arm,sbsa-uart" (xen/arch/arm/dom0less-build.c:181-185), and the physical
+	 * one below. Both are handled by amba-pl011.c and both allocate out of the
+	 * same amba_ports[] array, so without a hint the index is
+	 * first-come-first-served.
+	 *
+	 * pl011_setup_port() calls pl011_probe_dt_alias() (amba-pl011.c:2780-2809),
+	 * which honours a "serialN" alias and falls back to the caller's index
+	 * otherwise. sbsa_uart_probe() has no alias entry, so it takes
+	 * pl011_find_free_port() = the lowest free slot. Pinning the physical port to
+	 * 1 therefore gives vpl011 slot 0 in either probe order. Measured on the
+	 * board: the physical port comes up as ttyAMA1 and hci0 binds under
+	 * fe201000.serial, while DomD's console stays on ttyAMA0. (An "aliased and
+	 * non-aliased serial devices" warning is expected and harmless.)
+	 *
+	 * Xen copies this node across: domain_handle_dtb_boot_module() scans exactly
+	 * `aliases` and `passthrough` in the partial DT. dtc turns the &label into
+	 * the node's full path string.
+	 *
+	 * &uart0 lives OUTSIDE the SD-STRIP block near the end of this file, so this
+	 * reference survives the DOM0_OS=linux strip.
+	 */
 	aliases {
 		/* SODEV-LINUX-DOM0-SD-STRIP-BEGIN: these TWO LINES ONLY.
 		 * Pin the mmc host index. Linux assigns it in mmc_alloc_host() from
@@ -155,8 +182,9 @@
 		 *                              or label "emmc2"
 		 * -- and do_compile produces no DTB at all.
 		 *
-		 * JUST these two lines are marked, and NOT the whole /aliases node, so
-		 * that an alias added to it later survives the strip. domd-vc4.bb's sed is
+		 * JUST these two lines are marked, and NOT the whole /aliases node:
+		 * serial1 below points at &uart0, which lives outside the strip block
+		 * and is load-bearing for Bluetooth. domd-vc4.bb's sed is
 		 * `/BEGIN/,/END/d`, which deletes EVERY BEGIN..END range it finds, so a
 		 * second pair here needs no recipe change. Comments are dropped by dtc,
 		 * so the zephyr DTB is unaffected by the markers themselves.
@@ -164,6 +192,7 @@
 		mmc0 = &emmc2;
 		mmc1 = &mmcnr;
 		/* SODEV-LINUX-DOM0-SD-STRIP-END */
+		serial1 = &uart0;
 	};
 
 	gic: gic {
@@ -731,6 +760,124 @@
 				xen,reg = <0x0 0xfe980000 0x0 0x10000 0x0 0xfe980000>;
 				status = "okay";
 			};
+
+			/*
+			 * pl011 -> the on-board CYW43455 Bluetooth.
+			 *
+			 * Xen's console is the mini UART (boot.cmd passes
+			 * dtuart=/soc/serial@7e215040) and config.txt carries no
+			 * dtoverlay, so the stock wiring holds: pl011 on GPIO30-33
+			 * talking to the BT module at 3 Mbaud. That baud is the whole
+			 * point — 8N1 gives baud/10 bytes per second, so 3 Mbaud
+			 * carries 2400 kbps of HCI payload against A2DP SBC's
+			 * 229-328 kbps, while the mini UART's 230400 would give only
+			 * 184 kbps.
+			 *
+			 * The Xen host overlay marks &uart0 xen,passthrough so Xen
+			 * releases SPI 121; see the long note there for why the marker
+			 * cannot be skipped (Xen only probes the dtuart= node, so
+			 * pl011 is never used_by DOMID_XEN).
+			 *
+			 * compatible: keep ALL THREE, exactly as the host DT has them.
+			 * drivers/of/platform.c:361-366 creates an AMBA device for any
+			 * node compatible with "arm,primecell", so this binds to
+			 * amba-pl011.c's AMBA pl011_probe with vendor_arm — the same
+			 * path a stock Pi takes. Reducing it to "arm,pl011-axi" alone
+			 * would instead hit pl011_axi_probe() (amba-pl011.c:3104) with
+			 * vendor_arm_axi, i.e. a different register access width and
+			 * different vendor data. The AMBA path is also why apb_pclk has
+			 * to exist: amba_device_add() does clk_get(dev, "apb_pclk")
+			 * before probe.
+			 *
+			 * reg is rounded up from the host's 0x200 to a full 4 KiB page
+			 * because Xen maps MMIO per page — the same idiom the Xen host
+			 * overlay uses for &uart0. That page also holds uart2..uart5,
+			 * which both boot scripts remove so this node is its single
+			 * owner.
+			 *
+			 * No pinctrl: the host points at <&uart0_pins &bt_pins> under
+			 * gpio@7e200000 and DomD has no GPIO controller. boot.cmd muxes
+			 * GPIO30-33 to ALT3 with a raw GPFSEL3 write before Xen starts.
+			 * Same reasoning as sdio_pins/audio_pins elsewhere in this file.
+			 */
+			uart0: serial@fe201000 {
+				compatible = "arm,pl011-axi", "arm,pl011", "arm,primecell";
+				reg = <0x0 0xfe201000 0x0 0x1000>;
+				interrupts = <0x0 121 0x4>;	/* GIC SPI 121 */
+				interrupt-parent = <&gic>;
+				clocks = <&clk_uart>, <&clk_apb>;
+				clock-names = "uartclk", "apb_pclk";
+				arm,primecell-periphid = <0x341011>;
+				cts-event-workaround;
+				uart-has-rtscts;
+				/*
+				 * skip-init is INERT in this kernel and is present only
+				 * to keep this node identical to the host's. Measured:
+				 * nothing under drivers/ or arch/arm64/ consumes it, and
+				 * amba-pl011.c does not read it — so Linux DOES fully
+				 * initialise this port, which is what hci_bcm needs in
+				 * order to set the baud via
+				 * serdev_device_set_baudrate(). Do not read this line as
+				 * "the firmware already set the UART up, so the clock
+				 * must be fine".
+				 */
+				skip-init;
+				xen,path = "/soc/serial@7e201000";
+				xen,force-assign-without-iommu;
+				xen,reg = <0x0 0xfe201000 0x0 0x1000 0x0 0xfe201000>;
+				status = "okay";
+
+				/*
+				 * hci_uart binds here over serdev; hci_bcm picks the
+				 * node up via brcm,bcm43438-bt with
+				 * bcm43438_device_data (hci_bcm.c
+				 * bcm_bluetooth_of_match) and downloads
+				 * brcm/BCM4345C0.hcd — btbcm_initialize() always also
+				 * tries the board-name-less filename, which is what
+				 * bluez-firmware-rpidistro-bcm4345c0-hcd installs, so
+				 * the guest DT having no root compatible does not
+				 * matter here (unlike brcmfmac, which needed
+				 * brcm,board-type).
+				 *
+				 * max-speed drives the post-patchram baud switch
+				 * (hci_bcm.c:1232 reads it into oper_speed). Measured on
+				 * the board: 3000000, and the controller then answers
+				 * with chip id 107, BCM4345C0 build 0382.
+				 *
+				 * shutdown-gpios = BT_ON, expgpio line 0. The firmware
+				 * GPIO provider is already in this partial DT (see the
+				 * `firmware` node), so it resolves inside DomD.
+				 *
+				 * vbat-supply / vddio-supply are NOT optional in a
+				 * dom0less guest, and this is the one difference from a
+				 * stock Raspberry Pi DT, which declares neither.
+				 * hci_bcm.c's bcm_get_resources() takes both with
+				 * devm_regulator_get() (not the _optional variant). On a
+				 * stock Pi the regulator core inserts dummy supplies and
+				 * that succeeds; here it refuses:
+				 *   include/linux/of.h:1717-1720 — of_have_populated_dt()
+				 *     tests only whether the DT ROOT has a `compatible`;
+				 *   drivers/regulator/core.c:6585-6586 —
+				 *     has_full_constraints is set from that and nothing
+				 *     else, and dummy supplies need it.
+				 * A dom0less guest DT root carries only #address-cells /
+				 * #size-cells, so has_full_constraints stays false, dummy
+				 * supplies are refused and probe fails with
+				 * "error -ENODEV: Failed to get supply 'vbat'" — hci0
+				 * never appears. The number of regulators in the tree is
+				 * irrelevant. Hence the explicit always-on
+				 * bt_vbat_reg below.
+				 */
+				bluetooth {
+					compatible = "brcm,bcm43438-bt";
+					max-speed = <3000000>;
+					shutdown-gpios = <&expgpio 0 0>;	/* BT_ON */
+					fallback-bd-address;
+					vbat-supply = <&bt_vbat_reg>;
+					vddio-supply = <&bt_vbat_reg>;
+					status = "okay";
+				};
+			};
 		};
 
 		/*
@@ -743,6 +890,38 @@
 			#clock-cells = <0>;
 			clock-frequency = <480000000>;
 			clock-output-names = "otg";
+		};
+
+		/*
+		 * pl011's two clocks. The host uses <&clocks BCM2835_CLOCK_UART>
+		 * (cprman index 19) and <&clocks BCM2835_CLOCK_VPU> (index 20), and
+		 * cprman is not passed through — same situation as emmc2 and mmcnr,
+		 * and the same fixed-clock substitute.
+		 *
+		 * 48 MHz is init_uart_clock's default, i.e. what the firmware
+		 * programs into CM_UARTDIV. THE VALUE MATTERS: amba-pl011 computes
+		 * the baud divisor from clk_get_rate(), so if the real rate is not
+		 * 48 MHz the link runs at the wrong baud by exactly that ratio and
+		 * the BT firmware download fails. A fixed-clock cannot open a gate
+		 * either. Both hold on the board: the controller answers (chip id
+		 * 107, BCM4345C0 build 0382), which it cannot do over a link whose
+		 * baud comes from a wrong rate or whose clock is gated.
+		 *
+		 * apb_pclk is only there because amba_device_add() insists on it;
+		 * amba-pl011 never reads its rate.
+		 */
+		clk_uart: clk-uart {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <48000000>;
+			clock-output-names = "uart-clock";
+		};
+
+		clk_apb: clk-apb {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <48000000>;
+			clock-output-names = "apb-pclk";
 		};
 
 		/* ==============================================================
@@ -1046,6 +1225,36 @@
 				cooling-maps {
 				};
 			};
+		};
+
+		/*
+		 * Bluetooth vbat / vddio. A fixed regulator with NO gpio, so it
+		 * switches nothing — the CYW43455 is powered from the board
+		 * unconditionally. It exists solely to satisfy hci_bcm.c's
+		 * devm_regulator_get() calls, which cannot fall back to dummy
+		 * supplies in a dom0less guest; the mechanism is spelled out at the
+		 * `bluetooth` node above.
+		 *
+		 * It MUST stay OUTSIDE the SD-STRIP block below. The references to it
+		 * are in the `bluetooth` node, which is outside the block, so a
+		 * definition inside it would be deleted by domd-vc4.bb's sed for
+		 * DOM0_OS=linux and dtc would then reject the whole tree:
+		 *     ERROR (phandle_references):
+		 *         /passthrough/soc-bus/serial@fe201000/bluetooth:
+		 *         Reference to non-existent node or label "bt_vbat_reg"
+		 * — no DTB at all, and only for that one flavour. Same hazard the
+		 * /aliases mmc entries are marked for.
+		 *
+		 * sd_vcc_reg must NOT be reused: it carries SD_PWR_ON (expgpio 6), so
+		 * a Bluetooth probe would end up switching the SD card's power.
+		 */
+		bt_vbat_reg: bt-vbat-reg {
+			compatible = "regulator-fixed";
+			regulator-name = "bt-vbat";
+			regulator-min-microvolt = <3300000>;
+			regulator-max-microvolt = <3300000>;
+			regulator-always-on;
+			status = "okay";
 		};
 
 		/* SODEV-LINUX-DOM0-SD-STRIP-BEGIN: domd-vc4.bb removes this whole

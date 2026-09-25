@@ -54,30 +54,100 @@ do_deploy:append() {
 RPI_EXTRA_CONFIG:append = "\n# --- EL3: TF-A BL31 (PSCI + GICv2) as the armstub ---\narm_64bit=1\nenable_gic=1\narmstub=bl31.bin\ndevice_tree=bcm2711-rpi-4-b.dtb\n"
 
 # -----------------------------------------------------------------------------
-# pl011 on the GPIO header — the Xen console.
+# UART assignment: pl011 -> Bluetooth, mini UART -> the Xen console.
 # -----------------------------------------------------------------------------
-# On a stock RPi4 the pl011 (/soc/serial@7e201000) is wired to the Bluetooth
-# module and GPIO14/15 carries the mini UART (/soc/serial@7e215040). boot.cmd
-# passes dtuart=/soc/serial@7e201000 to Xen, so the two have to be swapped:
-# disable-bt gives pl011 the header pins and turns the BT node off. Without it the
-# hypervisor console would be talking to the Bluetooth chip.
+# BCM2711 has six UARTs, but only uart0 (pl011) and uart1 (mini UART) can be
+# muxed to the two pin groups that matter here: GPIO14/15 (the 40-pin header) and
+# GPIO30-33 (the on-board CYW43455 Bluetooth). uart2..uart5 are confined to
+# GPIO0-15 and cannot reach the BT pins at all
+# (arch/arm/boot/dts/broadcom/bcm283x.dtsi, and overlays/uart[2-5]-overlay.dts).
 #
-# The alternative is to leave BT alone and point Xen at the mini UART instead,
-# which is what meta-virtualization's stock RPi4 boot script does. That path needs
-# enable_uart=1 to pin the core clock, since the mini UART derives its baud rate
-# from it — set here regardless, because it also gives the firmware stage a
-# console.
+# The two pin groups are disjoint and uart0/uart1 are separate devices, so BOTH
+# consumers can be served at once — which is what the stock, no-overlay
+# configuration does. What is forced is only the PAIRING: whichever UART drives
+# the BT module, the console gets the other one.
 #
-# `dtoverlay=disable-bt` is resolved by the VideoCore firmware, which looks for
-# overlays/disable-bt.dtbo on the boot FAT. The pin mux has to be right before any
-# of TF-A / U-Boot / Xen runs, so this cannot be folded into the Xen host overlay
-# that U-Boot applies with `fdt apply` — by then the firmware has already muxed
-# GPIO14/15. rpi4-sodev.yaml therefore carries overlays/disable-bt.dtbo as a p1
-# boot item, and the kernel bbappend forces KERNEL_DEVICETREE to include
-# RPI_KERNEL_DEVICETREE_OVERLAYS so the file is actually built and deployed.
-# If that file is missing the overlay silently does nothing and the hypervisor
-# console talks to the Bluetooth chip instead of the header — i.e. a dead G1.
-RPI_EXTRA_CONFIG:append = "\n# --- Xen console: pl011 on GPIO14/15 (requires BT off) ---\nenable_uart=1\ndtoverlay=disable-bt\n"
+#   overlays          GPIO14/15 (header)          GPIO30-33 (BT module)
+#   ----------------  --------------------------  ---------------------------
+#   none (stock)      mini UART  (ttyS0)          pl011 @ 3 Mbaud
+#   disable-bt        pl011                       nothing — BT is dead
+#   miniuart-bt       pl011                       mini UART @ 230400
+#
+# The numbers decide the pairing. A UART at 8N1 carries baud/10 bytes per second,
+# so the mini UART's 230400 gives 184 kbps of HCI payload while A2DP SBC needs
+# 229 kbps (standard) to 328 kbps (high quality). miniuart-bt is therefore out —
+# its own overlays/README says it "should only be used with low-bandwidth
+# peripherals" — and disable-bt sacrifices Bluetooth entirely. pl011's 3 Mbaud
+# (2400 kbps) is the only pairing that carries A2DP, so BT gets pl011 and the
+# console gets the mini UART.
+#
+# No overlay at all is exactly that pairing: stock already puts pl011 on the BT
+# module and lets the firmware mux GPIO14/15 to the mini UART as the primary
+# UART. boot.cmd points Xen at the mini UART (dtuart=/soc/serial@7e215040), which
+# is also the path meta-virtualization's stock RPi4 boot script takes. Measured on
+# the board: hci0 binds under fe201000.serial, DomD's device tree reports
+# max-speed = 3000000, and the controller answers with chip id 107,
+# BCM4345C0 build 0382.
+#
+# enable_uart=1: the mini UART is the primary UART, so this is what gives the
+# firmware stage a console on the header at 115200. Xen's ns16550 driver supports
+# brcm,bcm2835-aux-uart directly (the compatible is in ns16550.c's DT match
+# table, and ns16550_uart_dt_init() sets reg_width=4/reg_shift=2 from it) and
+# uses BAUD_AUTO on the DT path, i.e. it reads the divisor the firmware
+# programmed rather than reprogramming it.
+#
+# force_turbo=1 is NOT optional, and the coupling is documented upstream. The mini
+# UART's parent clock is aux@7e215000 -> cprman index 20 = BCM2835_CLOCK_VPU, so
+# its baud rate moves with the core frequency. Raspberry Pi's own documentation
+# (configuration/interfaces.adoc, "Mini UART and core frequency") gives:
+#
+#   Mini UART set to | Core clock              | Result
+#   -----------------+-------------------------+--------------------------------
+#   Primary          | Variable                | Mini UART DISABLED
+#   Primary          | Fixed (enable_uart=1)   | enabled; core fixed at 250 MHz
+#                    |                         | (or turbo frequency if forced)
+#   Secondary        | Variable                | Mini UART DISABLED
+#   Secondary        | Fixed (core_freq=250)   | enabled
+#
+# So enable_uart=1 is itself what fixes the VPU clock, and it fixes it at 250 MHz
+# — half the Pi 4's default core_freq of 500. That is not acceptable here: the
+# core clock drives HVS (display composition), the VideoCore H.264 codec, and the
+# L2 cache and memory bus, and this design hands the whole display complex to
+# DomD. (V3D is separately clocked — v3d_freq/v3d_freq_min below — so it is not
+# affected directly.) The documented escape is the parenthesis in the table,
+# "or turbo frequency if forced".
+#
+# force_turbo=1 on its own does NOT set the warranty bit: upstream is explicit
+# that "the overclock bit sets when force_turbo is set to 1 AND any of the
+# over_voltage_* options are set to a value of more than 0", and nothing here sets
+# over_voltage_*. It is also not overclocking — turbo is the stock maximum. Cost:
+# all clocks stay at maximum even when idle, so idle power and temperature go up.
+# Residual risk worth knowing: overclock/overvoltage are disabled at runtime when
+# the SoC reaches temp_limit (85 C default), so under sustained thermal load the
+# core can drop and the console baud with it — watch for garbled console output
+# correlating with load.
+#
+#   https://github.com/raspberrypi/documentation/blob/master/documentation/asciidoc/computers/configuration/interfaces.adoc
+#   https://github.com/raspberrypi/documentation/blob/master/documentation/asciidoc/computers/config_txt/overclocking.adoc
+#
+# The pin mux for GPIO30-33 is done TWICE, and the duplication is deliberate.
+# boot.cmd read-modify-writes GPFSEL3 and both PUP_PDN_CNTRL registers for all four
+# lines before Xen starts, which is a strict superset of what the two `gpio=` lines
+# below can do -- a config.txt `gpio=` reaches only GPIO32/33, and DomD's DT asserts
+# uart-has-rtscts, so CTS0/RTS0 on GPIO30/31 have to be muxed as well.
+#
+# The `gpio=` lines are kept anyway because the configuration that was measured
+# working on the board has both, and dropping one half of it has NOT been measured.
+# Rewriting the SD card is the expensive step here, so the reduction is not worth
+# spending a boot on; remove them only together with a board test that shows the
+# read-modify-write alone brings the controller up (`chip id 107, BCM4345C0`).
+#
+# overlays/disable-bt.dtbo is still deployed as a p1 boot item (rpi4-sodev.yaml)
+# and the kernel bbappend still forces KERNEL_DEVICETREE to build the overlay set.
+# Nothing references the file, and keeping it means reverting this UART assignment
+# costs one config.txt line plus boot.scr with no change to the FAT layout —
+# rewriting the SD card is the expensive step on this board.
+RPI_EXTRA_CONFIG:append = "\n# --- Xen console: mini UART on GPIO14/15; pl011 belongs to Bluetooth ---\nenable_uart=1\nforce_turbo=1\ngpio=30,33=a3,pu\ngpio=31,32=a3,pn\n"
 
 # -----------------------------------------------------------------------------
 # Cancel meta-raspberrypi's own `dtoverlay=vc4-kms-v3d`.
@@ -93,9 +163,10 @@ RPI_EXTRA_CONFIG:append = "\n# --- Xen console: pl011 on GPIO14/15 (requires BT 
 #
 # On rpi5 it happened to be harmless because no overlays/ directory was shipped, so
 # the firmware could not find the file and skipped it. That is luck, not intent,
-# and it stops being true here: RPI_KERNEL_DEVICETREE_OVERLAYS is now built and
-# deployed (needed for disable-bt.dtbo), so anyone widening the p1 overlay list
-# would silently enable it.
+# and it stops being true here: RPI_KERNEL_DEVICETREE_OVERLAYS is built and
+# deployed and overlays/disable-bt.dtbo is on the boot FAT as the rollback path
+# for the UART assignment above, so anyone widening the p1 overlay list would
+# silently enable it.
 #
 # VC4GRAPHICS is a recipe-local variable used at exactly one place (that `if`), so
 # clearing it removes the line and nothing else. MACHINE_FEATURES is deliberately

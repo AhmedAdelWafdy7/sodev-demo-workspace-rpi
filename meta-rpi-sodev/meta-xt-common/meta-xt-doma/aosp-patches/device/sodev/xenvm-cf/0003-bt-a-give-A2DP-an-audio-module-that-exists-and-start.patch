@@ -1,0 +1,801 @@
+From 8c75724431e259466234e532da5fc1b84ac40ef9 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 25 Sep 2026 09:34:39 +0900
+Subject: [PATCH] bt-a: give A2DP an audio module that exists, and start
+ Bluetooth off
+
+trout's audio policy includes a2dp_audio_policy_configuration.xml, whose
+module is named "a2dp". There is no audio.a2dp.default anywhere in AOSP
+17 -- the implementation is audio.bluetooth.default and its module name
+is "bluetooth". Left alone, a phone pairs, connects, and media routes
+"successfully" while nothing comes out of the speaker.
+
+device/google/trout/aosp_trout_common.mk wraps its copy list in
+`ifndef LOCAL_AUDIO_PRODUCT_COPY_FILES`, so defining that variable here
+replaces the list wholesale. It has to be assigned ABOVE the inherit,
+for the reason the comment at the top of the product makefile gives: a
+parent's guard can be pre-empted from there. That comment gains one
+paragraph: LOCAL_* audio variables are plain global Make variables, not
+product variables, so clear-var-list in node_fns.mk never resets them
+and the value set here survives into trout's file.
+
+Four differences from trout's five entries:
+
+  * audio_policy_configuration.xml is forked into this device, to
+    include the bluetooth module instead of the a2dp one.
+  * a2dp_audio_policy_configuration.xml is dropped and
+    bluetooth_audio_policy_configuration.xml copied instead -- a local
+    copy of upstream's file, so the SCO/HFP ports can be added in one
+    place. The non-_7_0 variant is required: the top-level document is
+    version="1.0" and lists samplingRates comma-separated, while the
+    _7_0 files use spaces.
+  * The three XIncludes trout references but never ships
+    (r_submix_audio_policy_configuration.xml, audio_policy_volumes.xml,
+    default_volume_tables.xml) are now shipped. Serializer.cpp only
+    ALOGEs a failed XInclude and carries on, and EngineBase then fell
+    back to gDefaultVolumeGroups ("No legacy volume group found, using
+    default music group"), because parseLegacyVolumes() reads the
+    <volumes> section of this very file. So the guest ran with ONE
+    volume group and no r_submix module while audio.r_submix.default.so
+    was installed all along.
+    THIS CHANGES AUDIO BEHAVIOUR ON PURPOSE: the guest gains the real
+    legacy volume curves. The check on the board is that the media
+    slider still behaves on the HDMI bus outputs and "No legacy volume
+    group found" no longer appears -- `dumpsys audio` before and after.
+  * car_audio_configuration.xml, android.hardware.broadcastradio.xml and
+    usb_audio_policy_configuration.xml are unchanged from trout,
+    restated because defining the variable replaces the whole list.
+
+The image also lacked the module the policy names. PRODUCT_PACKAGES
+gains audio.bluetooth.default, the HW module AudioFlinger loads, and
+android.hardware.bluetooth.audio-impl, the AIDL provider factory the
+Bluetooth stack talks to, which the HIDL audio HAL service this image
+already ships dlopens.
+
+The HCI transport is not here: it is a virtio-serial port owned by
+DomD, and the DomD side of it is a separate change.
+
+Bluetooth also starts off on a fresh /data. SettingsProvider seeds
+bluetooth_on from def_bluetooth_on on the first boot of an empty /data.
+The device overlay has said false since this device was added
+(2026-08-23), but CarSettingsProviderConfigRRO sets it true and a
+runtime overlay outranks a build-time one: on a fresh RPi4 /data
+(2026-09-24) bluetooth_on came up 1 and `cmd overlay lookup` resolved
+def_bluetooth_on to true.
+
+Add DomaSettingsProviderRRO, a product RRO at priority 1 that holds
+only def_bluetooth_on=false. Static overlays are applied in partition
+order and then by priority, and Car's RRO is in product with none, so
+this one is applied after it; a vendor RRO would lose whatever its
+priority. The device overlay's own def_bluetooth_on, which never took
+effect, goes, and so do the notes around it, including the one about a
+guest with no Bluetooth transport, which DomD's HCI proxy has since
+provided. That overlay now overrides two values, the animation scales.
+
+Nothing forces Bluetooth back on: the boot path and BluetoothPowerPolicy
+restore the saved state only.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
+---
+ DomaSettingsProviderRRO/Android.bp            |  24 ++
+ DomaSettingsProviderRRO/AndroidManifest.xml   |  12 +
+ .../res/values/defaults.xml                   |  10 +
+ aosp_xenvm_trout_rpi4_arm64.mk                | 119 +++++-
+ audio/audio_policy_configuration.xml          | 353 ++++++++++++++++++
+ .../bluetooth_audio_policy_configuration.xml  |  65 ++++
+ .../SettingsProvider/res/values/defaults.xml  |  27 +-
+ 7 files changed, 578 insertions(+), 32 deletions(-)
+ create mode 100644 DomaSettingsProviderRRO/Android.bp
+ create mode 100644 DomaSettingsProviderRRO/AndroidManifest.xml
+ create mode 100644 DomaSettingsProviderRRO/res/values/defaults.xml
+ create mode 100644 audio/audio_policy_configuration.xml
+ create mode 100644 audio/bluetooth_audio_policy_configuration.xml
+
+diff --git a/DomaSettingsProviderRRO/Android.bp b/DomaSettingsProviderRRO/Android.bp
+new file mode 100644
+index 0000000..f6ce4aa
+--- /dev/null
++++ b/DomaSettingsProviderRRO/Android.bp
+@@ -0,0 +1,24 @@
++// SPDX-License-Identifier: Apache-2.0
++//
++// DomaSettingsProviderRRO -- Bluetooth starts off on a fresh /data.
++//
++// SettingsProvider seeds Settings.Global bluetooth_on from def_bluetooth_on once, on the
++// first boot of an empty /data, and the Settings toggle keeps the user's choice from
++// then on. CarSettingsProviderConfigRRO sets def_bluetooth_on=true
++// (packages/services/Car/car_product/rro/overlay-config/SettingsProviderRRO/res/values/
++// defaults.xml:24), and a build-time DEVICE_PACKAGE_OVERLAYS value loses to any runtime
++// overlay: on a fresh RPi4 /data (2026-09-24) bluetooth_on came up 1 and
++// `cmd overlay lookup` resolved def_bluetooth_on to true, with the device overlay saying
++// false.
++//
++// Static overlays are applied in partition order (PackagePartitions: system, vendor, odm,
++// oem, product, system_ext) and, within one partition, by android:priority
++// (OverlayConfig.java, sStaticOverlayComparator); the last one applied wins. Car's RRO is
++// in product with no priority, i.e. 0, so this is a product RRO at priority 1. A vendor
++// RRO would lose whatever its priority. Signed with the platform key, like Car's.
++runtime_resource_overlay {
++    name: "DomaSettingsProviderRRO",
++    resource_dirs: ["res"],
++    certificate: "platform",
++    product_specific: true,
++}
+diff --git a/DomaSettingsProviderRRO/AndroidManifest.xml b/DomaSettingsProviderRRO/AndroidManifest.xml
+new file mode 100644
+index 0000000..2001ce6
+--- /dev/null
++++ b/DomaSettingsProviderRRO/AndroidManifest.xml
+@@ -0,0 +1,12 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: Apache-2.0 -->
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="com.android.providers.settings.doma.overlay">
++
++    <application android:hasCode="false" />
++
++    <overlay
++        android:targetPackage="com.android.providers.settings"
++        android:isStatic="true"
++        android:priority="1" />
++</manifest>
+diff --git a/DomaSettingsProviderRRO/res/values/defaults.xml b/DomaSettingsProviderRRO/res/values/defaults.xml
+new file mode 100644
+index 0000000..029202c
+--- /dev/null
++++ b/DomaSettingsProviderRRO/res/values/defaults.xml
+@@ -0,0 +1,10 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: Apache-2.0 -->
++<!--
++  Applies to a FRESH /data only: SettingsProvider seeds Settings.Global once. On a board
++  that is already provisioned, turn Bluetooth off once in Settings (or run
++  `svc bluetooth disable`); the choice persists in /data from then on.
++-->
++<resources>
++    <bool name="def_bluetooth_on">false</bool>
++</resources>
+diff --git a/aosp_xenvm_trout_rpi4_arm64.mk b/aosp_xenvm_trout_rpi4_arm64.mk
+index 5d591dc..510d299 100644
+--- a/aosp_xenvm_trout_rpi4_arm64.mk
++++ b/aosp_xenvm_trout_rpi4_arm64.mk
+@@ -11,8 +11,9 @@
+ # The inherit has to come first for PRODUCT_* : the upstream makefile ends with its own
+ # PRODUCT_NAME / PRODUCT_DEVICE / PRODUCT_MODEL assignments, so ours have to be written
+ # after it to win. (The one PRODUCT_COPY_FILES line above the inherit is the opposite
+-# case on purpose; its comment says why.) The block below is the exact opposite and has
+-# to come BEFORE, for a reason worth spelling out because it is easy to get backwards:
++# case on purpose; its comment says why.) The LOCAL_* block below is the exact
++# opposite and has to come BEFORE, for a reason worth spelling out because it is easy
++# to get backwards:
+ #
+ #   $(call inherit-product) does not include anything at the point it appears. It only
+ #   pushes an $(INHERIT_TAG)<path> marker onto every product variable
+@@ -21,6 +22,66 @@
+ #   :190 and only then recurses into that parent's own inherits at :201. Evaluation
+ #   order is therefore leaf -> epam -> trout -> cuttlefish. Anything a parent guards
+ #   with ?= or ifndef can be pre-empted by assigning it here, above the inherit.
++#
++#   LOCAL_* audio variables are also plain global Make variables, not entries in
++#   _product_var_list, so clear-var-list in node_fns.mk never resets them and the value
++#   set here survives all the way into trout's file.
++
++# ---------------------------------------------------------------------------
++# Audio policy: give Bluetooth a module that actually exists.
++#
++# device/google/trout/aosp_trout_common.mk:44 wraps its copy list in
++# `ifndef LOCAL_AUDIO_PRODUCT_COPY_FILES`, so defining it here replaces trout's
++# list wholesale. Four differences from trout's five entries:
++#
++#   * audio_policy_configuration.xml comes from this device dir instead of
++#     device/google/trout/product_files/. It is a fork whose header documents both
++#     changes; the short version is that trout includes
++#     a2dp_audio_policy_configuration.xml, whose module is named "a2dp", and
++#     audio.a2dp.default does not exist anywhere in AOSP 17. The implementation is
++#     audio.bluetooth.default now and its module name is "bluetooth". Left alone,
++#     Bluetooth pairs and connects and media routes "successfully" while nothing
++#     comes out of the speaker.
++#
++#   * a2dp_audio_policy_configuration.xml is dropped and
++#     bluetooth_audio_policy_configuration.xml (also a local fork, so the SCO/HFP
++#     ports can be added in one place later) is copied instead. The non-_7_0
++#     variant is REQUIRED: the top-level document is version="1.0" and lists
++#     samplingRates comma-separated, while the _7_0 files use spaces.
++#
++#   * The three XIncludes trout references but never ships
++#     (r_submix_audio_policy_configuration.xml, audio_policy_volumes.xml,
++#     default_volume_tables.xml) ARE SHIPPED HERE.
++#
++#     The bug they caused: Serializer.cpp:869-871 only ALOGEs a failed XInclude and
++#     carries on, and EngineBase.cpp:133-142 then fell back to gDefaultVolumeGroups
++#     ("No legacy volume group found, using default music group"), because
++#     parseLegacyVolumes() reads the <volumes> section of this very file
++#     (EngineConfig.cpp:859-867). So the guest ran with ONE volume group and no
++#     r_submix module, while audio.r_submix.default.so was installed all along and
++#     merely absent from the policy.
++#
++#     THIS CHANGES AUDIO BEHAVIOUR ON PURPOSE. The guest gains the real legacy
++#     volume curves in place of the single fallback group, and r_submix becomes
++#     reachable. Verify on the board that the media volume slider still behaves on
++#     the HDMI bus outputs, and that "No legacy volume group found" no longer
++#     appears; `dumpsys audio` before and after is the comparison.
++#
++#     All three come from frameworks/av/services/audiopolicy/config/, i.e. exactly
++#     the files the forked XML's xi:includes already name -- no fork needed.
++#
++#   * car_audio_configuration.xml, android.hardware.broadcastradio.xml and
++#     usb_audio_policy_configuration.xml are unchanged from trout, and are
++#     restated because defining the variable replaces the whole list.
++LOCAL_AUDIO_PRODUCT_COPY_FILES := \
++    device/sodev/xenvm-cf/audio/audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_configuration.xml \
++    device/sodev/xenvm-cf/audio/bluetooth_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/bluetooth_audio_policy_configuration.xml \
++    device/google/trout/product_files/vendor/etc/car_audio_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/car_audio_configuration.xml \
++    frameworks/native/data/etc/android.hardware.broadcastradio.xml:system/etc/permissions/android.hardware.broadcastradio.xml \
++    frameworks/av/services/audiopolicy/config/usb_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/usb_audio_policy_configuration.xml \
++    frameworks/av/services/audiopolicy/config/r_submix_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/r_submix_audio_policy_configuration.xml \
++    frameworks/av/services/audiopolicy/config/audio_policy_volumes.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_volumes.xml \
++    frameworks/av/services/audiopolicy/config/default_volume_tables.xml:$(TARGET_COPY_OUT_VENDOR)/etc/default_volume_tables.xml
+ 
+ # ---------------------------------------------------------------------------
+ # Vulkan: hand the loader a Venus ICD it can actually find.
+@@ -115,10 +176,9 @@ PRODUCT_VENDOR_PROPERTIES += \
+ PRODUCT_COPY_FILES += \
+     device/sodev/xenvm-cf/init.xenvm-buried-eth0.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/init.xenvm-buried-eth0.rc
+ 
+-# Settings.Global defaults for a fresh userdata: Bluetooth off (no transport in this
+-# guest, and com.android.bluetooth crash-loops without one) and window/transition
+-# animations off (the device model, not the GPU, pays for them). The overlay file
+-# carries the measurements and the runtime equivalents for an existing /data.
++# Settings.Global defaults for a fresh userdata: window/transition animations off (the
++# device model, not the GPU, pays for them). The overlay file carries the measurements
++# and the runtime equivalents for an existing /data.
+ DEVICE_PACKAGE_OVERLAYS += device/sodev/xenvm-cf/overlay
+ 
+ # Shadow-AP Wi-Fi: simulated radios in this guest beaconing the SSIDs DomD really
+@@ -178,6 +238,48 @@ PRODUCT_COPY_FILES += \
+ #   WifiActiveModeWarden: ClientModeManager start failed!
+ PRODUCT_PACKAGES += wificond
+ 
++# ---------------------------------------------------------------------------
++# Bluetooth audio (A2DP). The HCI transport is separate and lives in DomD; this is
++# only the path from AudioFlinger to the Bluetooth stack, and without it the HAL can
++# be perfect and there will still be no sound.
++#
++# AOSP 17 needs BOTH halves, in the same process, and this image had NEITHER:
++#
++#   audio.bluetooth.default            the HW module AudioFlinger loads from
++#                                      /vendor/lib64/hw/. Module name "bluetooth",
++#                                      which is what the forked policy XML above
++#                                      declares.
++#   android.hardware.bluetooth.audio-impl
++#                                      the AIDL IBluetoothAudioProviderFactory the
++#                                      Bluetooth stack talks to. It is dlopened by
++#                                      the HIDL audio HAL service we already ship:
++#                                      hardware/interfaces/audio/common/all-versions/
++#                                      default/service/service.cpp:136-145 lists it
++#                                      in optionalInterfaceSharedLibs. So staying on
++#                                      the HIDL audio HAL costs nothing here.
++#
++# libbluetooth_audio_session{,_aidl} are the in-process glue between the two and come
++# in automatically as shared_libs; no explicit entry needed.
++#
++# No SELinux work: plat_service_contexts already labels
++# android.hardware.bluetooth.audio.IBluetoothAudioProviderFactory/default as
++# hal_audio_service, and system/sepolicy/private/bluetooth.te already grants
++# `find` on it plus hal_client_domain(bluetooth, hal_audio). No VINTF work either:
++# hardware/interfaces/bluetooth/audio/aidl/default/Android.bp declares
++# vintf_fragments, so the manifest fragment installs itself.
++#
++# audio.bluetooth.default carries visibility: ["//device/generic/goldfish/hals/audio"],
++# which does NOT block this. Soong visibility is only enforced on module DEPENDENCIES
++# (build/soong/android/visibility.go:552, "depends on %s which is not visible"), and
++# PRODUCT_PACKAGES is a Make-level install request. yukawa, hikey and dragonboard all
++# install it exactly like this.
++#
++# Reference product for the whole shape (HIDL primary HAL + Bluetooth audio):
++# device/amlogic/yukawa/device.mk:163-174.
++PRODUCT_PACKAGES += \
++    android.hardware.bluetooth.audio-impl \
++    audio.bluetooth.default
++
+ # ---------------------------------------------------------------------------
+ # WHY DomaWifiRelay. It is the ONLY component that can learn the passphrase the user
+ # types on the AAOS Wi-Fi screen. The shadow AP on wlan2 validates that passphrase
+@@ -215,3 +317,8 @@ PRODUCT_PACKAGES += wificond
+ # DomaWifiRelay/privapp_allowlist_com.android.xt.domawifirelay.xml.
+ PRODUCT_PACKAGES += \
+     DomaWifiRelay
++
++# Bluetooth off on a fresh userdata. A runtime overlay, not the one above: Car's own RRO
++# sets def_bluetooth_on=true and outranks any build-time overlay. The ordering that makes
++# this one win is in its Android.bp.
++PRODUCT_PACKAGES += DomaSettingsProviderRRO
+diff --git a/audio/audio_policy_configuration.xml b/audio/audio_policy_configuration.xml
+new file mode 100644
+index 0000000..cc79420
+--- /dev/null
++++ b/audio/audio_policy_configuration.xml
+@@ -0,0 +1,353 @@
++<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
++<!-- Copyright (C) 2018 The Android Open Source Project
++
++     Licensed under the Apache License, Version 2.0 (the "License");
++     you may not use this file except in compliance with the License.
++     You may obtain a copy of the License at
++
++          http://www.apache.org/licenses/LICENSE-2.0
++
++     Unless required by applicable law or agreed to in writing, software
++     distributed under the License is distributed on an "AS IS" BASIS,
++     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++     See the License for the specific language governing permissions and
++     limitations under the License.
++-->
++
++<!--
++     SPDX-License-Identifier: Apache-2.0
++
++     FORKED from device/google/trout/product_files/vendor/etc/audio_policy_configuration.emulator.xml
++     for aosp_xenvm_trout_rpi4_arm64. Two changes, both load-bearing; everything
++     else is byte-identical to trout's file and should stay that way.
++
++     1. The A2dp include is replaced by a "bluetooth" module.
++
++        trout includes a2dp_audio_policy_configuration.xml, whose module is named
++        "a2dp". That name resolves to a HW module audio.a2dp.default, and
++        audio.a2dp.default DOES NOT EXIST anywhere in AOSP 17. The implementation
++        was replaced by audio.bluetooth.default
++        (packages/modules/Bluetooth/system/audio_bluetooth_hw/), whose module name
++        is "bluetooth". So trout's include is dead configuration: the module can
++        never load and AUDIO_DEVICE_OUT_BLUETOOTH_A2DP is unreachable from
++        AudioPolicyManager. Symptom: Bluetooth pairs and connects, media routes
++        "successfully", and nothing comes out of the speaker.
++
++     2. The three xi:includes trout references but never ships have their
++        files copied, so this document's includes all resolve.
++
++        r_submix_audio_policy_configuration.xml, audio_policy_volumes.xml and
++        default_volume_tables.xml are all xi:included below, and
++        trout's LOCAL_AUDIO_PRODUCT_COPY_FILES copies none of them.
++        Serializer.cpp:869-871 only ALOGEs a failed XInclude and carries on, and
++        EngineBase.cpp:133-142 then fell back to gDefaultVolumeGroups, logging "No
++        legacy volume group found, using default music group", because
++        parseLegacyVolumes() reads the volumes section of THIS file
++        (EngineConfig.cpp:859-867). So the guest ran with ONE volume group and no
++        r_submix module, while audio.r_submix.default.so was installed all along
++        and merely absent from the policy.
++
++        The includes themselves are untouched, exactly as trout wrote them. What
++        changed is the copy list in aosp_xenvm_trout_rpi4_arm64.mk. This DOES
++        change audio behaviour: real legacy volume curves replace the single
++        fallback group, and r_submix becomes reachable.
++
++        Measured on the shipped image: all five xi:includes resolve to real
++        files with real content, listed in installed-files-vendor.txt. What is
++        left to check on the board is the media volume slider on the HDMI bus
++        outputs.
++
++     Schema note: this document is version="1.0", so samplingRates lists are
++     COMMA separated. Do not pull in a *_7_0.xml include, because those use spaces
++     and mixing the two is a schema error.
++-->
++<audioPolicyConfiguration version="1.0" xmlns:xi="http://www.w3.org/2001/XInclude">
++    <!-- version section contains a “version” tag in the form “major.minor” e.g version=”1.0” -->
++
++    <!-- Global configuration Decalaration -->
++    <globalConfiguration speaker_drc_enabled="true"/>
++
++    <!-- Modules section:
++        There is one section per audio HW module present on the platform.
++        Each module section will contains two mandatory tags for audio HAL “halVersion” and “name”.
++        The module names are the same as in current .conf file:
++                “primary”, “A2DP”, “remote_submix”, “USB”
++        Each module will contain the following sections:
++        “devicePorts”: a list of device descriptors for all input and output devices accessible via
++        this module.
++        This contains both permanently attached devices and removable devices.
++            "gain": constraints applied to the millibel values:
++                - maxValueMB >= minValueMB
++                - defaultValueMB >= minValueMB && defaultValueMB <= maxValueMB
++                - (maxValueMB - minValueMB) % stepValueMB == 0
++                - (defaultValueMB - minValueMB) % stepValueMB == 0
++        “mixPorts”: listing all output and input streams exposed by the audio HAL
++        “routes”: list of possible connections between input and output devices or between stream
++        and devices.
++            "route": is defined by an attribute:
++                -"type": <mux|mix> means all sources are mutual exclusive (mux) or can be mixed (mix)
++                -"sink": the sink involved in this route
++                -"sources": all the sources than can be connected to the sink via vis route
++        “attachedDevices”: permanently attached devices.
++        The attachedDevices section is a list of devices names. The names correspond to device names
++        defined in <devicePorts> section.
++        “defaultOutputDevice”: device to be used by default when no policy rule applies
++    -->
++    <modules>
++        <!-- Primary Audio HAL -->
++        <module name="primary" halVersion="3.0">
++            <attachedDevices>
++                <!-- One bus per context -->
++                <item>bus0_media_out</item>
++                <item>bus1_navigation_out</item>
++                <item>bus2_voice_command_out</item>
++                <item>bus3_call_ring_out</item>
++                <item>bus4_call_out</item>
++                <item>bus5_alarm_out</item>
++                <item>bus6_notification_out</item>
++                <item>bus7_system_sound_out</item>
++                <!-- names with _audio_zone_# are used for defined an emulator rear seat audio zone
++                     where each number # is the zone id number -->
++                <item>Built-In Mic</item>
++                <item>Built-In Back Mic</item>
++                <item>Echo-Reference Mic</item>
++                <item>FM Tuner</item>
++                <item>Tone Generator 0</item>
++                <item>Tone Generator 1</item>
++            </attachedDevices>
++            <defaultOutputDevice>bus0_media_out</defaultOutputDevice>
++            <mixPorts>
++                <mixPort name="mixport_bus0_media_out" role="source"
++                         flags="AUDIO_OUTPUT_FLAG_PRIMARY">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000"
++                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                </mixPort>
++                <mixPort name="mixport_bus1_navigation_out" role="source">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000"
++                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                </mixPort>
++                <mixPort name="mixport_bus2_voice_command_out" role="source">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000"
++                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                </mixPort>
++                <mixPort name="mixport_bus3_call_ring_out" role="source">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000"
++                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                </mixPort>
++                <mixPort name="mixport_bus4_call_out" role="source">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000"
++                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                </mixPort>
++                <mixPort name="mixport_bus5_alarm_out" role="source">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000"
++                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                </mixPort>
++                <mixPort name="mixport_bus6_notification_out" role="source">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000"
++                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                </mixPort>
++                <mixPort name="mixport_bus7_system_sound_out" role="source">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000"
++                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                </mixPort>
++                <mixPort name="primary input" role="sink">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
++                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK"/>
++                </mixPort>
++                <mixPort name="mixport_tuner0" role="sink">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000"
++                             channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
++                </mixPort>
++                <mixPort name="mixport_input_bus_tone_zone_0" role="sink">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000"
++                             channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
++                </mixPort>
++                <mixPort name="mixport_input_bus_tone_zone_1" role="sink">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000"
++                             channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
++                </mixPort>
++            </mixPorts>
++            <devicePorts>
++                <devicePort tagName="bus0_media_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
++                            address="bus0_media_out">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                    <gains>
++                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
++                              minValueMB="-3200" maxValueMB="600"
++                              defaultValueMB="0" stepValueMB="100"/>
++                    </gains>
++                </devicePort>
++                <devicePort tagName="bus1_navigation_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
++                        address="bus1_navigation_out">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                    <gains>
++                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
++                              minValueMB="-3200" maxValueMB="600"
++                              defaultValueMB="0" stepValueMB="100"/>
++                    </gains>
++                </devicePort>
++                <devicePort tagName="bus2_voice_command_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
++                            address="bus2_voice_command_out">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                    <gains>
++                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
++                              minValueMB="-3200" maxValueMB="600"
++                              defaultValueMB="0" stepValueMB="100"/>
++                    </gains>
++                </devicePort>
++                <devicePort tagName="bus3_call_ring_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
++                            address="bus3_call_ring_out">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                    <gains>
++                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
++                              minValueMB="-3200" maxValueMB="600"
++                              defaultValueMB="0" stepValueMB="100"/>
++                    </gains>
++                </devicePort>
++                <devicePort tagName="bus4_call_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
++                            address="bus4_call_out">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                    <gains>
++                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
++                              minValueMB="-3200" maxValueMB="600"
++                              defaultValueMB="0" stepValueMB="100"/>
++                    </gains>
++                </devicePort>
++                <devicePort tagName="bus5_alarm_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
++                            address="bus5_alarm_out">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                    <gains>
++                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
++                              minValueMB="-3200" maxValueMB="600"
++                              defaultValueMB="0" stepValueMB="100"/>
++                    </gains>
++                </devicePort>
++                <devicePort tagName="bus6_notification_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
++                            address="bus6_notification_out">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                    <gains>
++                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
++                              minValueMB="-3200" maxValueMB="600"
++                              defaultValueMB="0" stepValueMB="100"/>
++                    </gains>
++                </devicePort>
++                <devicePort tagName="bus7_system_sound_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
++                            address="bus7_system_sound_out">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++                    <gains>
++                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
++                              minValueMB="-3200" maxValueMB="600"
++                              defaultValueMB="0" stepValueMB="100"/>
++                    </gains>
++                </devicePort>
++                <devicePort tagName="Built-In Mic" type="AUDIO_DEVICE_IN_BUILTIN_MIC" role="source"
++                    address="Built-In Mic" >
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
++                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK"/>
++                </devicePort>
++                <devicePort tagName="Built-In Back Mic" type="AUDIO_DEVICE_IN_BACK_MIC"
++                            role="source" address="Built-In Back Mic">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
++                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK"/>
++                </devicePort>
++                <devicePort tagName="Echo-Reference Mic" type="AUDIO_DEVICE_IN_ECHO_REFERENCE" role="source"
++                            address="Echo-Reference Mic">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
++                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK"/>
++                </devicePort>
++                <devicePort tagName="FM Tuner" type="AUDIO_DEVICE_IN_FM_TUNER" role="source"
++                            address="tuner0">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
++                    <gains>
++                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
++                              minValueMB="-3200" maxValueMB="600" defaultValueMB="0" stepValueMB="100"/>
++                    </gains>
++                </devicePort>
++                <devicePort tagName="Tone Generator 0" type="AUDIO_DEVICE_IN_BUS" role="source"
++                            address="input_bus_tone_zone_0">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
++                    <gains>
++                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
++                              minValueMB="-3200" maxValueMB="600"
++                              defaultValueMB="0" stepValueMB="100"/>
++                    </gains>
++                </devicePort>
++                <devicePort tagName="Tone Generator 1" type="AUDIO_DEVICE_IN_BUS" role="source"
++                            address="input_bus_tone_zone_1">
++                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
++                    <gains>
++                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
++                              minValueMB="-3200" maxValueMB="600"
++                              defaultValueMB="0" stepValueMB="100"/>
++                    </gains>
++                </devicePort>
++            </devicePorts>
++            <!-- route declaration, i.e. list all available sources for a given sink -->
++            <routes>
++                <route type="mix" sink="bus0_media_out" sources="mixport_bus0_media_out"/>
++                <route type="mix" sink="bus1_navigation_out" sources="mixport_bus1_navigation_out"/>
++                <route type="mix" sink="bus2_voice_command_out"
++                       sources="mixport_bus2_voice_command_out"/>
++                <route type="mix" sink="bus3_call_ring_out" sources="mixport_bus3_call_ring_out"/>
++                <route type="mix" sink="bus4_call_out" sources="mixport_bus4_call_out"/>
++                <route type="mix" sink="bus5_alarm_out" sources="mixport_bus5_alarm_out"/>
++                <route type="mix" sink="bus6_notification_out"
++                       sources="mixport_bus6_notification_out"/>
++                <route type="mix" sink="bus7_system_sound_out"
++                       sources="mixport_bus7_system_sound_out"/>
++                <route type="mix" sink="primary input"
++                       sources="Built-In Mic,Built-In Back Mic,Echo-Reference Mic"/>
++                <route type="mix" sink="mixport_tuner0" sources="FM Tuner"/>
++                <route type="mix" sink="mixport_input_bus_tone_zone_0" sources="Tone Generator 0"/>
++                <route type="mix" sink="mixport_input_bus_tone_zone_1" sources="Tone Generator 1"/>
++            </routes>
++
++        </module>
++
++        <!-- Bluetooth Audio HAL -->
++        <xi:include href="bluetooth_audio_policy_configuration.xml"/>
++
++        <!-- Usb Audio HAL -->
++        <xi:include href="usb_audio_policy_configuration.xml"/>
++
++        <!-- Remote Submix Audio HAL -->
++        <xi:include href="r_submix_audio_policy_configuration.xml"/>
++
++    </modules>
++    <!-- End of Modules section -->
++
++    <!-- Volume section -->
++
++    <xi:include href="audio_policy_volumes.xml"/>
++    <xi:include href="default_volume_tables.xml"/>
++
++    <!-- End of Volume section -->
++    <!-- End of Modules section -->
++
++</audioPolicyConfiguration>
+diff --git a/audio/bluetooth_audio_policy_configuration.xml b/audio/bluetooth_audio_policy_configuration.xml
+new file mode 100644
+index 0000000..35ba73c
+--- /dev/null
++++ b/audio/bluetooth_audio_policy_configuration.xml
+@@ -0,0 +1,65 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!-- Bluetooth Audio HAL Audio Policy Configuration file -->
++<!--
++     SPDX-License-Identifier: Apache-2.0
++
++     FORKED from frameworks/av/services/audiopolicy/config/bluetooth_audio_policy_configuration.xml
++     for aosp_xenvm_trout_rpi4_arm64.
++
++     The content is upstream's, unchanged. It is a local copy so that the
++     hands-free (SCO) ports can be added in one place.
++
++     WHY IT IS INCLUDED AT ALL. trout's audio_policy_configuration.emulator.xml
++     includes a2dp_audio_policy_configuration.xml instead, whose module is named
++     "a2dp". That resolves to a HW module audio.a2dp.default, which does not exist
++     in AOSP 17: the implementation is now audio.bluetooth.default
++     (packages/modules/Bluetooth/system/audio_bluetooth_hw/) and its module name is
++     "bluetooth". See the header of the forked audio_policy_configuration.xml next
++     to this file.
++
++     The 1.0 schema is deliberate: the parent document is version="1.0", so
++     samplingRates are COMMA separated here. The *_7_0.xml variant uses spaces and
++     cannot be mixed in.
++-->
++<module name="bluetooth" halVersion="2.0">
++    <mixPorts>
++        <!-- A2DP Audio Ports -->
++        <mixPort name="a2dp output" role="source"/>
++        <!-- Hearing AIDs Audio Ports -->
++        <mixPort name="hearing aid output" role="source">
++            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                     samplingRates="24000,16000"
++                     channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++        </mixPort>
++    </mixPorts>
++    <devicePorts>
++        <!-- A2DP Audio Ports -->
++        <devicePort tagName="BT A2DP Out" type="AUDIO_DEVICE_OUT_BLUETOOTH_A2DP" role="sink">
++            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                     samplingRates="44100,48000,88200,96000"
++                     channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++        </devicePort>
++        <devicePort tagName="BT A2DP Headphones" type="AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES" role="sink">
++            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                     samplingRates="44100,48000,88200,96000"
++                     channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++        </devicePort>
++        <devicePort tagName="BT A2DP Speaker" type="AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER" role="sink">
++            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
++                     samplingRates="44100,48000,88200,96000"
++                     channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
++        </devicePort>
++        <!-- Hearing AIDs Audio Ports -->
++        <devicePort tagName="BT Hearing Aid Out" type="AUDIO_DEVICE_OUT_HEARING_AID" role="sink"/>
++    </devicePorts>
++    <routes>
++        <route type="mix" sink="BT A2DP Out"
++               sources="a2dp output"/>
++        <route type="mix" sink="BT A2DP Headphones"
++               sources="a2dp output"/>
++        <route type="mix" sink="BT A2DP Speaker"
++               sources="a2dp output"/>
++        <route type="mix" sink="BT Hearing Aid Out"
++               sources="hearing aid output"/>
++    </routes>
++</module>
+diff --git a/overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml b/overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml
+index 515fecf..3b6dae6 100644
+--- a/overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml
++++ b/overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml
+@@ -2,7 +2,7 @@
+ <!--
+   SPDX-License-Identifier: Apache-2.0
+ 
+-  Product overlay for SettingsProvider's Settings.Global defaults. Only the three
++  Product overlay for SettingsProvider's Settings.Global defaults. Only the two
+   values below are overridden; everything else keeps the AOSP default, because a
+   DEVICE_PACKAGE_OVERLAYS resource file is merged per resource name rather than
+   swapped in whole.
+@@ -11,35 +11,11 @@
+   Settings.Global once, on the first boot of an empty /data. On a board whose
+   /data is already provisioned, set the same values live instead:
+ 
+-      settings put global bluetooth_on 0        (or: svc bluetooth disable)
+       settings put global window_animation_scale 0
+       settings put global transition_animation_scale 0
+       settings put global animator_duration_scale 0    (no resource default
+                                                         exists; runtime only)
+ 
+-  def_bluetooth_on=false  (DOES NOT TAKE EFFECT ON AAOS; kept for the record)
+-    Measured on a fresh userdata, 2026-08-18 on the RPi5 P4 image: the two animation
+-    scales below came up at 0.0 as intended, but bluetooth_on was still 1. AAOS ships
+-    CarSettingsProviderConfigRRO (packages/services/Car/car_product/rro/
+-    overlay-config/SettingsProviderRRO/res/values/defaults.xml line 24) which sets
+-    def_bluetooth_on=true, and a runtime resource overlay outranks a build-time
+-    DEVICE_PACKAGE_OVERLAYS resource. Beating it would mean shipping our own RRO with
+-    a higher priority; until someone does, turn Bluetooth off at run time:
+-      svc bluetooth disable        (persists in /data)
+-    The value below is left in place because it is correct for a non-automotive
+-    product and because removing it would hide why the runtime step is needed.
+-
+-    There is no Bluetooth transport in this guest. AAOS brings the adapter up
+-    anyway, the HAL never becomes ready, and com.android.bluetooth crash loops:
+-    measured on hardware 2026-08-18 it restarted about every 44 s, each time
+-    running crash_dump64 and writing a tombstone to /data, which reaches the SD
+-    through DomD's device model, so the cost lands on the whole cockpit. The
+-    console shows the framework giving up on it:
+-      GceEventReporter: VIRTUAL_DEVICE_BOOT_FAILED: Dependencies not ready
+-                        after 10 checks: Bluetooth
+-    Leaving the adapter off stops the loop. The packages stay installed, so
+-    turning Bluetooth on by hand still works if a transport is ever added.
+-
+   def_window_animation_scale / def_window_transition_scale = 0%
+     Window and transition animations are pure compositor work on a platform whose
+     GPU is not the bottleneck: with three Settings/Home transitions driven in a
+@@ -54,7 +30,6 @@
+   this block uses none.
+ -->
+ <resources>
+-    <bool name="def_bluetooth_on">false</bool>
+     <fraction name="def_window_animation_scale">0%</fraction>
+     <fraction name="def_window_transition_scale">0%</fraction>
+ </resources>

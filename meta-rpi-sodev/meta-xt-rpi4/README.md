@@ -174,11 +174,12 @@ fetch; the Pi 5 checkout has no such project and skips it.
 `meta-xt-common/meta-xt-doma/stage-aosp-device.sh` no longer copies anything for this
 board; `build.sh` still runs it between `ninja fetch-doma` and `ninja doma`, where it
 checks that the project, its board config and the two installed files are present and
-that `DomaWifiRelay` is defined by exactly one `Android.bp` under `device/`. A forgotten
-group flag otherwise surfaces as `lunch` reporting "Can't find a product spec", which
-points at neither the manifest nor the flag. Nothing under
-`device/epam/aosp-xenvm-trout` is modified either way, so `repo sync` has nothing to
-reset and the pinned manifest revision can move without the change rotting.
+that `DomaWifiRelay` and `DomaSettingsProviderRRO` are each defined by exactly one
+`Android.bp` under `device/`. A forgotten group flag otherwise surfaces as `lunch`
+reporting "Can't find a product spec", which points at neither the manifest nor the
+flag. Nothing under `device/epam/aosp-xenvm-trout` is modified either way, so
+`repo sync` has nothing to reset and the pinned manifest revision can move without the
+change rotting.
 
 Two consequences worth knowing:
 
@@ -231,8 +232,10 @@ The Yocto-built DomD host services need no equivalent: meta-raspberrypi's own
   **(1)** DomD's bootargs carry `quiet loglevel=3`, so even `Waiting for root device`
   is invisible and the domain looks like it hung with no output at all — rebuild
   `boot.scr` with `ignore_loglevel` (a bare `loglevel=N` is overridden by the trailing
-  `quiet loglevel=3`) and add `earlycon=pl011,0xfe201000 keep_bootcon`, or nothing
-  reaches the console before the pl011 driver probes. **(2)** `sdhci` prints the
+  `quiet loglevel=3`) and add `earlycon=pl011,0x22000000 keep_bootcon` (DomD's
+  vpl011 while Xen's console is the mini UART; 0xfe201000 is the Bluetooth UART
+  passed through to DomD), or nothing reaches the console before the pl011
+  driver probes. **(2)** `sdhci` prints the
   register dump and the ADMA descriptor table with `SDHCI_DUMP`, which is `pr_debug`,
   and this kernel has `CONFIG_DYNAMIC_DEBUG` off — so `ADMA error: 0x%08x` is all you
   get. The `dma-ranges` mismatch was found by reading the live host DT instead.
@@ -298,7 +301,7 @@ The Yocto-built DomD host services need no equivalent: meta-raspberrypi's own
 ```
 BCM2711-DT-TRUTH.md                     measured host DT — the source of every value
 conf/layer.conf                         collection xt-rpi4, priority 10
-recipes-bsp/bootfiles/                  config.txt: armstub, GIC, disable-bt, gpu_mem, v3d_freq
+recipes-bsp/bootfiles/                  config.txt: armstub, GIC, UART+BT pins, gpu_mem, v3d_freq
 recipes-bsp/trusted-firmware-a/         PLAT=rpi4, target bl31 (bl31.bin is itself the armstub)
 recipes-bsp/u-boot/                     CONFIG_BCM2711_64B, NR_DRAM_BANKS=8, >4 GiB mapping
 recipes-bsp/xt-rpi-u-boot-scr/          static board-tuned boot.cmd per Dom0 flavour

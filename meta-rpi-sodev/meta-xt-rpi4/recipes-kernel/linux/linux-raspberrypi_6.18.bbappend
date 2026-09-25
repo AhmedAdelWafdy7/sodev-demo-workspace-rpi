@@ -113,8 +113,9 @@ RPI_KERNEL_DEVICETREE:append = " \
 # boots through. rouge then failed at image-assembly time with
 #     Can't find file '.../bcm2711-raspberrypi4-64-xen.dtbo'
 # and the same would have happened for domd.dtb, the four passthrough overlays and
-# — critically for the Xen console — overlays/disable-bt.dtbo, which config.txt
-# names and which lives in RPI_KERNEL_DEVICETREE_OVERLAYS.
+# overlays/disable-bt.dtbo, which rpi4-sodev.yaml carries as a p1 boot item (the
+# rollback path for the UART assignment) and which lives in
+# RPI_KERNEL_DEVICETREE_OVERLAYS.
 #
 # There is no RPi5 equivalent of this: meta-virtualization ships no
 # xen-raspberrypi5.inc, so nothing overrides rpi-base.inc there.
