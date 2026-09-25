@@ -72,13 +72,14 @@ variables:
   # only exists in the --DOM0_OS zephyr flavour, and DomZ must build in both. The
   # manifest is the same repository as Dom0's (it is what pins xen-troops/zephyr,
   # the tree that carries the xenvm board), but the application built out of it is
-  # this repo's domz/app, referenced by a workspace-relative path: moulin's zephyr
-  # builder runs `west build ... $target` from inside the component build-dir, so a
-  # target outside the workspace is simply a relative path. That keeps the DomZ
-  # application versioned here while the Zephyr checkout stays pristine.
+  # this repo's meta-xt-domz/zephyr-apps/domz, referenced by a workspace-relative
+  # path: moulin's zephyr builder runs `west build ... $target` from inside the
+  # component build-dir, so a target outside the workspace is simply a relative
+  # path. That keeps the DomZ application versioned here, next to the xl config
+  # that starts it, while the Zephyr checkout stays a pristine west checkout.
   ZEPHYR_DOMZ_DIR: "zephyr-domz"
   ZEPHYR_DOMZ_MACHINE: "xenvm"      # Zephyr's Xen-guest board (GICv2, Xen PV console)
-  ZEPHYR_DOMZ_APP: "../domz/app"
+  ZEPHYR_DOMZ_APP: "../meta-rpi-sodev/meta-xt-common/meta-xt-domz/zephyr-apps/domz"
   # Named after the board even though the guest is board-independent (`xenvm`, so the
   # two boards produce the same image): moulin's zephyr builder does not build pristine,
   # and a shared directory would hand whichever board ran last its predecessor's CMake
