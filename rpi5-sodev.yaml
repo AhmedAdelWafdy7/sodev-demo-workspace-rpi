@@ -26,6 +26,10 @@ variables:
   DOMU_BUILD_DIR: "build-domu"
   MACHINE: "raspberrypi5"
   SOC_FAMILY: "bcm2712"
+  # BCM2712 D0 boards only: TF-A is built with the D0 pin controller tables
+  # (meta-xt-rpi5/recipes-bsp/trusted-firmware-a/trusted-firmware-a_git.bb). The
+  # firmware applies overlays/bcm2712d0.dtbo, a p1 boot item below, on D0 boards
+  # only and ignores it on C0.
   DOM0_OS: "zephyr"          # default zephyr; overridable: --DOM0_OS {zephyr|linux}
   BOARD_RAM: "16g"           # default 16g (16 GB board); overridable: --BOARD_RAM {16g|8g}
 
@@ -61,6 +65,11 @@ variables:
   XT_XEN_DTBO_NAME: "%{SOC_FAMILY}-%{MACHINE}-xen.dtbo"
   XT_DOMD_DTB_NAME: "%{SOC_FAMILY}-%{MACHINE}-domd.dtb"
   XEN_DT_SCMI_NAME: "%{SOC_FAMILY}-%{MACHINE}-xen-scmi"
+  # meta-xt-rpi5 own host overlay that publishes the TF-A SCMI server to Xen.
+  # Distinct from XEN_DT_SCMI_NAME above (the meta-xt-driver-domain / EPAM one,
+  # which flips the root node to #size-cells=<1> and uses the downstream property
+  # name xen,arm_sci); see that .dtso header.
+  XT_SCMI_HOST_DTBO_NAME: "%{SOC_FAMILY}-%{MACHINE}-scmi-host.dtbo"
   # DomD = V4H sodev pattern (weston + qemu virtio-gpu backend + xen-tools-devd +
   #   V4H helpers) so the DomU/DomA -> DomD weston -> HDMI display chain renders.
   #   The -v4h recipe lives in the linux-dom0-poc layer (added to the domd
@@ -99,27 +108,31 @@ variables:
   # "../%{ANDROID_KERNEL_DIR}/..." form now fails soong analysis. Not under device/: that is
   # repo-managed and `repo sync` would delete the copy.
   ANDROID_KERNEL_STAGE_DIR: "xt-doma-kernel"
-  ANDROID_DEVICE: "xenvm_trout_arm64"
+  ANDROID_DEVICE: "xenvm_trout_rpi5_arm64"
   # The lunch target is this tree's own product, staged by
   # meta-xt-doma/stage-aosp-device.sh into device/agl/xenvm-trout-rpi5/, not the
-  # upstream aosp_xenvm_trout_arm64. It exists for exactly one line -- the
+  # upstream aosp_xenvm_trout_arm64. One of the lines it adds is the
   # PRODUCT_COPY_FILES that puts init.xenvm-buried-eth0.rc into vendor/, without which
   # minradio never completes a data call and retries setupDataCall at 7-13 Hz (186 % of
   # a physical core measured on the Pi 4, and this board ships the same minradio APEX,
   # the same cuttlefish rename_eth0 service and the same trout property that disables
   # it). device/epam/aosp-xenvm-trout is repo-managed, so the line cannot live there.
   #
-  # This is the arrangement the four-pattern hardware verification ran (2026-08-18).
   # The gated form of that rc -- `on boot && property:ro.boot.xt_buried_eth0=1`, which
   # is what an upstream submission needs so single-NIC guests are unaffected -- is NOT
   # used here, because it has not been run on hardware. It goes upstream to
   # device/epam/aosp-xenvm-trout once the maintainer agrees, and this copy is dropped
   # then.
   #
-  # ANDROID_DEVICE above deliberately does NOT change: the product keeps the upstream
-  # PRODUCT_DEVICE, so it reuses the upstream BoardConfig (one BoardConfig.mk per device
-  # name, which AOSP requires) and out/target/product/xenvm_trout_arm64 stays the same
-  # tree. Contrast rpi4, which needs its own device for cortex-a72.
+  # ANDROID_DEVICE above names this product's OWN device, not the upstream
+  # xenvm_trout_arm64, because DomA features need variables only a
+  # BoardConfig.mk can set, BOARD_VENDOR_SEPOLICY_DIRS for the shadow-AP policy
+  # among them. A product makefile cannot set them. AOSP's board_config.mk
+  # rejects a second BoardConfig.mk for one device name, so owning a
+  # BoardConfig means owning a PRODUCT_DEVICE, which also gives the product
+  # its own output tree
+  # (out/target/product/xenvm_trout_rpi5_arm64). rpi4 has its own device as
+  # well, for its own reason (the cortex-a72 ISA baseline).
   ANDROID_LUNCH_TARGET: "aosp_xenvm_trout_rpi5_arm64-trunk_staging-userdebug"
   # --- DomU (AGL) — informational; actual build is in build.sh ---
   AGL_GUEST_MACHINE: "virtio-aarch64"
@@ -192,6 +205,15 @@ common_data:
     # bitbake via BB_ENV_PASSTHROUGH_ADDITIONS). Empty env = the defaults here.
     - [SSTATE_DIR, "${@os.getenv('XT_SSTATE_DIR') or d.expand('${TOPDIR}/../common_data/sstate')}"]
     - [DL_DIR, "${@os.getenv('XT_DL_DIR') or d.expand('${TOPDIR}/../common_data/downloads')}"]
+    # Keep the hash-equivalence database next to the sstate cache it describes.
+    # Its default is inside the build directory, so two build dirs sharing one
+    # SSTATE_DIR each keep their own view of "these different task hashes produce
+    # the same output" and cannot reuse each other's entries -- bitbake says so
+    # itself, as a WARNING naming this variable, on every build that shares a
+    # cache. Moving it alongside SSTATE_DIR is what makes a shared cache actually
+    # shared. Harmless when the cache is not shared: the database simply lives
+    # one directory further out.
+    - [BB_HASHSERVE_DB_DIR, "${SSTATE_DIR}"]
     # DISTRO. With the poky combo-repo gone, meta-poky's poky.conf is added as an
     # explicit layer (common_yocto_layers) and DISTRO must be set here (the
     # poky-bundle local.conf.sample used to default it).
@@ -862,6 +884,13 @@ components:
         # zephyr flavour. The dom0-linux component sets BOARD_RAM as well, because
         # there the toolstack -- and therefore the doma.cfg that matters -- is Dom0's.
         - [BOARD_RAM, "%{BOARD_RAM}"]
+        # aaos-guest-binaries derives the DomA kernel/ramdisk from the AOSP product out
+        # tree, whose directory name is the PRODUCT_DEVICE. Pass it rather than let the
+        # recipe default (xenvm_trout_arm64) point at the upstream device this board no
+        # longer builds: this board has its own product, xenvm_trout_rpi5_arm64.
+        # AAOS_SRC_TREE / AAOS_KERNEL_TREE are not needed here, because this board's
+        # DOMA_DIR / ANDROID_KERNEL_DIR are the recipe defaults' names.
+        - [AAOS_DEVICE, "%{ANDROID_DEVICE}"]
         # The AOSP build reads the guest kernel from a copy inside its own checkout
         # (Soong will not take a path outside the tree), and that copy is made by a
         # script, not by a ninja edge, so it can go stale without the graph noticing.
@@ -885,6 +914,24 @@ components:
         # appended those patches). See the dom0 component comment.
         - [PREFERRED_VERSION_u-boot, "2024.04"]
         - [XEN_DT_SCMI, "%{XEN_DT_SCMI_NAME}"]
+        # SCMI. One switch for what SCMI needs on this board, which is why it is
+        # a MACHINE_FEATURE and not separate edits:
+        #   trusted-firmware-a -> SCMI_SERVER_SUPPORT=1, i.e. the SCMI server
+        #     (protocol 0x19 pinctrl) is compiled into the armstub.
+        #   linux-raspberrypi_6.18.bbappend -> scmi-config.cfg
+        #     (CONFIG_ARM_SCMI_PROTOCOL + CONFIG_PINCTRL_SCMI; the SMC transport is
+        #     default y once the protocol is on) and the host DT overlay below.
+        # Two more consumers change nothing here:
+        #   xen_4.22.bbappend -> xen-scmi.cfg (CONFIG_ARM_SCI +
+        #     CONFIG_SCMI_SMC), both of which Xen 4.22 already turns on by
+        #     default.
+        #   xt-rpi-u-boot-scr.bbappend -> appends to XEN_OVERLAYS/DOMD_OVERLAYS,
+        #     which the rpi5 static boot.cmd does not consume.
+        #
+        # This is how Wi-Fi and Bluetooth get their pins on this board: DomD
+        # asks TF-A over SCMI, and TF-A programs the pin controller
+        # (pinctrl@7d504100) at EL3.
+        - [MACHINE_FEATURES:append, " scmi"]
         - [PREFERRED_VERSION_linux-raspberrypi, "6.18.%"]
         # meta-xt-qemu provides the xen-troops qemu 7.0.0-xt (xenpv machine +
         # GPEX/pcie.0 + multi-vcpu + the 0110 virtio-pci IOREQ ISR fix) — the
@@ -1007,6 +1054,10 @@ components:
       target_images:
         - "tmp/deploy/images/%{MACHINE}/xen-%{MACHINE}"
         - "tmp/deploy/images/%{MACHINE}/%{XT_XEN_DTBO_NAME}"
+        # Host SCMI overlay. Deployed by the kernel recipe only when the scmi
+        # MACHINE_FEATURE is set, which the local_conf edit above does, so the two
+        # must be changed together or this target does not exist.
+        - "tmp/deploy/images/%{MACHINE}/%{XT_SCMI_HOST_DTBO_NAME}"
         - "tmp/deploy/images/%{MACHINE}/u-boot-%{MACHINE}.bin"
         - "tmp/deploy/images/%{MACHINE}/boot.scr"
         - "tmp/deploy/images/%{MACHINE}/bcm2712-rpi-5-b.dtb"
@@ -1309,6 +1360,8 @@ images:
           # bcm2712d0.dtbo. Matches upstream external/meta-xt-prod-devel-rpi5/rpi5.yaml.
           "overlays/bcm2712d0.dtbo": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/bcm2712d0.dtbo"
           "%{XT_XEN_DTBO_NAME}": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/%{XT_XEN_DTBO_NAME}"
+          # Applied by boot.cmd immediately after the Xen overlay above.
+          "%{XT_SCMI_HOST_DTBO_NAME}": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/%{XT_SCMI_HOST_DTBO_NAME}"
           # [DOM0_OS] The dom0-kernel boot item is supplied per-variant by the DOM0_OS
           # parameter (see `parameters:`): linux -> initramfs-xt-dom0-thin.cpio.gz;
           # zephyr -> zephyr.bin. It is NOT in this common base so only the selected

@@ -1,5 +1,5 @@
 # ============================================================================
-# Xen 4.22 + 30-patch series (hypervisor)
+# Xen 4.22 + 31-patch series (hypervisor)
 # ============================================================================
 # This bbappend attaches to xen_4.22.bb (PV "4.22.0+stable", SRCREV d45d5687f1,
 # branch stable-4.22). It is selected by
@@ -52,6 +52,15 @@
 #              "Panic on CPU 0: Could not set up domain domD (rc = -22)".
 #              Measured on hardware 2026-08-18: without it NO configuration of
 #              this workspace boots on either board.
+#
+#   4.22-0013  xen/arm: Fix evaluation of parameters for SMCCC calls. NOT
+#              board-specific; a backport of stable-4.22 781b60f951 (master
+#              95302b3943), which the pinned SRCREV predates. Without it
+#              scmi_handle_smc() reaches TF-A with the wrong SMCCC function ID
+#              (evaluating the arguments clobbers x0), DomD's arm-scmi fails with
+#              -EOPNOTSUPP, the SCMI pinctrl never registers, and the Wi-Fi SDIO
+#              host and the Bluetooth UART stay in deferred probe: no Wi-Fi and
+#              no Bluetooth on this board. Measured on hardware 2026-09-24.
 # NOTE on ThumbEE: [4.22] no longer relevant. In 4.21 the stock xen_4.21.bb
 # SRC_URI carried 0001-ARM-Drop-ThumbEE-support.patch (Andrew Cooper 5bbe1fe413,
 # binutils/gcc15 fix) and this bbappend documented that it was therefore not
@@ -67,13 +76,13 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # shared dir (meta-xt-common/recipes-extended/xen-common/files) that both this
 # hypervisor bbappend and the xen-tools bbappend point at, so there is a single
 # copy of each -- both SRC_URI lists name those same 28 files. This bbappend adds
-# the two hypervisor-only ones from the same shared dir (0025 and 4.22-0006, both
-# xen/ only, no tools/ hunk), which is why it fetches 30 where the toolstack
-# fetches 28 of the shared set. Only the Kconfig .cfg fragments live in ./files
-# here (alongside the interim recipe's own stock pre-patches).
+# three hypervisor-only ones (xen/ only, no tools/ hunk) -- 0025 from ./files, and
+# 4.22-0006 and 4.22-0013 from the shared dir -- which is why it fetches 31 where
+# the toolstack fetches 28 of the shared set. Only 0025 and the Kconfig .cfg
+# fragments live in ./files here.
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../../meta-xt-common/recipes-extended/xen-common/files:"
 
-# --- 30-patch series (order matters; matches the verified git-apply order) ---
+# --- 31-patch series (order matters; matches the verified git-apply order) ---
 SRC_URI:append = " \
     file://0002-xen-arm-ignore-spurious-interrupts-from-virtual-time.patch \
     file://0003-Adjust-guest-memory-map.patch \
@@ -105,6 +114,7 @@ SRC_URI:append = " \
     file://4.22-0004-vgic-pci-irq-level-race-fix.patch \
     file://4.22-0005-build-honour-external-toolchain-vars.patch \
     file://4.22-0006-dom0less-seed-next-phandle-below-reserved-range.patch \
+    file://4.22-0013-xen-arm-Fix-evaluation-of-parameters-for-SMCCC-calls.patch \
 "
 
 # --- hypervisor Kconfig fragments ---

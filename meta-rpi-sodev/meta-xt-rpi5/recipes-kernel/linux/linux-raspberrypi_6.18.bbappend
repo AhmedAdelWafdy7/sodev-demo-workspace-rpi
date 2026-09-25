@@ -39,6 +39,12 @@ PCIE1_DT_NAME = "${RPI_SOC_FAMILY}-${MACHINE}-pcie1"
 CAN_DT_NAME = "${RPI_SOC_FAMILY}-${MACHINE}-can-${DOMD_CAN_TYPE}"
 HDMI_DT_NAME = "${RPI_SOC_FAMILY}-${MACHINE}-hdmi"
 HDMI_PASSTHROUGH_NAME = "hdmi-passthrough"
+# Host (hypervisor) DT overlay that publishes the TF-A SCMI server to Xen. This is
+# OURS, not the bcm2712-raspberrypi5-xen-scmi.dtso that meta-xt-driver-domain ships:
+# that one flips the ROOT node to #size-cells = <1> and writes the EPAM-downstream
+# property name xen,arm_sci, where upstream Xen reads xen,sci_type. The .dtso header
+# documents both in full.
+SCMI_HOST_DT_NAME = "${RPI_SOC_FAMILY}-${MACHINE}-scmi-host"
 
 
 RPI_KERNEL_DEVICETREE:append = " \
@@ -59,6 +65,10 @@ RPI_KERNEL_DEVICETREE:append = " \
     ${@bb.utils.contains('MACHINE_FEATURES', 'domd_hdmi', \
                           ' broadcom/${HDMI_DT_NAME}.dtbo \
                             broadcom/${HDMI_PASSTHROUGH_NAME}.dtbo ', '', d)} \
+"
+
+RPI_KERNEL_DEVICETREE:append = " \
+    ${@bb.utils.contains('MACHINE_FEATURES', 'scmi', 'broadcom/${SCMI_HOST_DT_NAME}.dtbo', '', d)} \
 "
 
 KERNEL_IMAGETYPES:append = " Image.gz"
@@ -105,6 +115,8 @@ python __anonymous() {
         d.appendVar('SRC_URI', ' file://%s.dtso;%s file://%s.dtso;%s' % (hdmi, subdir, hdmi_pt, subdir))
     if bb.utils.contains('MACHINE_FEATURES', 'scmi', True, False, d):
         d.appendVar('SRC_URI', ' file://scmi-config.cfg')
+        scmi_host = d.getVar('SCMI_HOST_DT_NAME')
+        d.appendVar('SRC_URI', ' file://%s.dtso;%s' % (scmi_host, subdir))
 }
 
 # [P1 fix] Apply the shared Dom0/DomD Image config to the Dom0 build as well.
