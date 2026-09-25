@@ -12,8 +12,15 @@
 /zephyr/
 # DomZ's west workspace. A SECOND one is needed because /zephyr/ only exists in the
 # --dom0=zephyr flavour while DomZ is built in both (see the domz component in
-# rpi5-sodev.yaml). The DomZ application itself is committed, under domz/.
+# rpi5-sodev.yaml). The DomZ application itself is committed, under
+# meta-rpi-sodev/meta-xt-common/meta-xt-domz/zephyr-apps/domz.
 /zephyr-domz/
+
+# Scratch directory of tools/domz-qemu/qemu-xen-domz.sh: the dumped and patched
+# QEMU device trees and the FAT share disk it hands to Dom0. The harness defaults
+# OUT to a directory beside itself, so without this a single run leaves four
+# untracked files inside a tracked tree.
+/tools/domz-qemu/qemu-xen/
 /artifacts/
 /out/
 /full.img

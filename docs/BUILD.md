@@ -204,7 +204,7 @@ Follow *Docker usage* below -- in particular the post-install step that lets you
 `-z` adds a second **west** workspace (`zephyr-domz/`) and one more Zephyr build; it
 costs a few minutes and no Yocto work, so it combines freely with any of the rows
 above. The guest is board-independent (`xenvm`), so the same image is valid under Xen on
-either board — see [`domz/README.md`](../domz/README.md) for what the domain is and how
+either board — see [`meta-xt-domz/README.md`](../meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md) for what the domain is and how
 to bring it up.
 
 The rest of this walkthrough uses the third row, which is the full cockpit on the Zephyr

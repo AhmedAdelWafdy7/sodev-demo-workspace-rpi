@@ -66,7 +66,8 @@ missing DomZ image: $DOMZ_BIN
 
 Build it first (from the west workspace the domz component creates):
   cd $WS/zephyr-domz && source zephyr/zephyr-env.sh
-  west build -p always -b xenvm -d build-domz-rpi5 ../domz/app
+  west build -p always -b xenvm -d build-domz-rpi5 \
+    ../meta-rpi-sodev/meta-xt-common/meta-xt-domz/zephyr-apps/domz
 Or point DOMZ_BIN at a build you already have.
 EOF
     exit 1

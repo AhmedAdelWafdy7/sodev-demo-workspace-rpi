@@ -32,25 +32,30 @@ xl console DomZ                 # Zephyr's Xen PV console, Ctrl-] to leave
 
 ## What is in here
 
+Paths are relative to this layer, except the ones marked as repository-root paths
+(the harness is a developer tool, so it lives in `tools/` with the others). The
+examples that build something start in the repository root.
+
 | Path | What it is |
 |---|---|
-| `app/` | The Zephyr application. Board **`xenvm`** (Zephyr's Xen-guest board: GICv2, guest RAM at 0x40000000, Xen PV console). Built by the moulin `domz` component out of a separate west workspace (`zephyr-domz/`), which is why the application itself lives here rather than in that workspace. |
-| `tools/qemu-xen-domz.sh` | Boots Xen + a minimal Linux Dom0 under QEMU aarch64 so `xl create` can be exercised on a PC. See *Verifying `xl create` on a PC* below. |
-| `tools/meta-domz-qemu/` | The one Yocto layer that harness needs: the Xen dom0 kernel options poky's `features/xen` does not set (`CONFIG_XEN_GNTDEV` above all). |
+| `zephyr-apps/domz/` | The Zephyr application. Board **`xenvm`** (Zephyr's Xen-guest board: GICv2, guest RAM at 0x40000000, Xen PV console). Built by the moulin `domz` component out of a separate west workspace (`zephyr-domz/`, repository root), which is why the application itself lives here rather than in that workspace. |
+| `tools/domz-qemu/qemu-xen-domz.sh` (repository root) | Boots Xen + a minimal Linux Dom0 under QEMU aarch64 so `xl create` can be exercised on a PC. See *Verifying `xl create` on a PC* below. |
+| `tools/domz-qemu/meta-domz-qemu/` (repository root) | The one Yocto layer that harness needs: the Xen dom0 kernel options poky's `features/xen` does not set (`CONFIG_XEN_GNTDEV` above all). |
 
-The domain config and its systemd unit are on the Yocto side, in
-`meta-rpi-sodev/meta-xt-common/meta-xt-domz/` (`domz.cfg`,
-`xl-create-domz.service`), installed into the toolstack domain's rootfs — DomD in the
-Zephyr-Dom0 flavour, the thin Dom0 in the linux one.
+The domain config and its systemd unit are in `recipes-guests/domz/files/`
+(`domz.cfg`, `xl-create-domz.service`), installed into the toolstack domain's
+rootfs — DomD in the Zephyr-Dom0 flavour, the thin Dom0 in the linux one. That is
+why this layer is in both layer sets.
 
 Everything that can be checked without a board is collected in
-`tools/check-domz.sh` (`--quick` for the static half).
+`tools/check-domz.sh` (repository root; `--quick` for the static half).
 
 ## Verifying `xl create` on a PC (QEMU)
 
 The domain-creation path — does `xl create` accept the Zephyr image, does the guest
-reach its PV console — needs a hypervisor, not a Raspberry Pi. `tools/qemu-xen-domz.sh`
-boots Xen with a minimal Linux Dom0 under QEMU aarch64 and lets you create DomZ there.
+reach its PV console — needs a hypervisor, not a Raspberry Pi.
+`tools/domz-qemu/qemu-xen-domz.sh` (repository root) boots Xen with a minimal
+Linux Dom0 under QEMU aarch64 and lets you create DomZ there.
 **This has been run, and it works** (recorded with Zephyr 3.6.0 / Xen 4.21.1-pre /
 GICv2, before the 4.4.1 move):
 
@@ -75,7 +80,7 @@ To reproduce, build a Dom0 for `qemuarm64` in its own build directory:
 ```sh
 cd yocto && source poky/oe-init-build-env build-qemu
 bitbake-layers add-layer ../meta-yocto/meta-poky ../meta-openembedded/meta-oe     ../meta-openembedded/meta-python ../meta-openembedded/meta-networking     ../meta-openembedded/meta-filesystems ../meta-virtualization
-cp -r ../../domz/tools/meta-domz-qemu ../meta-domz-qemu && bitbake-layers add-layer ../meta-domz-qemu
+cp -r ../../tools/domz-qemu/meta-domz-qemu ../meta-domz-qemu && bitbake-layers add-layer ../meta-domz-qemu
 cat >> conf/local.conf <<'EOF'
 MACHINE = "qemuarm64"
 DISTRO_FEATURES:append = " xen virtualization"
@@ -85,7 +90,7 @@ IMAGE_INSTALL:append = " xen-tools kernel-modules"
 EXTRA_IMAGE_FEATURES:append = " empty-root-password allow-empty-password allow-root-login serial-autologin-root"
 EOF
 bitbake core-image-minimal xen
-cd ../.. && domz/tools/qemu-xen-domz.sh      # see the script header for the share.img step
+cd ../.. && tools/domz-qemu/qemu-xen-domz.sh      # see the script header for the share.img step
 ```
 
 Three things bit during bring-up and are worth knowing, because two of them would bite
@@ -158,6 +163,6 @@ DomD, the boot script).
 16 MiB and one vCPU, pinned to pCPU 0 (alongside Dom0 and DomD's first vCPU; it used
 to be pCPU 3, one of DomA's cores, and was moved off them -- `domz.cfg` explains why). The 16 MiB is not a tunable: Zephyr's
 `xenvm` board links against a 16 MiB RAM bank at `0x40000000`, so `memory = 16` in
-`domz.cfg` has to match it — `tools/check-domz.sh` checks that pair. Nothing
-static-mem changes, so the memory map checked by `tools/check-memory-map.py` is
-untouched.
+`domz.cfg` has to match it — `tools/check-domz.sh` (repository root) checks that pair.
+Nothing static-mem changes, so the memory map checked by `tools/check-memory-map.py`
+(repository root) is untouched.

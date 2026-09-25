@@ -21,8 +21,8 @@
 #      Needs Docker + sodev-builder-rpi.
 #
 # What is NOT covered, and cannot be: booting the domain (`xl create domz.cfg`) and
-# the Xen PV console. See domz/README.md for the bring-up order and for how to iterate
-# over scp without reflashing.
+# the Xen PV console. See meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md for the
+# bring-up order and for how to iterate over scp without reflashing.
 #
 # Usage: tools/check-domz.sh [--quick]
 #   --quick   only step 1 (no Docker, no build; a couple of seconds)
@@ -46,7 +46,7 @@ WEST_WS="${WEST_WS:-zephyr-domz}"
 # --quick run on a tree that has never built DomZ, and is reported as such.
 XENVM_RAM_MIB_FALLBACK=16
 XENVM_DTS_REL="boards/xen/xenvm/xenvm.dts"
-DOMZ_CFG="meta-rpi-sodev/meta-xt-common/meta-xt-domz/recipes-extended/xt-xen-cfg-domz/files/domz.cfg"
+DOMZ_CFG="meta-rpi-sodev/meta-xt-common/meta-xt-domz/recipes-guests/domz/files/domz.cfg"
 
 pass=0 fail=0 skip=0
 
@@ -106,7 +106,7 @@ else
   # and would otherwise be indistinguishable from "clean".
   cp_out="$(perl "$CHECKPATCH" --no-tree --show-types \
         --ignore=SPDX_LICENSE_TAG,FILE_PATH_CHANGES,GERRIT_CHANGE_ID,COMMIT_MESSAGE,VOLATILE,BRACES,TRAILING_SEMICOLON,SPLIT_STRING \
-        -f domz/app/src/*.c 2>&1)"
+        -f meta-rpi-sodev/meta-xt-common/meta-xt-domz/zephyr-apps/domz/src/*.c 2>&1)"
   cp_rc=$?
   cp_hits="$(printf '%s\n' "$cp_out" | grep -cE "^(WARNING|ERROR)")"
   if [ "$cp_rc" -ne 0 ] && [ "$cp_hits" = "0" ]; then
@@ -201,7 +201,7 @@ else
   # populated.
   bl="$(mktemp)"
   if in_docker "set -e; cd $WEST_WS; source zephyr/zephyr-env.sh; \
-                west build -p always -b xenvm -d build-check-domz ../domz/app; \
+                west build -p always -b xenvm -d build-check-domz ../meta-rpi-sodev/meta-xt-common/meta-xt-domz/zephyr-apps/domz; \
                 test -f build-check-domz/zephyr/zephyr.bin" >"$bl" 2>&1; then
     ok "the DomZ image builds for the xenvm board"
   else

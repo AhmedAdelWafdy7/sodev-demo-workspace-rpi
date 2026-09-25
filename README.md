@@ -139,7 +139,7 @@ disables the heavy Android/Flatcar guests by default).
 | `--ram=<sku>` (`BOARD_RAM`) | **16g** (rpi5) / **8g** (rpi4) | Board SKU; the valid values and the default depend on `--board`. **rpi5: `16g`\|`8g`.** `16g` = the full 4-domain map (Dom0 512 + DomD 4096 + DomU 1024 + DomA 4096 = 9728 MiB). `8g` takes **DomD to 3072 MiB** (static-mem bank4 at `0x180000000` dropped) **and DomA to 3072 MiB**; Dom0/DomU keep their sizes, so the four total 7680 MiB and fit an 8 GB board. Splitting the reduction is measured, not a preference — see *Board RAM size* (`docs/DESIGN.md`). **rpi4: `8g`\|`4g`.** `8g` = Dom0 128 (zephyr, the default) or 256 (linux) + DomD 1920 + DomU 1024 + DomA 2560; `4g` takes DomD to 1024 MiB (bank2 dropped, bank0 to 640 MiB) and DomA and DomU can no longer RUN at the same time — each fits alone, and `build.sh` says so |
 | `-u`, `--domu` (`ENABLE_DOMU`) | **off** | Adds the AGL instrument-cluster DomU: Xen-aware kernel `linux-virtio-armv8` (p1) + AGL rootfs (p3). V4H-aligned minimal domu layer set (kernel via moulin; AGL rootfs via `build.sh`'s AGL bitbake) |
 | `-a`, `--android` (`ENABLE_ANDROID`) | **off** | Include DomA (AAOS, p4 nested GPT). Alias for `--aaos=auto` — the mode chooses how DomA is produced |
-| `-z`, `--domz` (`ENABLE_DOMZ`) | **off** | Adds DomZ, the Zephyr RTOS domain: Zephyr built for its own Xen-guest board (`xenvm`, GICv2, Xen PV console) out of a second west workspace, staged on p1 as `zephyr-domz.bin` and started by the xl toolstack from `/etc/xen/domz.cfg`. 16 MiB / 1 vCPU, no rootfs and **no new partition**, so the p2/p3/p4 layout is unchanged. Console: `xl console DomZ`. See [`domz/README.md`](domz/README.md) |
+| `-z`, `--domz` (`ENABLE_DOMZ`) | **off** | Adds DomZ, the Zephyr RTOS domain: Zephyr built for its own Xen-guest board (`xenvm`, GICv2, Xen PV console) out of a second west workspace, staged on p1 as `zephyr-domz.bin` and started by the xl toolstack from `/etc/xen/domz.cfg`. 16 MiB / 1 vCPU, no rootfs and **no new partition**, so the p2/p3/p4 layout is unchanged. Console: `xl console DomZ`. See [`meta-xt-domz/README.md`](meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md) |
 | `--domains-only` (`NINJA_TARGET=""`) | off | Build the domains but skip SD-image assembly |
 | `--aaos=<mode>` (`AAOS_MODE`) | off (`-a`⇒auto) | `off` \| `auto` \| `source` \| `prebuilt`. **auto** = prebuilt if a bundle is found (default probe `<workspace>/aaos-prebuilt-<board>`, then `<workspace>/aaos-prebuilt`), else source if an AOSP checkout is found, else off (or a hard error when DomA was required via `-a`) |
 | `--aaos-prebuilt=<dir>` (`AAOS_PREBUILT_DIR`) | `<ws>/aaos-prebuilt-<board>`, then `<ws>/aaos-prebuilt` | Prebuilt AAOS bundle (`files/` + `images/` + `BUNDLE-INFO`, plus an optional `MANIFEST.md5`); consumed by `prebuilt`/`auto`. **Skips the AOSP source build entirely.** See *AAOS build modes* |
@@ -246,7 +246,7 @@ Moved to [`docs/DESIGN.md`](docs/DESIGN.md) — the 16 GB and 8 GB memory maps, 
 | DomD device-model | QEMU 7.0.0 (Xen IOREQ, virtio-gpu-gl, vhost-net/-vsock) |
 | DomU guest | AGL SoDeV instrument cluster (`agl-cluster-demo-flutter-guest`, kernel 6.8.0-rc1 — historically aligned with the V4H AGL SoDeV DomU kernel: torvalds linux `6613476e` + the single Xen backend-domid patch, plus the RPi5-specific `xen-force-grant.cfg`; the current V4H submodule has since moved to a 6.12-series DomU kernel; MACHINE virtio-aarch64) |
 | DomA guest | AAOS (`aosp_xenvm_trout_rpi5_arm64` / `aosp_xenvm_trout_rpi4_arm64`), Xen virtio (CONFIG_XEN / XEN_VIRTIO). The virtio contract is the V4H one: a complete V4H-built AAOS image (kernel, ramdisk and p4 from one build) boots unmodified -- measured in 2026-07 with a V4H Android 17 image on this stack while it was still Android 15. `build.sh` nevertheless accepts only prebuilt bundles that declare this tree's own generation (Android 17 / GKI 6.18.32, `BUNDLE-INFO`): the failure it guards against is a *mixed* set, a guest kernel and a `vendor_dlkm` from different builds, which share no `module_layout` and boot to a black panel |
-| DomZ guest | Zephyr 4.4.1 (the same manifest and pins as Dom0 — its own west workspace, brought to 4.4.1 by `apply-zephyr-patches.sh --manifest-only`), board `xenvm` (GICv2, Xen PV console), Zephyr SDK 1.0.1 / `aarch64-zephyr-elf`. Application in [`domz/`](domz/README.md) |
+| DomZ guest | Zephyr 4.4.1 (the same manifest and pins as Dom0 — its own west workspace, brought to 4.4.1 by `apply-zephyr-patches.sh --manifest-only`), board `xenvm` (GICv2, Xen PV console), Zephyr SDK 1.0.1 / `aarch64-zephyr-elf`. Application in [`meta-xt-domz/zephyr-apps/domz/`](meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md) |
 
 
 See also:
@@ -260,10 +260,6 @@ See also:
 ├── rpi4-sodev.yaml          # moulin entry (Raspberry Pi 4 / BCM2711), same domain set; ./build.sh --board=rpi4
 ├── docker/                  # unified sodev-builder-rpi build image (built on demand)
 ├── docs/                    # BUILD.md (build detail) / DESIGN.md (why) / TROUBLESHOOTING.md
-├── domz/                    # DomZ = the Zephyr RTOS guest (-z)
-│   ├── app/                 #   Zephyr application for the `xenvm` board
-│   ├── tools/               #   QEMU harness (xl create on a PC) + its Yocto layer
-│   └── README.md            #   what the domain is, and how to bring it up
 ├── external/
 │   ├── meta-xt-prod-devel-rpi5/   # submodule: pristine xen-troops base (byte-identical)
 │   └── sodev-demo-workspace/      # submodule: AGL SoDeV — DomU/DomA source of truth (V4H)
@@ -274,7 +270,8 @@ See also:
 │   │   │                            #   zephyrproject-rtos xenlib, xenstore server, dom_cfg,
 │   │   ├── meta-xt-driver-domain/   # DomD image (p2 rootfs), kernel (vhost_xen/vc4), weston, qemu, xen-network
 │   │   ├── meta-xt-domu/            # DomU xl cfg + cluster recipes + virtio kernel
-│   │   ├── meta-xt-domz/            # DomZ xl cfg (domz.cfg) + xl-create-domz.service
+│   │   ├── meta-xt-domz/            # DomZ: xl cfg + unit (recipes-guests/domz/) and the
+│   │   │                            #   Zephyr application (zephyr-apps/domz/), plus its README
 │   │   ├── meta-xt-doma/            # DomA xl cfg + AAOS host services + guest binaries
 │   │   ├── meta-xt-domx/            # shared cross-guest recipes (libc-headers, base-files, ...)
 │   │   ├── meta-xt-{qemu,security}/ # vendored upstream
@@ -297,10 +294,13 @@ See also:
     │                               #   command (check-yaml-drift + the domz.cfg memory invariant +
     │                               #   checkpatch + moulin graph + the xenvm guest build).
     │                               #   To go further and actually BOOT DomZ on a PC, see
-    │                               #   domz/tools/qemu-xen-domz.sh (Xen + Dom0 in QEMU)
-    └── compare-sd-image.py         # compare a fresh SD image against one that booted, judging
-                                        deterministic / timestamp-contaminated / deliberately-
-                                        different artifacts by different criteria
+    │                               #   domz-qemu/qemu-xen-domz.sh (Xen + Dom0 in QEMU)
+    ├── compare-sd-image.py         # compare a fresh SD image against one that booted, judging
+    │                                   deterministic / timestamp-contaminated / deliberately-
+    │                                   different artifacts by different criteria
+    └── domz-qemu/                  # boot Xen + a Linux Dom0 under QEMU and `xl create` DomZ on
+                                    #   a PC. Not referenced by any build; meta-domz-qemu/ here
+                                    #   must not enter the SD image build.
 ```
 
 ## Zephyr Dom0 (DOM0_OS=zephyr, the default)
@@ -395,7 +395,7 @@ On a PC, before that:
   carries `/etc/xen/domz.cfg`, `/usr/lib/systemd/system/xl-create-domz.service` and the
   `multi-user.target.wants` symlink that auto-enables it;
 - **DomZ was created and booted under QEMU first** -- aarch64 with Xen 4.21.1-pre and a
-  minimal Linux Dom0 (`domz/tools/qemu-xen-domz.sh`): `xl create` accepted the image,
+  minimal Linux Dom0 (`tools/domz-qemu/qemu-xen-domz.sh`): `xl create` accepted the image,
   `xl list` showed `DomZ ... -b----` (idle, i.e. healthy) and `xl console DomZ` printed
   the banner (that run predates the move to 4.4.1). The image format holds for the
   reason libxc's loaders say it should: Zephyr's arm64 output carries a Linux arm64
@@ -403,7 +403,7 @@ On a PC, before that:
   claims (the multiboot `bin` loader would have rejected a bare blob).
 
 The bring-up order and how to iterate over `scp` **without reflashing the SD card** are
-in [`domz/README.md`](domz/README.md); the failure signatures are in *DomZ does not
+in [`meta-xt-domz/README.md`](meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md); the failure signatures are in *DomZ does not
 start* (`docs/TROUBLESHOOTING.md`).
 
 ## Known issues
