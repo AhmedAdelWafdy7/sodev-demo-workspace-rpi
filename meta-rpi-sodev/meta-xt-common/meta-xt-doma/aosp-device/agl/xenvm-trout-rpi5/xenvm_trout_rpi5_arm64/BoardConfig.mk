@@ -50,3 +50,22 @@ include device/epam/aosp-xenvm-trout/xenvm_trout_arm64/BoardConfig.mk
 # value and not a silent fall-through to the default.
 TARGET_ARCH_VARIANT := armv8-a
 TARGET_CPU_VARIANT := cortex-a76
+
+# ---------------------------------------------------------------------------
+# Build the Venus ICD.
+#
+# The included board config sets BOARD_MESA3D_USES_MESON_BUILD and
+# GALLIUM_DRIVERS := virgl and names no Vulkan driver, so Mesa was configured
+# with -Dvulkan-drivers= and nothing after it and the install tree carries no
+# libvulkan_*.so. Naming it here is what puts -Dvulkan-drivers=virtio on the
+# meson line and what makes Mesa's Android.mk emit the vulkan.virtio module
+# into /vendor/lib64/hw/.
+#
+# Build-system trap: the MESON_MESA3D .build.timestamp rule rebuilds the whole
+# meson project with rm -rf / cp -r / meson setup / ninja, and this variable is
+# not among its prerequisites, so make semantics alone do not retrigger it.
+# mesa3d_cross.mk also touches an empty .so when the real one is missing and
+# Android.mk turns LOCAL_CHECK_ELF_FILES off, so a stale tree ships a 0-byte ICD
+# and the build still passes. Remove obj/MESON_MESA3D* before trusting a
+# rebuild.
+BOARD_MESA3D_VULKAN_DRIVERS := virtio
