@@ -1,0 +1,491 @@
+From 4eb1c4d43864bf815854083fa9e942df43ce9280 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 25 Sep 2026 09:34:41 +0900
+Subject: [PATCH] hwdec: H.264 on VideoCore behind XT_DOMA_HWDEC,
+ SurfaceFlinger at 60 Hz
+
+Let the guest decode H.264 on VideoCore. What it gets: the V4L2 Codec2
+HAL (android.hardware.media.c2@1.2-service-v4l2) talking to /dev/video0,
+which is a virtio-media device backed by bcm2835-codec in DomD, i.e.
+VideoCore's own decoder.
+
+The decode path is inside `ifeq ($(XT_DOMA_HWDEC),true)`, so a build
+that does not pass the variable installs none of it. The service needs
+a /dev/videoN, which DomA has only when its device model provides a
+virtio-media device; declaring the HAL without one would leave init
+crash-looping a service and the VINTF manifest advertising a HAL the
+device does not have. Three things sit outside the gate: the soong
+namespace line and the hal_codec2_default sepolicy, each deliberately,
+and the SurfaceFlinger property described last, which applies to any
+30 fps video.
+
+  * PRODUCT_SOONG_NAMESPACES for external/v4l2_codec2. Its root
+    Android.bp opens with a bare `soong_namespace {}`, which hides every
+    module in the project from the build graph until a product opts in.
+    A namespace opt-in installs nothing by itself, and keeping it
+    unconditional means the gated and ungated builds share one soong
+    analysis.
+  * media_codecs_c2.xml describes DECODERS ONLY, AND H.264 ONLY.
+    bcm2835-codec supports H.263, H.264, JPEG, MJPEG, MPEG2, MPEG4 and
+    VC-1 -- no VP8, VP9, HEVC or AV1 -- so the VP8/VP9 entries in the
+    upstream template would advertise codecs that cannot work. Encoders
+    are dropped because encode is a different node (/dev/video11) and
+    this device model proxies exactly one. The .secure variants are
+    dropped because there is no Widevine and no secure allocator. max
+    size is 1920x1088, not 4096x4096: VideoCore's H.264 decoder is a
+    1080p part, and claiming 4K would let the framework hand it streams
+    it cannot decode, which would look like a decoder bug.
+  * codec2.vendor.ext.policy is the extended seccomp policy. It is
+    installed as android.hardware.media.c2-extended-seccomp_policy, the
+    fixed name the service opens; under any other name it is never read,
+    and the V4L2 ioctls are killed rather than denied.
+  * The gate also sets the properties the service and the framework
+    read: the v4l2_codec2 instance counts, prefer_rgba, the
+    capture-buffer output delay, the Codec2 pool mask and
+    media.c2.hal.selection=hidl. The last one decides whether any of
+    this is reachable: the service publishes a HIDL-only VINTF
+    fragment, and with AIDL selected, which is what cuttlefish sets,
+    the framework never enumerates this store and c2.v4l2.avc.decoder
+    does not appear in the codec list. The software codecs stay, on the
+    HIDL software instance. The makefile argues each property.
+  * sepolicy for hal_codec2_default: the domain and exec type init needs
+    before it can start the service at all -- file_contexts labels the
+    service binary hal_codec2_default_exec, without which init cannot
+    exec it -- plus rules for the denials collected from board logs,
+    2026-09-01. The board boots permissive, so those denials break
+    nothing today and would break hardware decode the moment it goes
+    enforcing. It is unconditional so that every build type-checks the
+    same policy.
+
+ro.surface_flinger.enable_frame_rate_override=false keeps SurfaceFlinger
+at 60 Hz while a 30 fps video plays. A 1080p30 clip through VideoView
+swung between 14.7 and 28.4 fps from one 10 s window to the next. In
+the bad windows SurfaceFlinger had dropped its render rate to 30 Hz for
+the video (frame rate override with content detection): the work
+duration went to 32.3 ms, the present time it handed drm_hwcomposer was
+two vsyncs out, and WaitForPresentTime slept inside
+PresentStagedComposition -- SurfaceFlinger's main thread -- 13 ms
+median per frame. NuPlayer places frames on the 60 Hz grid, so when the
+30 Hz grid's phase disagreed every frame was one vsync late and pairs
+collapsed into one (4-vsync gaps for 52 of 73 frames, 54 buffers
+released unshown).
+
+The property keeps the render rate at 60 Hz. It also turns off per-app
+frame rate overrides (setFrameRate, GameManager), which only ever lower
+the render rate below the panel's; the guest's virtio-gpu offers one
+60 Hz mode. Only the RPi4 device sets it; the Pi 5 has not been
+measured. Measured at runtime on the RPi4 (setprop before
+SurfaceFlinger starts, 2026-09-24): four runs at 27.1-28.8 fps, the
+render rate stayed 60 Hz, and WaitForPresentTime never slept.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
+---
+ aosp_xenvm_trout_rpi4_arm64.mk                | 147 ++++++++++++++++++
+ sepolicy/file_contexts                        |  14 ++
+ sepolicy/hal_codec2_default.te                |  89 +++++++++++
+ .../codec2.vendor.ext.policy                  |  19 +++
+ xenvm_trout_rpi4_arm64/media_codecs_c2.xml    |  77 +++++++++
+ 5 files changed, 346 insertions(+)
+ create mode 100644 sepolicy/hal_codec2_default.te
+ create mode 100644 xenvm_trout_rpi4_arm64/codec2.vendor.ext.policy
+ create mode 100644 xenvm_trout_rpi4_arm64/media_codecs_c2.xml
+
+diff --git a/aosp_xenvm_trout_rpi4_arm64.mk b/aosp_xenvm_trout_rpi4_arm64.mk
+index 655b980..46fc236 100644
+--- a/aosp_xenvm_trout_rpi4_arm64.mk
++++ b/aosp_xenvm_trout_rpi4_arm64.mk
+@@ -165,6 +165,23 @@ PRODUCT_VENDOR_PROPERTIES += \
+     debug.renderengine.backend=skiavkthreaded \
+     debug.hwui.renderer=skiavk
+ 
++# Keep SurfaceFlinger rendering at the panel's 60 Hz. With frame rate override
++# on (the default, SurfaceFlinger.cpp:4256), a lone 30 fps video makes
++# SurfaceFlinger drop its render rate to 30 Hz: its work duration becomes
++# 32.3 ms and it hands drm_hwcomposer a present time two vsyncs out, which
++# WaitForPresentTime (HwcDisplay.cpp:955-1001) sleeps off inside
++# PresentStagedComposition -- on SurfaceFlinger's main thread, 13 ms median per
++# frame. NuPlayer places frames on the 60 Hz grid, so whenever the 30 Hz grid's
++# phase disagrees every frame lands one vsync late and pairs collapse into one:
++# 10 s windows of the same 1080p30 clip measured 14.7 and 28.4 fps. With it off,
++# four runs gave 27.1-28.8 fps and WaitForPresentTime never slept. The same
++# property also defaults content detection off (SurfaceFlinger.cpp:5172), which
++# is what picked the 30 Hz rate. What is given up: per-app frame rate overrides
++# (setFrameRate, GameManager), i.e. lowering the render rate below the panel's;
++# virtio-gpu offers this guest a single 60 Hz mode anyway.
++PRODUCT_VENDOR_PROPERTIES += \
++    ro.surface_flinger.enable_frame_rate_override=false
++
+ # Start the interface rename that minradio's data call depends on. cuttlefish already
+ # ships the service and a trigger for it, but trout sets ro.vendor.disable_rename_eth0
+ # so that trigger never fires; overriding that is deliberate and argued in the .rc.
+@@ -336,6 +353,19 @@ PRODUCT_VENDOR_PROPERTIES += \
+     bluetooth.sco.managed_by_audio=true \
+     bluetooth.hfp.software_datapath.enabled=true
+ 
++# ---------------------------------------------------------------------------
++# WHY PRODUCT_SOONG_NAMESPACES for external/v4l2_codec2. Its root Android.bp
++# opens with a bare `soong_namespace {}`, which hides every module in the
++# project from the build graph until a product opts in. Without this line
++# `m libv4l2_codec2_common ...` fails with `unknown target` for all six
++# modules -- that is namespace invisibility, NOT an android17 source
++# incompatibility. external/v4l2_codec2/README.md names this exact line as
++# step 1 of the official integration recipe.
++#
++# Declaring a namespace only makes modules visible; it installs nothing, so this
++# line alone leaves the image byte-for-byte unaffected.
++PRODUCT_SOONG_NAMESPACES += external/v4l2_codec2
++
+ # ---------------------------------------------------------------------------
+ # WHY DomaWifiRelay. It is the ONLY component that can learn the passphrase the user
+ # types on the AAOS Wi-Fi screen. The shadow AP on wlan2 validates that passphrase
+@@ -374,6 +404,123 @@ PRODUCT_VENDOR_PROPERTIES += \
+ PRODUCT_PACKAGES += \
+     DomaWifiRelay
+ 
++# ---------------------------------------------------------------------------
++# DomA HARDWARE DECODE, BEHIND A BUILD SWITCH.
++#
++# Everything in this block is gated on XT_DOMA_HWDEC=true, which the SoDeV
++# workspace's rpi4-sodev.yaml sets on its vulkan lane. The C2 service ships a
++# VINTF fragment declaring android.hardware.media.c2@1.2, and declaring a HAL
++# that cannot start (there is no /dev/videoN in DomA without the virtio-media
++# device, which only the qemu 10.0.2 device model has) would leave init
++# crash-looping a service and the VINTF manifest advertising a HAL the device
++# does not have.
++ifeq ($(XT_DOMA_HWDEC),true)
++
++# The V4L2 codec2 service and the plugin store it loads.
++PRODUCT_PACKAGES += \
++    android.hardware.media.c2@1.2-service-v4l2 \
++    libc2plugin_store
++
++# The extended seccomp policy MUST be installed under the name
++# android.hardware.media.c2-extended-seccomp_policy (confirmed on RPi4 hardware,
++# 2026-09-01): external/v4l2_codec2's service/service.cpp opens that fixed path
++# (kExtSeccompPolicyPath, under /vendor/etc/seccomp_policy/), so under the name
++# codec2.vendor.ext.policy the extended policy is never read and the V4L2 ioctls
++# are killed by seccomp. No SELinux denial is emitted, so the cause is
++# invisible.
++# Codec2InfoBuilder reads media_codecs_c2.xml to describe vendor C2 components.
++# Decoders only, H.264 only, 1080p max: the reasoning is in the file itself.
++PRODUCT_COPY_FILES += \
++    device/sodev/xenvm-cf/xenvm_trout_rpi4_arm64/media_codecs_c2.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_codecs_c2.xml \
++    device/sodev/xenvm-cf/xenvm_trout_rpi4_arm64/codec2.vendor.ext.policy:$(TARGET_COPY_OUT_VENDOR)/etc/seccomp_policy/android.hardware.media.c2-extended-seccomp_policy
++
++# WHY prefer_rgba=true is spelled out here although it is v4l2_codec2's default.
++#
++# Both places that read it, DecodeInterface (the pixel format the component
++# advertises) and V4L2Decoder's preferRgbOutput() (the format it asks the
++# device for), take ro.vendor.v4l2_codec2.prefer_rgba with true as the default,
++# so this line changes nothing the decoder does; it names the choice where the
++# product is defined. It is load bearing for this stack, not a preference: the
++# guest's GL driver has no GL_EXT_YUV_target, so a YUV capture buffer cannot
++# become a texture -- see the kPreferredRgbFourccs list in V4L2Decoder.cpp and
++# the paragraphs above it.
++PRODUCT_VENDOR_PROPERTIES += \
++    ro.vendor.v4l2_codec2.decode_concurrent_instances=8 \
++    ro.vendor.v4l2_codec2.encode_concurrent_instances=0 \
++    ro.vendor.v4l2_codec2.prefer_rgba=true
++
++# CAPTURE buffer budget for 1080p on this board.
++#
++# external/v4l2_codec2's getMinNumOutputBuffers() is output_delay + 4 + 3 + 2 and
++# the H.264 default delay is 16, so a 1080p decode asks the host for 25 NV12
++# capture buffers of 3,133,440 B each (~75 MiB of order-10 CMA in DomD). DomD's
++# CMA is the only VideoCore-reachable pool and ~100 MiB of it is already held by
++# the vc4/virtio-gpu scanout buffers at idle, so the 24th/25th REQBUFS allocation
++# fails ("bcm2835-codec: dma alloc of size 3133440 failed", cma_alloc -EBUSY,
++# order-10 GFP_DMA failure) and the reclaim/compaction storm that follows starves
++# every DomD process for minutes (measured 2026-09-15). 854x480 works because
++# 25 x 691,200 B fits.
++#
++# Delay 2 = 11 buffers (~33 MiB) was the measured minimum that decodes 1080p30;
++# 720p passes with the code default. The code default stays 16 on purpose
++# (DecodeInterface::getOutputDelay); the property is read once per component
++# instance. Streams that reorder deeper than 2 frames make CCodec time out
++# instead of stalling -- raise to 4 if that shows up (the H.264 streams measured
++# in a WebView reordered by 2-4 frames). It pairs with DomD's CMA (cma= in
++# DomD's bootargs, boot.scr), which gives the pool the headroom the 2026-09-07
++# measurement (~45 MiB free) assumed.
++PRODUCT_PROPERTY_OVERRIDES += \
++    debug.v4l2codec2.output_delay=2
++
++# WHY media.c2.hal.selection=hidl, AND WHY WITHOUT IT NOTHING ABOVE IS REACHABLE.
++# external/v4l2_codec2's service publishes a HIDL-only VINTF fragment:
++#
++#     <hal format="hidl"><name>android.hardware.media.c2</name>
++#         <fqname>@1.2::IComponentStore/default</fqname>
++#
++# and the framework decides which transport to enumerate before it looks at any
++# manifest. IsCodec2AidlHalSelected() in
++# frameworks/av/media/codec2/hal/common/HalSelection.cpp picks AIDL only where
++# the aidl_hal aconfig flag is enabled (it IS, state: ENABLED in
++# build/release/aconfig/trunk_staging/com.android.media.codec.flags) or the
++# vendor API level is 202404 or later, and then only if media.c2.hal.selection
++# is aidl; the property itself defaults to hidl. cuttlefish sets it to aidl
++# (device/google/cuttlefish/shared/device.mk, with ?=), so the inherited value
++# was aidl, and with AIDL selected Codec2Client::CacheServiceNames()
++# (hal/client/client.cpp:2755) walks AServiceManager_forEachDeclaredInstance()
++# over AIDL instances only and never reaches the HIDL branch.
++#
++# MEASURED CONSEQUENCE: c2.v4l2.avc.decoder did not appear in the codec list even
++# with the virtio-media device, because Codec2InfoBuilder builds its list from the
++# traits the client returns and the client had never seen this store. The image
++# contained every hardware-decode artifact and used none of them.
++#
++# hidl rather than converting the service to AIDL because the device is
++# target-level 7 and compatibility_matrix.7.xml declares media.c2 as HIDL only;
++# an AIDL fragment makes checkUnusedHals fail the build. Converting is the right
++# long-term move and belongs with a target-level bump.
++#
++# THIS DOES NOT COST THE SOFTWARE CODECS. With hidl selected,
++# frameworks/av/media/module/codecserviceregistrant/CodecServiceRegistrant.cpp
++# registers the real platform store on the HIDL "software" instance and only a
++# null store on the AIDL one, and mediaserver's HIDL software manifest entry is
++# max-level 8, so it stays valid at target-level 7. Clients see two HIDL stores:
++# software (AOSP) and default (this one).
++#
++# Inside the gate on purpose: a build without the decoder keeps the aidl
++# cuttlefish sets.
++PRODUCT_VENDOR_PROPERTIES += \
++    media.c2.hal.selection=hidl
++
++# Codec2.0 poolMask. 0xf50000 selects ION for linear buffers, which is what
++# external/v4l2_codec2/README.md specifies for the ION case; BLOB (0xfc0000)
++# would be the alternative. Left at the README's ION value because that is what
++# the plugin store's allocator ids assume.
++PRODUCT_PROPERTY_OVERRIDES += \
++    debug.stagefright.c2-poolmask=0xf50000
++
++endif # XT_DOMA_HWDEC
++
+ # Bluetooth off on a fresh userdata. A runtime overlay, not the one above: Car's own RRO
+ # sets def_bluetooth_on=true and outranks any build-time overlay. The ordering that makes
+ # this one win is in its Android.bp.
+diff --git a/sepolicy/file_contexts b/sepolicy/file_contexts
+index 3a6d344..91ff639 100644
+--- a/sepolicy/file_contexts
++++ b/sepolicy/file_contexts
+@@ -24,3 +24,17 @@
+ # default already has the rules it needs for that type (22 references in the built
+ # vendor_sepolicy.cil), so the apex hostapd works with no policy of its own.
+ /data/vendor/wifi/shadow(/.*)?   u:object_r:hostapd_data_file:s0
++
++# The v4l2 Codec2 HAL. Without this line the binary stays vendor_file and init
++# cannot exec it at all (neverallow init ...:file execute_no_trans), so the
++# service never starts and the whole hardware-decode path is dead regardless of
++# whether a decoder is behind it. See sepolicy/hal_codec2_default.te.
++#
++# The name carries the -64 suffix because soong appends it: the module is
++# android.hardware.media.c2@1.2-service-v4l2 and what lands in the image is
++# android.hardware.media.c2@1.2-service-v4l2-64. Matching without the suffix
++# labels nothing, which is the same silent failure as having no line here.
++#
++# Regex-escaped because '@' and '.' are literal here and file_contexts entries
++# are regexes.
++/vendor/bin/hw/android\.hardware\.media\.c2@1\.2-service-v4l2-64  u:object_r:hal_codec2_default_exec:s0
+diff --git a/sepolicy/hal_codec2_default.te b/sepolicy/hal_codec2_default.te
+new file mode 100644
+index 0000000..7585417
+--- /dev/null
++++ b/sepolicy/hal_codec2_default.te
+@@ -0,0 +1,89 @@
++# SPDX-License-Identifier: Apache-2.0
++#
++# Domain for the v4l2 Codec2 HAL, external/v4l2_codec2's
++# android.hardware.media.c2@1.2-service-v4l2-64. It is the DomA half of the
++# hardware-decode path: DomD owns bcm2835-codec, qemu's virtio-media device
++# proxies it, and this service is what Android's media framework talks to.
++#
++# WHY THIS FILE HAD TO BE WRITTEN AT ALL. Nothing in the tree labelled the
++# service binary, so it stayed vendor_file, and
++#
++#     system/sepolicy/private/init.te
++#       neverallow init { file_type fs_type }:file execute_no_trans;
++#
++# means init cannot exec an unlabelled binary without a domain to transition
++# into. The service therefore could not start -- in EITHER Xen config, with or
++# without a decoder behind it: the failure comes one step before a C2 HAL
++# could crash-loop for want of a /dev/videoN, and it has nothing to do with
++# the device.
++#
++# WHY IT IS NOT INSIDE THE XT_DOMA_HWDEC GATE, unlike the rest of the
++# hardware-decode wiring. A domain and an exec label with no binary to apply
++# them to are dead weight, not a hazard, whereas gating them would mean the
++# neverallow surface only gets exercised on hwdec builds -- and inventing a
++# domain is exactly where this product's sepolicy risk lives (see the note on
++# doma-wifi-relay in file_contexts). Keeping it
++# unconditional means every build type-checks the same policy.
++#
++# WHAT THE ATTRIBUTE ALREADY GIVES US, so this file stays short:
++# system/sepolicy/private/hal_codec2.te grants hal_codec2_server the binder
++# calls in both directions, hal_codec2_hwservice and hal_codec2_service access,
++# the media_variant and codec2_config properties, and the graphics/camera fd
++# use rules. hal_server_domain() below joins this domain to hal_codec2_server,
++# so none of that is repeated here.
++type hal_codec2_default, domain;
++hal_server_domain(hal_codec2_default, hal_codec2)
++
++type hal_codec2_default_exec, exec_type, vendor_file_type, file_type;
++init_daemon_domain(hal_codec2_default)
++
++# The decoder itself. On this board /dev/video* is NOT local hardware: it is
++# whatever qemu's virtio-media device exports, so the node exists only when
++# DomA's config has that device. video_device is the platform label for
++# /dev/video[0-9]* (system/sepolicy/private/file_contexts).
++#
++# Note that V4L2ComponentStore::Create() probes these nodes at service start to
++# decide which codecs to advertise, so a denial here does not look like a
++# permission error to the framework -- it looks like "no hardware decoder", and
++# the codec silently does not appear. If HW decode is missing on hardware, read
++# the avc log before anything else:
++#     logcat -d | grep -E 'avc: denied.*hal_codec2|haveDevice'
++allow hal_codec2_default video_device:chr_file rw_file_perms;
++
++# --- 2026-09-01: the three denials measured on the RPi4 board ---------------
++# All three were observed while the build is PERMISSIVE
++# (androidboot.selinux=permissive + enforcing=0 in
++# device/epam/aosp-xenvm-trout/xenvm_trout_arm64/BoardConfig.mk), which means
++# they did not break anything yet. They WILL break hardware decode the moment
++# the build goes enforcing, so they are allowed now while the evidence is fresh.
++# The denials quoted below are verbatim from a board log, 2026-09-01.
++
++# avc: denied { call } scontext=hal_codec2_default tcontext=hal_graphics_allocator_default tclass=binder
++#
++# The decoder allocates its own output buffers through gralloc. The platform
++# grants this binder call to the hal_graphics_allocator_CLIENT attribute
++# (system/sepolicy/private/hal_graphics_allocator.te), not to individual
++# domains, and hal_server_domain() above only joins hal_codec2_server. So the
++# fix is to join the client attribute -- writing a bare allow rule for
++# hal_graphics_allocator_default would work today and rot the moment the
++# platform renames the type.
++hal_client_domain(hal_codec2_default, hal_graphics_allocator)
++
++# avc: denied { ioctl } path="/dev/dri/renderD128" ioctlcmd=0x642e tcontext=gpu_device tclass=chr_file
++#
++# 0x642e is DRM_IOCTL_PRIME_FD_TO_HANDLE: importing the gralloc dmabuf so it can
++# be described to the decoder. gpu_device has no ioctl allow-list anywhere in
++# system/sepolicy (no allowxperm/neverallowxperm on it), so a plain allow is
++# sufficient and no allowxperm is needed -- adding one would in fact be the
++# thing that starts restricting it.
++allow hal_codec2_default gpu_device:chr_file rw_file_perms;
++
++# avc: denied { getattr } path="/dev/dma_heap/system-uncached" tcontext=... tclass=chr_file
++#
++# dmabuf_system_heap_device is the label of the /dev/dma_heap/system* NODES
++# (system/sepolicy/private/file_contexts); dmabuf_heap_device labels the
++# DIRECTORY and is a different type -- and the directory is already granted to
++# every domain by public/domain.te, which is why only the chr_file rule is
++# missing. r_file_perms covers getattr. Same shape as the platform's own
++# mediacodec domain (system/sepolicy/vendor/mediacodec.te).
++allow hal_codec2_default dmabuf_system_heap_device:chr_file r_file_perms;
+diff --git a/xenvm_trout_rpi4_arm64/codec2.vendor.ext.policy b/xenvm_trout_rpi4_arm64/codec2.vendor.ext.policy
+new file mode 100644
+index 0000000..0568c25
+--- /dev/null
++++ b/xenvm_trout_rpi4_arm64/codec2.vendor.ext.policy
+@@ -0,0 +1,19 @@
++# SPDX-License-Identifier: Apache-2.0
++#
++# Extra syscalls the V4L2 codec2 service needs on top of
++# android.hardware.media.c2-default-seccomp_policy, per
++# external/v4l2_codec2/README.md.
++#
++# The README's list is written for 32-bit ABIs (mmap2, fstat64, _llseek...).
++# This product is arm64 only (TARGET_ARCH_VARIANT armv8-a, cortex-a72), so the
++# 64-bit names are used and the 32-bit-only entries are omitted -- listing a
++# syscall that does not exist on the ABI makes minijail reject the whole policy.
++epoll_create1: 1
++epoll_ctl: 1
++epoll_pwait: 1
++eventfd2: 1
++getcwd: 1
++getdents64: 1
++pselect6: 1
++statfs: 1
++sysinfo: 1
+diff --git a/xenvm_trout_rpi4_arm64/media_codecs_c2.xml b/xenvm_trout_rpi4_arm64/media_codecs_c2.xml
+new file mode 100644
+index 0000000..7e33ca0
+--- /dev/null
++++ b/xenvm_trout_rpi4_arm64/media_codecs_c2.xml
+@@ -0,0 +1,77 @@
++<?xml version="1.0" encoding="utf-8" ?>
++<!-- SPDX-License-Identifier: Apache-2.0
++
++     Codec2 components provided by external/v4l2_codec2, for the DomA
++     hardware-decode path.
++
++     DECODERS ONLY, AND H.264 ONLY.
++
++     The hardware behind this is VideoCore's decoder, reached through
++     virtio-media and bcm2835-codec in DomD. bcm2835-v4l2-codec.c supports
++     H.263, H.264, JPEG, MJPEG, MPEG2, MPEG4 and VC-1 (no VP8, VP9, HEVC or
++     AV1), so
++     the VP8/VP9 entries in external/v4l2_codec2/README.md's template would
++     advertise codecs that cannot work. Of the formats it does support, H.264 is
++     the one this product's decode path was built and measured on, so avc is the
++     only entry that earns its place.
++
++     The encoder entries are dropped for the same reason plus one more:
++     bcm2835-codec's encode function is a different node (/dev/video11) and this
++     device model proxies exactly one node.
++
++     The .secure variants are dropped: they need Widevine and a secure
++     allocator, neither of which exists here.
++
++     max size 1920x1088 rather than 4096x4096: VideoCore's H.264 decoder is a
++     1080p part. Claiming 4K would let the framework hand it streams it cannot
++     decode, and the failure would look like a decoder bug.
++
++     THE TWO RATE LIMITS SAY DIFFERENT THINGS, AND THAT IS DELIBERATE (2026-08-30).
++     1920x1080 is divUp(1920,16) x divUp(1080,16) = 120 x 68 = 8160 macroblocks, so
++
++         blocks-per-second max 489600  = 8160 x 60  = 1080p60
++         performance-point-1920x1080 30-30           = 1080p30
++
++     blocks-per-second is the HARDWARE's rating: VideoCore decodes 1080p60 H.264.
++     The performance point is what THIS PATH is expected to sustain, and this path
++     bounces every frame twice between the guest SGL and a host MMAP buffer because
++     bcm2835-codec does not accept USERPTR (about 190 MB/s round trip at 1080p30
++     NV12). 30 is a conservative placeholder, NOT a measurement.
++
++     NEITHER NUMBER REACHES WEBVIEW. Measured on the shipped WebView
++     (145.0.7632.218, product/app/webview/webview.apk): its dex references
++     getVideoCapabilities, getSupportedWidths, isSizeSupported and
++     isFeatureSupported, but NOT areSizeAndRateSupported and NOT
++     getSupportedPerformancePoints, and neither name appears in
++     libwebviewchromium.so either. Chromium therefore selects on size and features
++     alone. Do not expect either limit to stop a page playing video in a WebView
++     from asking for 1080p60; if that has to be capped, cap it in the app that
++     embeds the WebView.
++
++     performance-point is a pure information API in any case: nothing in
++     frameworks/base/media or frameworks/av consults
++     getSupportedPerformancePoints() during codec selection (all 8 references are
++     getters, JNI read-out or the interface declaration).
++
++     NOTE for whoever edits this file: an XML comment may not contain two
++     consecutive hyphens. It is worse than a build break here:
++     MediaCodecsXmlParser reports BAD_VALUE
++     for a malformed file, combineStatus() does NOT downgrade that to OK, and
++     Codec2InfoBuilder.cpp:503-506 then returns without registering ANY Codec2
++     component. A stray double hyphen makes the hardware decoder vanish from
++     MediaCodecList entirely.
++-->
++<MediaCodecs>
++   <Decoders>
++       <MediaCodec name="c2.v4l2.avc.decoder" type="video/avc" >
++           <Limit name="size" min="16x16" max="1920x1088" />
++           <Limit name="alignment" value="2x2" />
++           <Limit name="block-size" value="16x16" />
++           <Limit name="blocks-per-second" min="1" max="489600" />
++           <Limit name="bitrate" range="1-62500000" />
++           <Limit name="concurrent-instances" max="8" />
++           <Limit name="performance-point-1920x1080" range="30-30" />
++           <Feature name="adaptive-playback" />
++       </MediaCodec>
++   </Decoders>
++</MediaCodecs>

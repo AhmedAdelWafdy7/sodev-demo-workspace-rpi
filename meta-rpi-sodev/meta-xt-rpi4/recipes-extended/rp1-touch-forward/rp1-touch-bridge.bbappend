@@ -5,7 +5,8 @@
 # WHY
 # 72-rp1-touch-output.rules tags every touchscreen interface WL_OUTPUT=HDMI-A-2 because
 # on the reference board AAOS/DomA lives on that output. On THIS RPi4 only HDMI-A-1 has a
-# panel attached -- /sys/class/drm reads
+# panel attached -- /sys/class/drm read (2026-08-04, the 12.3FHD panel; the Onlap1102I
+# used since 2026-09-23 is on the same connector)
 #     card0-HDMI-A-1: connected 1920x720
 #     card0-HDMI-A-2: disconnected
 # -- so DomA was moved to HDMI-A-1 in weston.ini (see the note in that file). The touch

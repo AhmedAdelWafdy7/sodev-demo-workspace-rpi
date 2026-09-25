@@ -198,8 +198,8 @@ VC4GRAPHICS = "0"
 # status="okay" — and enabling them host-side would only hand the ones this design
 # deliberately does NOT pass through (pixelvalve0/1/3, vec) to the control Dom0.
 # The overlay's CMA sizing is not needed either: boot.cmd deletes
-# /reserved-memory/linux,cma and DomD takes its CMA from `cma=192M` on its own
-# command line.
+# /reserved-memory/linux,cma and DomD takes its CMA from `cma=` on its own command
+# line (the value and its reason are at the DomD bootargs in boot.cmd).
 RPI_EXTRA_CONFIG:append = "\n# --- DomD owns HDMI: keep the firmware out of the display path ---\ndisable_fw_kms_setup=1\ndisable_splash=1\n"
 
 # -----------------------------------------------------------------------------

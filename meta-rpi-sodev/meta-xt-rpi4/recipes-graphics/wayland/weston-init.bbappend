@@ -23,7 +23,8 @@ do_install:append() {
 FILES:${PN} += "${systemd_system_unitdir}/weston.service.d/96-vt-bind.conf"
 
 # --------------------------------------------------------------------------------
-# 2. RPi4 board wiring fix: the 1920x720 panel is on micro-HDMI 1, not micro-HDMI 2.
+# 2. RPi4 board wiring fix: the panel is on micro-HDMI 1, and DomA drives it at
+#    1280x720 (CEA-861 VIC 4).
 #
 # WHY THIS EXISTS
 # meta-xt-driver-domain's weston.ini pins an explicit modeline per output and says so
@@ -33,34 +34,36 @@ FILES:${PN} += "${systemd_system_unitdir}/weston.service.d/96-vt-bind.conf"
 #   [output] HDMI-A-1   mode=111.75 1920 2016 2208 2496 720 723 733 748 -hsync +vsync
 #            "HDMI-A-1 has no EDID at all", so this is `cvt 1920 720 60` output.
 #   [output] HDMI-A-2   mode=93.24  1920 1968 2010 2100 720 723 733 740 +hsync +vsync
-#            the panel's own preferred DTD, transcribed from its EDID (PNP RTD,
-#            model "12.3FHD").
+#            the 12.3FHD panel's own preferred DTD, transcribed from its EDID.
 #
-# On this RPi4 bench the SAME "12.3FHD" panel is plugged into micro-HDMI 1. Measured
-# on hardware with modetest (2026-08-04):
-#
-#   35 34 connected HDMI-A-1
-#     #0 1920x720 60.00 1920 1968 2010 2100 720 723 733 740 93240 phsync pvsync
-#        type: preferred, driver
-#   EDID: ... 00 fc 00 31 32 2e 33 46 48 44   ("12.3FHD")
-#
-# i.e. HDMI-A-1 DOES have an EDID here, and its preferred timing is the 93.24 MHz one
-# the upstream file assigns to HDMI-A-2. Forcing the 111.75 MHz CVT timing onto a
-# fixed-timing panel makes every atomic commit fail:
+# On this RPi4 bench the panel is on micro-HDMI 1 and it HAS an EDID, so HDMI-A-1
+# needs a timing that panel accepts. A computed CVT timing on a fixed-timing panel
+# makes every atomic commit fail (measured 2026-08-04 with the 12.3FHD panel):
 #
 #   weston[555]: atomic: couldn't commit new state: Invalid argument
 #   weston[555]: repaint-flush failed: No such file or directory
 #
 # repeated forever, so weston never presents a frame and the CRTC keeps scanning out
-# fbcon's framebuffer -- the panel shows the DomD text console. Confirmed by
-# /sys/kernel/debug/dri/1/state reporting `allocated by = [fbcon]` while weston was
-# active, and fixed by this sed: after it, the same file reports `allocated by =
-# weston` (XR24, 1920x720), the EINVAL storm stops, and weston-flower was VISIBLE on
-# the panel (verified with a webcam, 2026-08-04).
+# fbcon's framebuffer -- the panel shows the DomD text console
+# (/sys/kernel/debug/dri/1/state: `allocated by = [fbcon]`). Always take the mode
+# from the panel's own EDID.
 #
-# Only HDMI-A-1's modeline changes. The app-ids routing is untouched, so DomU still
-# lands on HDMI-A-1 (`app-ids=qemu-system-aarch64-domu,DomU`) and DomA on HDMI-A-2 --
-# which is what we want, since HDMI-A-1 is the connector with the panel on it.
+# THE PANEL AND THE MODE (2026-09-23). The bench panel is now an Onlap1102I:
+# 1920x1080 native (DTD 1 = VIC 16), and its EDID also lists 1280x720@60, 74.25 MHz
+# (VIC 4, DTD 5). DomA runs at 1280x720 and the panel scales it up, because GPU
+# load was measured to decide it -- a 1080p24 video playing in a WebView with
+# hardware decode, full Vulkan:
+#   1920x1080 (VIC 16)   6.9 fps shown, V3D render 97.8% / tfu 54.0% (saturated)
+#   1280x720  (VIC 4)    9.2 fps shown, V3D render 77.2% / tfu 34.4%
+# SurfaceFlinger, qemu's scanout blit and weston all compose on the same V3D, so the
+# display size is paid three times. The guest side of the same size is doma.cfg's
+# virtio-gpu xres/yres, rewritten by this layer's xt-xen-cfg-doma bbappend; the two
+# must agree, since a mismatch does not fail -- kiosk-shell just scales the surface.
+#
+# Only HDMI-A-1's modeline changes. HDMI-A-2 keeps the shared file's 93.24 MHz line,
+# and the guard below requires that, so the shared weston.ini's HDMI-A-2 section
+# stays exactly as the common recipe ships it. Which guest lands on which output is
+# section 3.
 #
 # If the bench is ever rewired to the upstream arrangement, drop this bbappend rather
 # than editing it: the point is that the DEFAULT file describes upstream's wiring.
@@ -72,7 +75,8 @@ FILES:${PN} += "${systemd_system_unitdir}/weston.service.d/96-vt-bind.conf"
 do_install[postfuncs] += "rpi4_hdmi1_modeline"
 
 RPI4_HDMI1_CVT_MODE ?= "mode=111.75 1920 2016 2208 2496 720 723 733 748 -hsync +vsync"
-RPI4_HDMI1_PANEL_MODE ?= "mode=93.24 1920 1968 2010 2100 720 723 733 740 +hsync +vsync"
+RPI4_HDMI1_PANEL_MODE ?= "mode=74.25 1280 1390 1430 1650 720 725 730 750 +hsync +vsync"
+RPI4_HDMI2_UPSTREAM_MODE ?= "mode=93.24 1920 1968 2010 2100 720 723 733 740 +hsync +vsync"
 
 rpi4_hdmi1_modeline:raspberrypi4-64() {
     ini="${D}${sysconfdir}/xdg/weston/weston.ini"
@@ -95,23 +99,27 @@ $ini. Looked for:\n  ${RPI4_HDMI1_CVT_MODE}\nRe-derive it from \
 modetest on the board before touching this."
     fi
 
-    # Only the FIRST occurrence, which is HDMI-A-1's -- HDMI-A-2 keeps its own line.
-    sed -i "0,\|^${RPI4_HDMI1_CVT_MODE}\$|s||${RPI4_HDMI1_PANEL_MODE}|" "$ini"
+    sed -i "s|^${RPI4_HDMI1_CVT_MODE}\$|${RPI4_HDMI1_PANEL_MODE}|" "$ini"
 
-    if ! grep -qxF '${RPI4_HDMI1_PANEL_MODE}' "$ini"; then
-        bbfatal "weston-init.bbappend (rpi4): sed did not apply to $ini"
-    fi
+    # The new line exactly once, in HDMI-A-1's section; HDMI-A-2's line untouched.
     n=$(grep -cxF '${RPI4_HDMI1_PANEL_MODE}' "$ini")
-    if [ "$n" != "2" ]; then
-        bbfatal "weston-init.bbappend (rpi4): expected the panel modeline on BOTH \
-outputs after the sed (HDMI-A-1 rewritten + HDMI-A-2 original), found $n in $ini"
+    sec=$(awk '/^name=/{o=$0} $0=="${RPI4_HDMI1_PANEL_MODE}"{print o}' "$ini")
+    if [ "$n" != "1" ] || [ "$sec" != "name=HDMI-A-1" ]; then
+        bbfatal "weston-init.bbappend (rpi4): expected the panel modeline once, in \
+HDMI-A-1's section, after the sed; found $n (section '$sec') in $ini"
+    fi
+    n=$(grep -cxF '${RPI4_HDMI2_UPSTREAM_MODE}' "$ini")
+    sec=$(awk '/^name=/{o=$0} $0=="${RPI4_HDMI2_UPSTREAM_MODE}"{print o}' "$ini")
+    if [ "$n" != "1" ] || [ "$sec" != "name=HDMI-A-2" ]; then
+        bbfatal "weston-init.bbappend (rpi4): HDMI-A-2's upstream modeline must stay \
+once in its own section; found $n (section '$sec') in $ini"
     fi
     bbnote "weston-init.bbappend (rpi4): HDMI-A-1 modeline -> ${RPI4_HDMI1_PANEL_MODE}"
 }
 
 # The sed above edits a file the shared layer ships, so this bbappend's task hash must
-# change when either modeline string does.
-do_install[vardeps] += "RPI4_HDMI1_CVT_MODE RPI4_HDMI1_PANEL_MODE"
+# change when any of the modeline strings does.
+do_install[vardeps] += "RPI4_HDMI1_CVT_MODE RPI4_HDMI1_PANEL_MODE RPI4_HDMI2_UPSTREAM_MODE"
 
 # 3. Same board wiring, second consequence: WHICH GUEST gets the attached panel.
 #

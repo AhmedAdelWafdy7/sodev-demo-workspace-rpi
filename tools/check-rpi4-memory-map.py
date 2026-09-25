@@ -17,6 +17,8 @@ Derived from, never duplicated:
   * boot.cmd.xen.{zephyr,linux}-dom0.in          -- Dom0's size, from the live
       xen,xen-bootargs (both files also mention other dom0_mem values in comments)
   * meta-xt-domu/.../files/domu.cfg              -- DomU's size
+  * rpi4-sodev.yaml, rpi5-sodev.yaml             -- XT_DOMA_HWDEC per GPU lane
+      and Dom0 flavour
 
 What it checks, and why each one can actually go wrong:
 
@@ -34,7 +36,10 @@ What it checks, and why each one can actually go wrong:
      the only VideoCore-visible window and carries vc4's CMA and DomD's ZONE_DMA;
   7. the domain budget fits 3956 MiB for every (SKU, Dom0 flavour, lane), and the
      Venus transfer is neutral: DomD gains exactly what DomA gives up;
-  8. DomA's size in the bbappend agrees with what the boot script's echo claims.
+  8. DomA's size in the bbappend agrees with what the boot script's echo claims;
+  9. in both board yamls XT_DOMA_HWDEC is false on the gl lane, and true on
+     the vulkan lane with the zephyr Dom0 -- the guest's decoder needs the
+     qemu 10.0.2 device model and, on 4 GiB, the venus lane's 1408 MiB DomD.
 
 Usage: tools/check-rpi4-memory-map.py [--strict-budget]
 Exit status is non-zero if any check fails. --strict-budget additionally fails the
@@ -94,6 +99,10 @@ XEN_OVERHEAD_MiB = 80
 # two here would be the same drift the rest of it exists to prevent.
 DOMU_CFG = os.path.join(ROOT, "meta-rpi-sodev", "meta-xt-common", "meta-xt-domu",
                         "recipes-extended", "xt-xen-cfg-domu", "files", "domu.cfg")
+
+# Both board yamls, for the one cross-check that is not about memory: the guest's
+# hardware-decode build has to be gated on the SAME lane as the memory transfer.
+BOARD_YAMLS = {b: os.path.join(ROOT, "%s-sodev.yaml" % b) for b in ("rpi4", "rpi5")}
 
 # A module's load slot. The address is parsed; the size is not knowable here, so a
 # flat slot is assumed. Over-reserving can only cause a false alarm, never hide a
@@ -262,6 +271,49 @@ def parse_domu_mem():
     return int(m[0])
 
 
+def parse_hwdec_gate(path):
+    """XT_DOMA_HWDEC as the GPU parameter sets it, per lane.
+
+    The value reaches the AOSP build through the doma builder's env, and the guest's
+    hardware-decode additions are inside `ifeq ($(XT_DOMA_HWDEC),true)`. It must
+    never be true off the venus lane: the decoder the guest talks to is a
+    virtio-media device, which only the qemu 10.0.2 device model has.
+
+    The vulkan branch names %{XT_DOMA_HWDEC_VULKAN}, which the top-level
+    variables set and a Dom0 flavour can override, so the result is per
+    (lane, flavour), and a reference is resolved the way moulin resolves it:
+    the flavour's own variables first, then the top-level ones.
+    """
+    text = read(path)
+
+    def var(block, name):
+        m = re.search(r'^\s*%s:\s*"([^"]*)"' % name, block, re.M)
+        return m.group(1) if m else None
+
+    # The GPU branches are `    "gl":` / `    "vulkan":` at four spaces of
+    # indent inside `  GPU:`, the flavours `    zephyr:` / `    linux:` inside
+    # `  DOM0_OS:`; each branch runs up to the next one or the next key.
+    top = re.search(r"^variables:\n(.*?)(?=^[a-z])", text, re.M | re.S)
+    dom0 = re.search(r"^  DOM0_OS:\n(.*?)(?=^  \S)", text, re.M | re.S)
+    gpu = re.search(r"^  GPU:\n(.*?)(?=^  \S)", text, re.M | re.S)
+    if not (top and dom0 and gpu):
+        raise SystemExit("no variables, DOM0_OS or GPU in %s" % path)
+    out = {}
+    for flavour in ("zephyr", "linux"):
+        fl = re.search(r"^    %s:\n(.*?)(?=^    \S|\Z)" % flavour,
+                       dom0.group(1), re.M | re.S)
+        for lane in ("gl", "vulkan"):
+            br = re.search(r'^    "%s":\n(.*?)(?=^    "|\Z)' % lane,
+                           gpu.group(1), re.M | re.S)
+            v = var(br.group(1), "XT_DOMA_HWDEC") if br else None
+            ref = re.fullmatch(r"%\{(\w+)\}", v or "")
+            if ref:
+                v = (var(fl.group(1), ref.group(1)) if fl else None) \
+                    or var(top.group(1), ref.group(1))
+            out[(lane, flavour)] = v
+    return out
+
+
 def check_banks(banks, memory_kib, sku, label):
     s = sorted(banks)
     overlap = False
@@ -427,6 +479,36 @@ def main():
         ok("4g/venus: an echo mentions DomA %d MiB, matching the bbappend" % a)
     else:
         bad("4g/venus: the bbappend says DomA %d MiB but no echo mentions it" % a)
+
+    # --- the hardware-decode gate must ride the venus lane -----------------
+    #
+    # This is the one check here that is not about addresses. It belongs in this file
+    # because of what it prevents: the 4 GiB DomD expansion to 1408 MiB is gated on
+    # venus_lane, and hardware decode is what NEEDS that expansion (a 1024 MiB DomD
+    # thrashes its page cache during 1080p playback). If XT_DOMA_HWDEC were ever
+    # switched on for the gl lane, the guest would ask for a decoder that lane has no
+    # device model for, AND it would do so with DomD at 1024 MiB. Widening the memory
+    # gate instead would be the wrong fix: it would give the gl lane a DT that its
+    # device model does not match.
+    #
+    # A Dom0 flavour may leave the decoder out on the vulkan lane too (rpi5's
+    # linux flavour does), which is safe in both directions; what must hold is
+    # false on gl in every flavour and true on vulkan with the zephyr Dom0, the
+    # default.
+    hdr("the hardware-decode gate follows the venus lane")
+    for board, path in sorted(BOARD_YAMLS.items()):
+        gate = parse_hwdec_gate(path)
+        linux = gate[("vulkan", "linux")]
+        if gate[("gl", "zephyr")] == gate[("gl", "linux")] == "false" \
+                and gate[("vulkan", "zephyr")] == "true" \
+                and linux in ("true", "false"):
+            ok("%s: XT_DOMA_HWDEC is false on gl and true on vulkan "
+               "(linux Dom0: %s)" % (board, linux))
+        else:
+            bad("%s: XT_DOMA_HWDEC is %r -- it must be false on gl and true "
+                "on vulkan with the zephyr Dom0, because the decoder is a "
+                "virtio-media device and only qemu 10.0.2 provides one"
+                % (board, gate))
 
     print("\n%d ok, %d failure(s)" % (PASS, FAIL))
     return 1 if FAIL else 0

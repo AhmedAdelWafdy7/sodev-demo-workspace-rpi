@@ -289,6 +289,14 @@ The Yocto-built DomD host services need no equivalent: meta-raspberrypi's own
   says so in its header. It has to be regenerated before anyone tries the libxl route on
   this board — which is also where the missing interrupt-type information in
   `irqs=[...]` would bite.
+* **DomA's 1280x720 needs a panel whose EDID lists 1280x720@60.** weston
+  drives HDMI-A-1 with CEA-861 VIC 4 (74.25 MHz), which the bench panel, an
+  Onlap1102I, lists, and the panel scales it up. On a panel that does not
+  accept that timing, weston's atomic commits fail and it never presents a
+  frame: the failure `recipes-graphics/wayland/weston-init.bbappend` records
+  for a computed timing on a fixed-timing panel. Only the Onlap1102I has run
+  at this size; for another panel take the modeline from its EDID and give
+  DomA the same size in `RPI4_DOMA_GPU_RES`.
 * **This board has its own checker: `tools/check-rpi4-memory-map.py`.** The BCM2712
   tool (`tools/check-memory-map.py`) has no rpi4 rows, so the invariants the boot
   scripts and recipes here describe are enforced by the rpi4 tool instead: banks and
@@ -312,7 +320,7 @@ recipes-extended/rp1-touch-forward/     retarget the touch panel to the attached
 recipes-extended/xen/                   Xen 4.22 series + hypervisor Kconfig + BCM2711 passthrough quirks
 recipes-extended/xt-aaos-host-services/ widen COMPATIBLE_MACHINE for the AAOS host services
 recipes-extended/xt-rpi5-domain/        per-domain CPU pinning (recipe name shared with meta-xt-common)
-recipes-extended/xt-xen-cfg-{doma,domu}/ DomA size, DomU vcpu pinning
+recipes-extended/xt-xen-cfg-{doma,domu}/ DomA memory and 1280x720 display, DomU vcpu pinning
 recipes-graphics/wayland/               weston output map and the HDMI-A-1 modeline
 recipes-guest/domd-vc4/                 DomD partial device tree (the file boot.cmd loads)
 recipes-kernel/linux/                   DT set, passthrough overlays, BCM2711 driver fragment

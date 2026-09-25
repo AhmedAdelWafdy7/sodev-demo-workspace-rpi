@@ -193,11 +193,11 @@ fdt resize 32768
 # -----------------------------------------------------------------------------
 # Unlike the RPi5 script, every device this overlay touches is marked with a
 # real &label. That is safe here because all of those labels were verified to
-# exist in the shipped bcm2711-rpi-4-b.dtb __symbols__ — check that by applying
-# the compiled .dtbo onto the stock DTB with fdtoverlay before changing any label
-# here. So the RPi5 workaround of re-marking everything with path-based
-# `fdt set ... xen,passthrough` at runtime is unnecessary, and only the two
-# genuinely flavour-specific decisions are made below.
+# exist in the shipped bcm2711-rpi-4-b.dtb __symbols__ -- check that by
+# applying the compiled .dtbo onto the stock DTB with fdtoverlay before
+# changing any label here. So the RPi5 workaround of re-marking everything with
+# path-based `fdt set ... xen,passthrough` at runtime is unnecessary, and only
+# the genuinely flavour-specific decisions are made below.
 fatload mmc 0 0x2200000 bcm2711-raspberrypi4-64-xen.dtbo
 fdt apply 0x2200000
 
@@ -227,7 +227,8 @@ fdt apply 0x2200000
 # clean), weston kept DRM master on VT7 and the guest surface kept being
 # composited. "in use" barely moves because most of the difference is reclaimable
 # page cache; the hard floor is ~630 MiB, of which CMA 128 + V3D GEM BOs ~207
-# (Shmem) + qemu ~101 + weston ~34.
+# (Shmem) + qemu ~101 + weston ~34. Those rows were measured with cma=128M; DomD
+# now reserves 256M (see the DomD bootargs), which raises that floor by 128 MiB.
 #
 # Those same runs pin Xen's own overhead, which the older comments guessed at
 # "~64 MiB":  3956 - (Dom0 + DomD + DomU) - free_memory = 80 / 79 / 78 MiB across
@@ -249,7 +250,7 @@ fdt apply 0x2200000
 # here -- that needs the 8 GiB SKU.
 #
 # Do NOT shrink bank1 to buy more: it is the only VideoCore-reachable window, and
-# CMA 128 MiB plus the V3D scanout buffers live in it.
+# DomD's CMA (256 MiB) plus the V3D scanout buffers live in it.
 #
 # bank0 at 640 MiB is still far more than place_modules() needs for DomD's
 # kernel + DTB (27 MiB + 14 KiB), and the module LOAD addresses (0xa0000000 DTB,
@@ -285,6 +286,15 @@ if test "${board_ram}" = "4g" ; then
     # and far above the 1 GiB lowmem window allocate_memory_11() scans for Dom0's
     # bank[0] at 0x20000000 -- so Dom0's placement, the module load addresses
     # (0xa0000000 DTB, 0xa4000000 kernel) and the whole low map are unaffected.
+    # HARDWARE DECODE RIDES THIS SAME GATE, and that is deliberate. A 1024 MiB DomD
+    # thrashes its page cache during 1080p playback (measured on the board), so the
+    # decode path needs the 1408 MiB this block gives. It is not gated separately
+    # because it cannot be: the guest's decoder is a virtio-media device, which only
+    # the qemu 10.0.2 device model provides, and that is the venus lane. The board
+    # yaml sets XT_DOMA_HWDEC from the same GPU parameter, and
+    # tools/check-rpi4-memory-map.py asserts the two stay coupled. Do NOT widen this
+    # condition to cover a gl-lane hardware-decode build: it would hand the gl lane a
+    # DT its device model does not match.
     if test "${venus_lane}" = "yes" ; then
         echo "venus_lane=yes: DomD 1408 MiB (bank0 1024 MiB); DomA drops to 2176"
         fdt set /chosen/domD memory <0x0 0x160000>
@@ -635,7 +645,8 @@ if fatload mmc 0 0xa4000000 Image ; then
     #                          once the vpl011 FIFO filled, and the PV console
     #                          ring overflowed the same way. `quiet loglevel=3`
     #                          keeps the early flood below both limits.
-    #   cma=128M               vc4's display buffers. DomD's ZONE_DMA is static-mem
+    #   cma=256M               vc4's display buffers and the hardware H.264 decoder's
+    #                          (bcm2835-codec) buffers. DomD's ZONE_DMA is static-mem
     #                          bank1 (0x08000000+384 MiB) because the partial DT's
     #                          soc_bus/emmc2_bus dma-ranges cap
     #                          of_dma_get_max_cpu_address() at 0x20000000, so
@@ -646,6 +657,12 @@ if fatload mmc 0 0xa4000000 Image ; then
     #                          the 384 MiB low bank. With DomD booting from xvda the
     #                          initramfs is gone, and upstream reduced CMA to match.
     #                          128 + 64 = 192 MiB of 384 MiB, so the headroom grew.
+    #                          128M -> 256M: a 1080p30 decode exhausted 128M (measured
+    #                          in the zephyr flavour 2026-09-15; see the note on its
+    #                          DomD bootargs). The decoder runs in DomD in both
+    #                          flavours, so the same reservation applies here; not
+    #                          yet measured in this flavour. 256 + 64 = 320 MiB of
+    #                          384 MiB, leaving 64 MiB of ordinary ZONE_DMA.
     #   xen_privcmd.unrestricted=1
     #                          Linux 6.18 restricts privcmd by default when
     #                          !xen_initial_domain(); a dom0less DomD has no
@@ -667,7 +684,7 @@ if fatload mmc 0 0xa4000000 Image ; then
     #                          domd-gpu-init.service. NOTE this makes DomD depend on
     #                          a working PV block frontend, i.e. on xenbus coming up
     #                          in DomD -- see README.md "Known limitations" for the RPi4 blocker.
-    fdt set /chosen/domD/module@0 bootargs "console=ttyAMA0 root=/dev/xvda rootwait rw clk_ignore_unused vhost_xen.nogrant=1 xen_privcmd.unrestricted=1 cma=128M net.ifnames=0 quiet loglevel=3"
+    fdt set /chosen/domD/module@0 bootargs "console=ttyAMA0 root=/dev/xvda rootwait rw clk_ignore_unused vhost_xen.nogrant=1 xen_privcmd.unrestricted=1 cma=256M net.ifnames=0 quiet loglevel=3"
 
     fdt mknode /chosen/domD module@1
     fdt set /chosen/domD/module@1 compatible "multiboot,device-tree" "multiboot,module"

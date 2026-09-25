@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Assisted-by: Claude Code:claude-opus-4-8
-# DomA's guest memory on Raspberry Pi 4.
+# DomA's guest memory, display size and decoded-frame width on Raspberry Pi 4.
 #
 # xt-xen-cfg-doma lives in meta-xt-common because DomA's xl configuration is
 # board-independent apart from its size, and this port keeps that layer's doma.cfg
-# byte-identical. Only the number changes here.
+# byte-identical. Only the memory size, the virtio-gpu resolution and the
+# virtio-media backend's host-max-width change here.
 #
 # WHY 2560 MiB
 # The 8 GiB Pi 4 has to fit four domains into what is left after the boot-time
@@ -63,3 +64,52 @@
 VENUS_LANE = "${@bb.utils.contains('DISTRO_FEATURES', 'venus', 'yes', 'no', d)}"
 DOMA_MEM_MiB:raspberrypi4-64 = "${@'2176' if (d.getVar('BOARD_RAM') == '4g' and d.getVar('VENUS_LANE') == 'yes') else '2560'}"
 do_install[vardeps] += "BOARD_RAM VENUS_LANE"
+
+# DomA's display is 1280x720 on this board: the 1920x1080 Onlap1102I panel on
+# HDMI-A-1 is driven at CEA-861 VIC 4 and scales it up. The size was chosen by
+# measured GPU load, and the weston side of it (HDMI-A-1's modeline) is this layer's
+# weston-init.bbappend -- see there. The guest's resolution is what the device model
+# reports as ui_info, i.e. virtio-gpu-gl-pci's xres/yres; AAOS follows it. The two
+# must agree: a mismatch does not fail, kiosk-shell just scales the guest surface.
+do_install[postfuncs] += "rpi4_doma_gpu_720p"
+
+RPI4_DOMA_GPU_RES_FROM ?= "xres=1920,yres=720"
+RPI4_DOMA_GPU_RES ?= "xres=1280,yres=720"
+
+rpi4_doma_gpu_720p:raspberrypi4-64() {
+    cfg="${D}${sysconfdir}/xen/doma.cfg"
+    [ -f "$cfg" ] || bbfatal "xt-xen-cfg-doma.bbappend (rpi4): $cfg not installed"
+    n=$(grep -c "virtio-gpu-gl-pci,.*,${RPI4_DOMA_GPU_RES_FROM}" "$cfg")
+    if [ "$n" != "1" ]; then
+        bbfatal "xt-xen-cfg-doma.bbappend (rpi4): expected one virtio-gpu line with \
+'${RPI4_DOMA_GPU_RES_FROM}' in $cfg, found $n"
+    fi
+    sed -i "/virtio-gpu-gl-pci,/s|,${RPI4_DOMA_GPU_RES_FROM}|,${RPI4_DOMA_GPU_RES}|" "$cfg"
+    n=$(grep -c "virtio-gpu-gl-pci,.*,${RPI4_DOMA_GPU_RES}" "$cfg")
+    if [ "$n" != "1" ] || grep -q "${RPI4_DOMA_GPU_RES_FROM}" "$cfg"; then
+        bbfatal "xt-xen-cfg-doma.bbappend (rpi4): the virtio-gpu resolution rewrite did \
+not apply cleanly to $cfg"
+    fi
+    bbnote "xt-xen-cfg-doma.bbappend (rpi4): DomA virtio-gpu -> ${RPI4_DOMA_GPU_RES}"
+}
+
+# Default is a no-op: bitbake gives a postfunc its flags from the unsuffixed
+# definition, so without it exec_func fails with "'NoneType' object has no
+# attribute 'get'".
+rpi4_doma_gpu_720p() {
+    :
+}
+
+do_install[vardeps] += "RPI4_DOMA_GPU_RES_FROM RPI4_DOMA_GPU_RES"
+
+# A stream wider than DomA's display reaches DomA at the display's width: qemu
+# 0246's host-max-width scales it down in the NV12 -> RGBA shader, so a 1080p
+# stream arrives visible at 1280x720 and SurfaceFlinger composes it 1:1 instead
+# of sampling 1920x1088 and scaling it. Measured at 1080p30 (2026-09-24, with
+# the guest's frame rate override off): SF 27.1-28.8 -> 29.2-29.7 fps, missed
+# 5.3-7.8 -> 0.9-1.3/s. The width comes from RPI4_DOMA_GPU_RES so the two
+# cannot disagree; int() stops the parse if xres is not a number. The device
+# model must carry 0246: qemu refuses an unknown property and DomA then does
+# not start, so this doma.cfg does not go onto a board without the qemu.
+RPI4_DOMA_HWDEC_MAX_W ?= "${@int(d.getVar('RPI4_DOMA_GPU_RES').split('xres=')[1].split(',')[0])}"
+XT_DOMA_HWDEC_DEVARG:append:raspberrypi4-64 = ",host-max-width=${RPI4_DOMA_HWDEC_MAX_W}"

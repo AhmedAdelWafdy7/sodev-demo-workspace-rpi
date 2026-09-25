@@ -272,6 +272,41 @@
 &avs_monitor { xen,passthrough; };
 
 /*
+ * vchiq needs a marker of its own. The host DT's label `mailbox` resolves to
+ * /soc/mailbox@7e00b880, the FIRMWARE mailbox on GIC SPI 33, so &mailbox above
+ * does NOT cover /soc/mailbox@7e00b840, the node the label `vchiq` names. That
+ * second node is vchiq, the VideoCore host interface bcm2835-codec reaches the
+ * only H.264 decode hardware on BCM2711 through, and it raises a GIC SPI of its
+ * own, 34.
+ *
+ * Unmarked it is assigned to the hardware domain with SPI 34 routed there, and
+ * DomD's claim on the same line then aborts domain construction outright -- so
+ * the failure is a reboot loop with no DomD to log into, not a missing decoder
+ * (measured on the board, 2026-08-26):
+ *     (XEN) IRQ 66 is already used by domain 0     <- 66 = 32 + SPI 34
+ *     (XEN) Unable to map IRQ66 to d1
+ *     (XEN) Failed to assign device to d1
+ *     (XEN) Device tree generation failed (-16).
+ *     (XEN) Panic on CPU 0: Could not set up domain domD (rc = -22)
+ *
+ * It must never become `fdt rm` either: handle_passthrough_prop() resolves
+ * DomD's xen,path against the HOST DT, so deleting the node turns DomD's claim
+ * into -EINVAL and panics domain construction.
+ */
+&vchiq       { xen,passthrough; };
+
+/*
+ * dma40 (/scb/dma@7e007b00, brcm,bcm2711-dma, GIC SPI 89-92): the 40-bit DMA
+ * controller the DomD partial DT claims with xen,path. Hardware H.264 decode
+ * needs it in DomD: vchiq refuses to probe without a brcm,bcm2711-dma node --
+ * see the dma40 note in bcm2711-raspberrypi4-64-domd-vc4.dts. Unmarked it fails
+ * exactly as vchiq above: SPI 89-92 go to the hardware domain first and DomD's
+ * claim aborts domain construction. The shipped host DTB exports the node as the
+ * label `dma40`.
+ */
+&dma40       { xen,passthrough; };
+
+/*
  * bcm2835-pm (/soc/watchdog@7e100000): V3D's power domain (<&pm 1> =
  * BCM2835_POWER_DOMAIN_GRAFX_V3D) and reset (<&pm 0> = BCM2835_RESET_V3D), which
  * the DomD partial DT claims with xen,path. Without this marker BOTH domains own

@@ -31,14 +31,25 @@
  *    mapping (guest IPA == host PA) because DomD is direct-map.
  *  - a node with xen,path MUST also have xen,reg (else -EINVAL), and the IRQs
  *    of the *host* node named by xen,path are what get routed to DomD.
- *  - every host page must be mapped exactly ONCE across the whole partial DT.
- *    This is OUR rule, not Xen's: a duplicate xen,reg does not fail, because
- *    map_regions_p2mt() -> p2m_insert_mapping() -> p2m_set_entry()
+ *  - every host page is mapped exactly ONCE across the whole partial DT, with
+ *    TWO deliberate exceptions: page 0xfe00b000, declared identically by
+ *    mailbox@fe00b880 and by vchiq (mailbox@fe00b840), and page 0xfe007000,
+ *    declared identically by the legacy DMA engine (dma-controller@fe007000)
+ *    and by dma40 (dma@fe007b00).
+ *    Single ownership is OUR rule, not Xen's: a duplicate xen,reg does not fail,
+ *    because map_regions_p2mt() -> p2m_insert_mapping() -> p2m_set_entry()
  *    (xen/arch/arm/p2m.c:113) overwrites the existing entry. It matters because a
- *    page mapped twice means two nodes each believe they own it, and the second
- *    one's intent is silently discarded. Devices sharing a 4 KiB page are
+ *    page mapped twice usually means two nodes each believe they own it, and the
+ *    second one's intent is silently discarded. Devices sharing a 4 KiB page are
  *    therefore represented as one "owner" node carrying xen,path+xen,reg plus
  *    plain sibling nodes with no xen,* properties at all.
+ *    Both exceptions are forced rather than chosen: each second node has GIC
+ *    SPIs OF ITS OWN (vchiq 34 against the firmware mailbox's 33; dma40 89-92
+ *    against the legacy engine's 80-88), Xen routes a node's IRQs only from
+ *    the xen,path branch of handle_passthrough_prop(), and its caller rejects a
+ *    xen,path without xen,reg with -EINVAL, which panics domain construction.
+ *    There is no way to say "route the IRQ, the MMIO is already mapped". See the
+ *    note on vchiq's xen,reg for why repeating the mapping is safe.
  *  - IRQs whose interrupt-parent is not the GIC are skipped by Xen
  *    (map_interrupts_to_domain), so the HDMI L2 sub-IRQs need no GIC grant —
  *    only their L2 parent (aon_intr, GIC SPI 96) does.
@@ -293,10 +304,81 @@
 				/*
 				 * Page 0xfe00b000 also holds mailbox@7e00b840
 				 * (vchiq) and the dwc2 controller's second reg
-				 * block (0xfe00b200). Mapping it once here is
-				 * what covers them; usb@fe980000 below must NOT
-				 * map it again.
+				 * block (0xfe00b200), so this one mapping covers
+				 * all three; usb@fe980000 below must NOT map it
+				 * again. vchiq below DOES repeat it, deliberately
+				 * and identically -- see the note on its xen,reg.
 				 */
+				xen,reg = <0x0 0xfe00b000 0x0 0x1000 0x0 0xfe00b000>;
+				status = "okay";
+			};
+
+			/* ------------------------------------------------------------------
+			 * vchiq -- the VideoCore host interface the H.264 decoder rides on.
+			 *
+			 * WHY IT IS HERE
+			 * The only H.264 decode hardware reachable on BCM2711 is inside
+			 * VideoCore, driven through VCHIQ/MMAL by bcm2835-codec, which
+			 * presents a V4L2 M2M decoder. Without this node vchiq never binds
+			 * (CONFIG_BCM2835_VCHIQ=y, so it waits for the DT node, not for a
+			 * module), bcm2835-codec has nothing to talk to, no /dev/videoN
+			 * appears, and the virtio-media device DomA is given has no backend.
+			 * It also needs dma40 on scb_bus: on BCM2711 vchiq fails its probe
+			 * without a brcm,bcm2711-dma node (see there).
+			 *
+			 * The dedicated codec@7eb10000 block is HEVC-only and is deliberately
+			 * NOT added here: nothing on this product decodes HEVC (the guest's
+			 * decoder list is H.264 only), so it would be a node added for no user.
+			 *
+			 * The RPi5 has no vchiq node at all, which is why H.264 hardware
+			 * decode is RPi4-only on this platform.
+			 *
+			 * DELTAS FROM THE HOST NODE /soc/mailbox@7e00b840
+			 *
+			 *   pinctrl-0   Dropped. The host points at <&audio_pins> under
+			 *               gpio@7e200000 -- GPIO 40/41 muxed to ALT0, i.e. the
+			 *               analog PWM audio on the headphone jack. That has
+			 *               nothing to do with the mailbox transport this node is
+			 *               here for, DomA's audio goes out over HDMI, and DomD
+			 *               has no GPIO controller to apply it with.
+			 *
+			 *   xen,reg     Identical to the mailbox node's above, ON PURPOSE.
+			 *               vchiq's registers (0xfe00b840 + 0x3c) sit in the same
+			 *               4 KiB page as the mailbox's, and there is no way to
+			 *               say "route the IRQ, the MMIO is already mapped":
+			 *               handle_passthrough_prop()'s caller rejects a
+			 *               xen,path without xen,reg with -EINVAL, and -EINVAL
+			 *               there panics domain construction. Repeating the same
+			 *               mapping is safe on both counts the code cares about:
+			 *               map_regions_p2mt() ends in p2m_set_entry(), which
+			 *               overwrites an identical GFN->MFN entry rather than
+			 *               rejecting it, and the rangeset that tracks assigned
+			 *               guest ranges returns 0 for a range already contained
+			 *               -- that rangeset only feeds the memory-hole
+			 *               subtraction which keeps guest RAM off passthrough
+			 *               MMIO, so a duplicate is a no-op there. An empty
+			 *               xen,reg would also skip the mapping loop, but only
+			 *               because the length computes to 0 -- an unintended
+			 *               hole that one upstream length check would turn into a
+			 *               panic. If the duplicate is ever refused, Xen says so
+			 *               out loud with "Failed to map", which is worth more
+			 *               than a quiet trick.
+			 *
+			 * GIC SPI 34 is this node's alone -- no other host node names it, so
+			 * unlike mmcnr/emmc2 on SPI 126 there is no shared-line hazard here.
+			 *
+			 * The host side needs the matching release: &vchiq in
+			 * bcm2711-raspberrypi4-64-xen.dtso. The label `mailbox` resolves to
+			 * /soc/mailbox@7e00b880, the FIRMWARE mailbox on SPI 33, and does not
+			 * cover this node.
+			 * ------------------------------------------------------------------ */
+			vchiq: mailbox@fe00b840 {
+				compatible = "brcm,bcm2711-vchiq";
+				reg = <0x0 0xfe00b840 0x0 0x3c>;
+				interrupts = <0x0 34 0x4>;	/* GIC SPI 34 LEVEL_HIGH */
+				interrupt-parent = <&gic>;
+				xen,path = "/soc/mailbox@7e00b840";
+				xen,force-assign-without-iommu;
 				xen,reg = <0x0 0xfe00b000 0x0 0x1000 0x0 0xfe00b000>;
 				status = "okay";
 			};
@@ -486,8 +568,8 @@
 			 * (cec + ddc0's bsc) and the shared 0xfef20000 (hd).
 			 * `dmas`/`dma-names` for HDMI audio are dropped on
 			 * purpose — the equivalent of the vc4-kms-v3d overlay's
-			 * `noaudio` override; DomD's cockpit has no HDMI audio
-			 * and keeping them would pull /scb/dma@7e007b00 in.
+			 * `noaudio` override; DomD's cockpit has no HDMI audio,
+			 * so vc4 registers no HDMI sound card.
 			 */
 			hdmi0: hdmi@fef00700 {
 				compatible = "brcm,bcm2711-hdmi0";
@@ -982,7 +1064,7 @@
 
 		/* ==============================================================
 		 * scb_bus — identity DMA over 16 GiB, matching the host /scb.
-		 * Hosts the PCIe root complex (VL805 USB3) and GENET.
+		 * Hosts the PCIe root complex (VL805 USB3), GENET and dma40.
 		 *
 		 * CORRECTED(2026-07-26): this used to declare 3 GiB
 		 * (size 0xc0000000) while claiming to match the host — the host
@@ -1006,6 +1088,69 @@
 			#size-cells = <0x2>;
 			ranges;
 			dma-ranges = <0x0 0x0 0x0 0x0 0x4 0x0>;
+
+			/*
+			 * ---- 40-bit DMA controller (dma40) ----
+			 * Hardware H.264 decode needs it: vchiq_arm.c:219 looks the
+			 * controller up by compatible ("brcm,bcm2711-dma") and FAILS ITS
+			 * PROBE without it (measured 2026-09-23 on this board:
+			 *   bcm2835_vchiq fe00b840.mailbox: 40-bit DMA controller not found
+			 *   probe with driver bcm2835_vchiq failed with error -22
+			 * ), so bcm2835-codec never appears as /dev/video10, qemu's
+			 * virtio-media cannot open it, and xl create of DomA fails as a
+			 * whole.
+			 *
+			 * The host has TWO DMA controllers and DomD takes both, for
+			 * different users:
+			 *   /soc/dma@7e007000   brcm,bcm2835-dma   mask 0x7f5  Wi-Fi SDIO
+			 *                       (legacy_dma_bus below)
+			 *   /scb/dma@7e007b00   brcm,bcm2711-dma   mask 0x7000 this node
+			 *
+			 * `#dma-cells = <1>` is a DREQ number, not a channel index
+			 * (Documentation/devicetree/bindings/dma/brcm,bcm2835-dma.yaml);
+			 * requests are served out of the channel pool that
+			 * brcm,dma-channel-mask names -- 0x7000 = channels 12/13/14.
+			 * Keep the mask at the host value: narrowing it would
+			 * starve the pool, widening it would claim the legacy engine's
+			 * channels.
+			 *
+			 * xen,reg is page-aligned down to 0xfe007000 because the register
+			 * block starts at +0xb00 inside that page. The legacy engine
+			 * declares the same page: the second deliberate duplicate in this
+			 * file (see the header rules).
+			 *
+			 * The four IRQs are the host node's (GIC SPI 89-92, "dma11".."dma14");
+			 * the IRQs of the node named by xen,path are what Xen routes, and the
+			 * Xen host overlay marks /scb/dma@7e007b00 xen,passthrough so they are
+			 * not given to the hardware domain first.
+			 *
+			 * WHY scb_bus AND NOT soc_bus: the host DT has this controller under
+			 * /scb, and vchiq keeps its struct device (g_dma_dev in vchiq_core.c,
+			 * which it hands to dma_unmap_sg() and dma_free_coherent()), so the
+			 * node sits where its DMA window is the host's: scb_bus's identity
+			 * window over the full 16 GiB, which holds every DomD static-mem
+			 * bank; soc_bus would clamp it to the VideoCore alias window.
+			 *
+			 * OUTSIDE THE SD-STRIP BLOCK ON PURPOSE: both Dom0 flavours give vchiq
+			 * to DomD, so both need the controller.
+			 */
+			dma40: dma@fe007b00 {
+				compatible = "brcm,bcm2711-dma";
+				reg = <0x0 0xfe007b00 0x0 0x400>;
+				interrupts = <0x0 89 0x4>,
+					     <0x0 90 0x4>,
+					     <0x0 91 0x4>,
+					     <0x0 92 0x4>;
+				interrupt-names = "dma11", "dma12",
+						  "dma13", "dma14";
+				interrupt-parent = <&gic>;
+				#dma-cells = <0x1>;
+				brcm,dma-channel-mask = <0x7000>;
+				xen,path = "/scb/dma@7e007b00";
+				xen,force-assign-without-iommu;
+				xen,reg = <0x0 0xfe007000 0x0 0x1000 0x0 0xfe007000>;
+				status = "okay";
+			};
 
 			/*
 			 * ---- BCM2711 PCIe RC + VL805 xHCI (USB3) ----
@@ -1437,7 +1582,7 @@
 		 * DRAM through the alias above. Of DomD's three static-mem banks
 		 * (bcm2711-raspberrypi4-64-xen.dtso: 0x40000000+0x40000000,
 		 * 0x08000000+0x18000000, 0x80000000+0x20000000) ONLY bank1 is inside
-		 * it, and DomD's `cma=` reservation (128 MiB in the 4 GiB lane) takes
+		 * it, and DomD's `cma=` reservation (256 MiB) takes
 		 * part of that 384 MiB for vc4. Everything else is bounced by swiotlb
 		 * (CONFIG_SWIOTLB=y, and SWIOTLB_XEN is def_bool y on ARM64+XEN), so
 		 * the win over PIO is a memcpy trade, not a free ride -- and it is a
@@ -1459,22 +1604,22 @@
 		 *
 		 * ---- Page 0xfe007000 is shared with dma40 -----------------------
 		 * The legacy engine's registers (0xfe007000 + 0xb00) and dma40's
-		 * (/scb/dma@7e007b00, HDMI audio, 0xfe007b00 + 0x400) sit in the same
-		 * 4 KiB page, and dma40 is NOT passed through -- it stays with the
-		 * hardware domain. So this is the one page in this file that is
-		 * mapped into DomD while another domain also has it -- a deviation
-		 * from the one-domain-per-page habit the boot scripts follow when they
-		 * `fdt rm` uart2..uart5 out of pl011's page, not from the header rule
-		 * above, which is about one xen,reg owner per page WITHIN this file.
-		 * It is benign in both directions that matter: Xen has no cross-domain
-		 * MMIO
-		 * exclusivity check, the two register windows do not overlap, and in
-		 * the DOM0_OS=zephyr flavour this node ships in there is no Linux
-		 * hardware domain to bind bcm2835-dma to dma40 at all. The global
-		 * DMA_ENABLE register at 0xfe007ff0 is the one byte of genuinely
-		 * shared state (measured 0x00007fff, i.e. channels 0..14 all enabled);
-		 * the engine is already enabled before either domain starts, so
-		 * neither has to write it.
+		 * (/scb/dma@7e007b00, 0xfe007b00 + 0x400) sit in the same 4 KiB page.
+		 * Both engines are DomD's, so both nodes declare the page -- the
+		 * second deliberate xen,reg duplicate in this file (header rules),
+		 * forced the same way as vchiq's: each engine has its own SPIs
+		 * (80-88 here, 89-92 there) and Xen routes IRQs only from a node that
+		 * also carries xen,reg. The two register windows do not overlap, and
+		 * the global DMA_ENABLE register at 0xfe007ff0 is the one word of
+		 * genuinely shared state (measured 0x00007fff, i.e. channels 0..14
+		 * all enabled): the engine is already enabled before DomD starts, and
+		 * bcm2835-dma.c defines DMA_ENABLE but writes only per-channel
+		 * registers, so neither driver instance has to touch it.
+		 *
+		 * In the DOM0_OS=linux flavour this node is stripped (below) and the
+		 * legacy engine stays with Dom0 while dma40 is DomD's: the page is then
+		 * shared ACROSS domains, which Xen does not police and which is benign
+		 * for the same two reasons.
 		 *
 		 * Interrupts are copied exactly from the host, including the two lines
 		 * that repeat: dma7/dma8 both raise SPI 87 and dma9/dma10 both raise

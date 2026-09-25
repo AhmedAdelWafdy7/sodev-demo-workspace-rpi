@@ -107,6 +107,57 @@ DOMD_WIFI_PACKAGES:raspberrypi4-64 = " \
 IMAGE_INSTALL:append = " ${DOMD_WIFI_PACKAGES}"
 
 # ---------------------------------------------------------------------------
+# Hardware H.264 decode in DomD.
+#
+# WHAT THIS IS. The only H.264 decode hardware on BCM2711 lives inside VideoCore
+# and is reached through VCHIQ/MMAL by bcm2835-codec, which presents it as a V4L2
+# M2M decoder -- a STATEFUL one, which is why the guest can talk to it almost
+# directly once the device model proxies the node. This stanza gives DomD the
+# /dev/videoN that virtio-media is pointed at (XT_DOMA_HWDEC_DEVARG in
+# xt-xen-cfg-doma).
+#
+# The DT side is in place, and all of it is a prerequisite for any of these
+# modules binding: bcm2835-codec reaches VideoCore through VCHIQ, so
+# /soc/mailbox@7e00b840 is marked xen,passthrough in
+# bcm2711-raspberrypi4-64-xen.dtso and DomD's partial DT carries the vchiq node;
+# and vchiq on BCM2711 fails its probe without the 40-bit DMA controller, so the
+# same overlay marks /scb/dma@7e007b00 and DomD's DT carries dma40 as well.
+#
+# The dedicated codec@7eb10000 block is HEVC-only and is not enabled here. This
+# stanza is Pi 4 only because the BCM2711 decoder is the stateful VCHIQ/MMAL one;
+# the Pi 5 has no vchiq node, and its only decode block, the HEVC-only
+# codec@800000, is a stateless one that rpi-hevc-dec drives.
+#
+# No kernel rebuild: every module below is already built and sitting in deploy,
+# exactly like the Wi-Fi ones. The list is the full RDEPENDS closure taken from
+# the RPMs themselves, not a guess --
+#   bcm2835-codec        -> bcm2835-mmal-vchiq, mc, v4l2-mem2mem,
+#                           videobuf2-{common,v4l2,dma-contig}, videodev
+#   bcm2835-mmal-vchiq   -> vc-sm-cma
+#   videobuf2-dma-contig -> videobuf2-memops
+# vchiq itself is CONFIG_BCM2835_VCHIQ=y, i.e. built in, so it binds as soon as
+# its DT node and dma40's are there rather than needing a module here.
+#
+# v4l-utils supplies v4l2-ctl, which is how the result is judged on hardware
+# (`v4l2-ctl --list-formats-out` on the decoder node). It is not in the base
+# image and has to be built, same as wpa-supplicant was.
+DOMD_HWDEC_PACKAGES = ""
+DOMD_HWDEC_PACKAGES:raspberrypi4-64 = " \
+    kernel-module-vc-sm-cma \
+    kernel-module-bcm2835-mmal-vchiq \
+    kernel-module-videodev \
+    kernel-module-mc \
+    kernel-module-videobuf2-common \
+    kernel-module-videobuf2-v4l2 \
+    kernel-module-videobuf2-dma-contig \
+    kernel-module-videobuf2-memops \
+    kernel-module-v4l2-mem2mem \
+    kernel-module-bcm2835-codec \
+    v4l-utils \
+    "
+IMAGE_INSTALL:append = " ${DOMD_HWDEC_PACKAGES}"
+
+# ---------------------------------------------------------------------------
 # Bluetooth in DomD, so DomA can use it.
 #
 # The BT side of the CYW43455 hangs off the pl011 (/soc/serial@7e201000) at
@@ -120,7 +171,7 @@ IMAGE_INSTALL:append = " ${DOMD_WIFI_PACKAGES}"
 # overlays/README says miniuart-bt "should only be used with low-bandwidth
 # peripherals". pl011's 3 Mbaud gives 2400 kbps.
 #
-# No kernel rebuild, same as the Wi-Fi stanza above: the kernel
+# No kernel rebuild, same as the Wi-Fi and codec stanzas above: the kernel
 # built from bcm2711_defconfig already has BT=m, BT_BCM=m, BT_HCIUART=m,
 # BT_HCIUART_SERDEV=y, BT_HCIUART_H4=y and BT_HCIUART_BCM=y. The defconfig names
 # BT, BT_HCIUART and BT_HCIUART_BCM; Kconfig's select and default supply the
