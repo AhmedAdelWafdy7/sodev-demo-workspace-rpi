@@ -1,8 +1,8 @@
 # ============================================================================
-# The rpi4 hypervisor series is the 29 patches listed in SRC_URI below.
+# The rpi4 hypervisor series is the 32 patches listed in SRC_URI below.
 # It does NOT include 4.22-0002-route-msi-ranges (see the REMOVED note further
-# down); the 29 are the ones actually fetched. The rpi5 bbappend fetches 30 --
-# the same set plus that one.
+# down). The rpi5 bbappend takes that one and not the rpi4-only 4.22-0011/0012,
+# which only a mini-UART console needs.
 # ============================================================================
 # This bbappend attaches to the STOCK meta-virtualization recipe
 # xen_4.22.bb (PV "4.22.0+stable", SRCREV d45d5687f1, branch stable-4.22) instead
@@ -51,6 +51,28 @@
 #              "Panic on CPU 0: Could not set up domain domD (rc = -22)".
 #              Measured on hardware 2026-08-18: without it NO configuration of
 #              this workspace boots on either board.
+#
+#   4.22-0011  vpl011-fall-back-to-the-guest-layout. rpi4 ONLY. For a
+#              direct-mapped domain Xen re-uses its console UART's MMIO for the
+#              vpl011 and refuses when that region is smaller than 4 KiB. This
+#              board's Xen console is the mini UART (serial@7e215040, reg 0x40),
+#              and DomD is direct-mapped with vpl011 = <1>, so without this patch
+#              DomD creation fails with
+#                "vpl011: Can't re-use the Xen UART MMIO region as it is too small."
+#                "Panic on CPU 0: Could not set up domain domD (rc = -22)"
+#              and the board reboot-loops (measured 2026-09-23). The patch places
+#              the vpl011 at GUEST_PL011_BASE (0x22000000) instead. rpi5 does not
+#              need it: its uart10 reg is padded to 0x1000 in the Xen overlay.
+#   4.22-0012  carve-the-fallback-vpl011-out-of-the-extended-regions. Required
+#              WITH 0011: 0x22000000 lies inside an extended region, so without the
+#              carve DomD's privcmd fails foreign mappings with EBUSY and xl can
+#              build no guest (DomA).
+#   4.22-0013  xen/arm: Fix evaluation of parameters for SMCCC calls. NOT
+#              board-specific; a backport of stable-4.22 781b60f951 (master
+#              95302b3943), which the pinned SRCREV predates. It is what brings
+#              SCMI back on rpi5 (Wi-Fi/Bluetooth pin control); nothing on this
+#              board forwards SCMI, so here it only keeps the two boards on the
+#              same SMCCC helper.
 # NOTE on ThumbEE: [4.22] no longer relevant. In 4.21 the stock xen_4.21.bb SRC_URI carried
 # 0001-ARM-Drop-ThumbEE-support.patch (Andrew Cooper 5bbe1fe413, binutils/gcc15
 # fix), so it was NOT re-added here. That commit is IN 4.22, so the interim
@@ -63,9 +85,11 @@
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # 0002-0024 + 4.22-000{1,3,4,5} are the same files the xen-tools toolstack bbappend
-# and live in a shared dir (meta-xt-common/recipes-extended/xen-common/files) that
-# both this hypervisor bbappend and the xen-tools bbappend point at. Only the
-# hypervisor-only 0025 and the Kconfig .cfg fragments remain in ./files here.
+# uses and live in a shared dir (meta-xt-common/recipes-extended/xen-common/files)
+# that both this hypervisor bbappend and the xen-tools bbappend point at;
+# 4.22-0006 and 4.22-0013, hypervisor-only, live there too so the two boards carry
+# one copy rather than two. Only the hypervisor-only 0025, the rpi4-only
+# 4.22-0011/0012 and the Kconfig .cfg fragments remain in ./files here.
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../../meta-xt-common/recipes-extended/xen-common/files:"
 
 # --- Xen patch series ---
@@ -104,6 +128,9 @@ SRC_URI:append = " \
     file://4.22-0004-vgic-pci-irq-level-race-fix.patch \
     file://4.22-0005-build-honour-external-toolchain-vars.patch \
     file://4.22-0006-dom0less-seed-next-phandle-below-reserved-range.patch \
+    file://4.22-0011-vpl011-fall-back-to-the-guest-layout-when-the-Xen-UA.patch \
+    file://4.22-0012-arm-carve-the-fallback-vpl011-out-of-the-extended-re.patch \
+    file://4.22-0013-xen-arm-Fix-evaluation-of-parameters-for-SMCCC-calls.patch \
 "
 
 # --- hypervisor Kconfig fragments ---

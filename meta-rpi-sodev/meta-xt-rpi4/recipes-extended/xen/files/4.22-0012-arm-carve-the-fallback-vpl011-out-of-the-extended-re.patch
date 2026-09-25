@@ -1,0 +1,172 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 31 Aug 2026 14:16:35 +0900
+Subject: [PATCH] arm: carve the fallback vpl011 out of the extended regions
+
+Companion to "vpl011: fall back to the guest layout when the Xen UART
+region cannot be re-used".  That fallback places the emulated vpl011 at
+GUEST_PL011_BASE for a direct-mapped domain, and for such a domain that
+address by construction lies inside one of the holes
+make_hypervisor_node() advertises as extended regions.
+
+Linux's unpopulated-alloc claims section-sized (128MB) chunks of the
+extended regions in the iomem resource tree.  The first chunk of the
+region starting at 0x20000000 contains the vpl011 at 0x22000000, whose
+resource the sbsa-uart driver has already claimed, so request_resource()
+fails with EBUSY and privcmd foreign mappings fail:
+
+    xen:xen_privcmd: alloc_empty_pages Could not alloc 10646 pfns rc:-16
+    xc: panic: xg_dom_boot.c:156: xc_dom_boot_domU_map: failed to mmap
+        domU pages 0x40000+0x2996 [mmap, errno=12]
+
+i.e. the driver domain can build no guest at all.  Measured on the
+Raspberry Pi 4 while creating DomA from DomD.
+
+Carve a 2MB-aligned window around the vpl011 page out of the computed
+extended regions before they are written to the guest DT.  2MB because
+both edges of an extended region are kept 2MB aligned elsewhere in this
+file.  Then drop the banks that became empty and re-sort the list:
+arch_xen_unpopulated_init() (arch/arm/xen/enlighten.c) rejects the whole
+list with -EINVAL as soon as it is not sorted and non-overlapping, and a
+rejected list silently falls back to ballooning one page of driver-domain
+RAM per foreign-mapped guest page, which on a 1-2GB DomD OOM-kills the
+device model mid-boot.
+
+On the board the window splits one region in the middle:
+
+    (XEN) d1: carving vpl011 window 0x22000000->0x22200000 out of extended region 1
+    (XEN) d1: extended region 1: 0x20000000->0x22000000
+    (XEN) d1: extended region 2: 0x22200000->0x38000000
+
+Changes from the version this was ported from: when the window covered
+the head of a bank, the old code appended the remainder as a new tail
+bank and then dropped "the duplicate" with nr_banks-- -- but when the
+array was already full no tail had been appended, so it dropped an
+unrelated bank instead and lost the remainder.  The remainder now stays
+in the bank itself unless a tail was actually appended, and the tail is
+copied from the whole bank (struct membank's type shares a union).
+Covered by a host-side test of all eight cases (split, head, head with a
+full array, tail, full cover, no overlap, split with a full array, no
+vpl011); only the middle split is exercised on this board.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [only needed with 4.22-0011, which is itself
+ Inappropriate]
+---
+ xen/arch/arm/domain_build.c | 105 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 105 insertions(+)
+
+--- a/xen/arch/arm/domain_build.c
++++ b/xen/arch/arm/domain_build.c
+@@ -1083,6 +1083,111 @@ int __init make_hypervisor_node(struct domain *d,
+         if ( res )
+             printk(XENLOG_WARNING "%pd: failed to allocate extended regions\n",
+                    d);
++
++#ifdef CONFIG_SBSA_VUART_CONSOLE
++        /*
++         * When domain_vpl011_init() could not re-use the Xen console UART for
++         * a direct-mapped domain it places the emulated vpl011 at
++         * GUEST_PL011_BASE, which by construction lies inside one of the
++         * holes this function is about to advertise as extended regions.
++         * Linux's unpopulated-alloc then claims section-sized chunks of those
++         * regions in the iomem tree, collides with the already-claimed UART
++         * resource and fails with EBUSY, which surfaces as privcmd foreign
++         * mappings failing -- xl cannot build any guest from that domain.
++         * Measured on the Raspberry Pi 4 driver domain:
++         *     xen:xen_privcmd: alloc_empty_pages Could not alloc 10646 pfns rc:-16
++         * Carve a 2MB-aligned window around the vpl011 page out of the
++         * extended regions so the guest kernel never places scratch space on
++         * top of it. 2MB because both edges of an extended region are kept
++         * 2MB aligned elsewhere in this file.
++         */
++        if ( d->arch.vpl011.base_addr )
++        {
++            const uint64_t carve_s = d->arch.vpl011.base_addr & ~(MB(2) - 1);
++            const uint64_t carve_e = ROUNDUP(d->arch.vpl011.base_addr +
++                                             GUEST_PL011_SIZE, MB(2));
++            unsigned int j, nr = ext_regions->nr_banks;
++
++            for ( j = 0; j < nr; j++ )
++            {
++                struct membank *bank = &ext_regions->bank[j];
++                const uint64_t bank_e = bank->start + bank->size;
++                bool tail_added = false;
++
++                if ( carve_s >= bank_e || carve_e <= bank->start )
++                    continue;
++
++                printk("%pd: carving vpl011 window %#"PRIx64"->%#"PRIx64
++                       " out of extended region %u\n",
++                       d, carve_s, carve_e, j);
++
++                if ( carve_e < bank_e &&
++                     ext_regions->nr_banks < ext_regions->max_banks )
++                {
++                    struct membank *tail =
++                        &ext_regions->bank[ext_regions->nr_banks++];
++
++                    *tail = *bank;
++                    tail->start = carve_e;
++                    tail->size = bank_e - carve_e;
++                    tail_added = true;
++                }
++
++                if ( carve_s > bank->start )
++                    bank->size = carve_s - bank->start;
++                else if ( carve_e < bank_e && !tail_added )
++                {
++                    bank->start = carve_e;
++                    bank->size = bank_e - carve_e;
++                }
++                else
++                    /* Fully covered, or the tail bank now holds the rest. */
++                    bank->size = 0;
++            }
++
++            /*
++             * Linux requires the extended regions to be sorted by start
++             * address and non-overlapping: arch_xen_unpopulated_init() in
++             * arch/arm/xen/enlighten.c rejects the whole list with -EINVAL as
++             * soon as regs[i - 1].end + 1 > regs[i].start.  The split above
++             * appends the tail bank at the end of the array, which breaks that
++             * order.  A rejected list is not a soft failure: it makes
++             * xen_alloc_unpopulated_pages() fall back to the balloon, i.e. one
++             * page of driver-domain RAM per foreign-mapped guest page.  On the
++             * Raspberry Pi 4 (DomD has 1GB) that OOM-kills the device model
++             * mid-boot and the guest then hangs forever on an unanswered
++             * ioreq, with pause_flags=_VPF_blocked_in_xen.  Drop the empty
++             * banks and sort what is left.
++             */
++            for ( j = 0; j < ext_regions->nr_banks; )
++            {
++                if ( ext_regions->bank[j].size == 0 )
++                {
++                    unsigned int k;
++
++                    for ( k = j; k + 1 < ext_regions->nr_banks; k++ )
++                        ext_regions->bank[k] = ext_regions->bank[k + 1];
++                    ext_regions->nr_banks--;
++                }
++                else
++                    j++;
++            }
++
++            for ( j = 1; j < ext_regions->nr_banks; j++ )
++            {
++                const struct membank tmp = ext_regions->bank[j];
++                unsigned int k = j;
++
++                while ( k > 0 && ext_regions->bank[k - 1].start > tmp.start )
++                {
++                    ext_regions->bank[k] = ext_regions->bank[k - 1];
++                    k--;
++                }
++                ext_regions->bank[k] = tmp;
++            }
++        }
++#endif
++
+         nr_ext_regions = ext_regions->nr_banks;
+     }
+ 

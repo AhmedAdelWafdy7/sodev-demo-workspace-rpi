@@ -1,0 +1,113 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Mon, 31 Aug 2026 13:22:17 +0900
+Subject: [PATCH] vpl011: fall back to the guest layout when the Xen UART
+ region cannot be re-used
+
+For a direct-mapped domain, domain_vpl011_init() re-uses the Xen console
+UART's base address and IRQ so that the emulated PL011 does not collide
+with anything in the guest's (host-mirroring) address space.  When the
+console UART's MMIO region is smaller than GUEST_PL011_SIZE it refuses
+with -EINVAL; init_vuart() passes that up and, on a dom0less system,
+create_domUs() turns it into a panic -- the board reboots in a loop
+before any domain runs.
+
+That is exactly what happens on a Raspberry Pi 4 whose Xen console is
+the mini UART (serial@7e215040) rather than the pl011: the mini UART's
+reg is 0x40 bytes, and it cannot be padded to 4KiB, because its page is
+shared with live AUX devices and the following page holds
+pixelvalve@7e216000, which this platform passes through to the same
+guest -- an emulated region grown to 4KiB from 0x...5040 would shadow
+the first 0x40 bytes of that device.  Measured on the board with Xen
+4.22:
+
+    (XEN) vpl011: Can't re-use the Xen UART MMIO region as it is too small.
+    (XEN) Panic on CPU 0:
+    (XEN) Could not set up domain domD (rc = -22)
+
+Instead of refusing, fall back to the ordinary guest-layout placement
+(GUEST_PL011_BASE / GUEST_VPL011_SPI).  For a direct-mapped guest that
+placement is only unsafe if it overlaps the guest's RAM banks or a
+passthrough MMIO region; on this platform GUEST_PL011_BASE (0x22000000)
+sits between the DomD static banks 0x08000000-0x20000000 and
+0x40000000-0x80000000 and far from every passthrough device.  The
+fallback prints a warning naming both the domain and the address so a
+platform where the overlap DOES exist has something to find in the log.
+
+The nr_spis estimate in arch_parse_dom0less_node() keeps using the
+hardware IRQ in this case.  That is deliberate: the hardware IRQ (SPI 93,
+INTID 125, for the mini UART) is always >= GUEST_VPL011_SPI (32) on this
+path, so the estimate stays sufficient, and the guest DT node takes both
+the base and the IRQ from d->arch.vpl011, which this function sets --
+the two cannot diverge.
+
+The companion patch "arm: carve the fallback vpl011 out of the extended
+regions" is required with this one: without it the driver domain cannot
+foreign-map any guest.
+
+This is a platform-integration patch, not upstreamable as-is: a generic
+fallback would have to check the overlap instead of asserting it in a
+commit message.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [platform integration: the fallback relies on
+ GUEST_PL011_BASE lying outside this board's RAM banks and passthrough MMIO
+ instead of checking it]
+---
+ xen/arch/arm/vpl011.c | 39 +++++++++++++++++++++------------------
+ 1 file changed, 21 insertions(+), 18 deletions(-)
+
+--- a/xen/arch/arm/vpl011.c
++++ b/xen/arch/arm/vpl011.c
+@@ -656,30 +656,33 @@ int domain_vpl011_init(struct domain *d, struct vpl011_init_info *info)
+         const struct vuart_info *uart = serial_vuart_info(SERHND_DTUART);
+         int vpl011_irq = serial_irq(SERHND_DTUART);
+ 
+-        if ( (uart != NULL) && (vpl011_irq > 0) )
+-        {
+-            vpl011->base_addr = uart->base_addr;
+-            vpl011->virq = vpl011_irq;
+-        }
+-        else
+-        {
+-            printk(XENLOG_ERR
+-                   "vpl011: Unable to re-use the Xen UART information.\n");
+-            return -EINVAL;
+-        }
+-
+         /*
+          * Since the PL011 we emulate for the guest requires a 4KB region,
+          * and on some Hardware (e.g. on some sunxi SoC), the UART MMIO
+          * region is less than 4KB, in which case, there may exist multiple
+-         * devices within the same 4KB region, here adds the following check to
+-         * prevent potential known pitfalls
++         * devices within the same 4KB region, re-using the Xen UART would
++         * shadow those devices for the guest.  Fall back to the ordinary
++         * guest-layout placement instead of failing the domain: the caller
++         * on the dom0less path panics on failure, which turns a console
++         * placement problem into a boot loop.  The fallback address is only
++         * safe when it overlaps neither the guest's RAM banks nor a
++         * passthrough MMIO region; on this platform (BCM2711)
++         * GUEST_PL011_BASE sits between the static banks and far below every
++         * passthrough device.
+          */
+-        if ( uart->size < GUEST_PL011_SIZE )
++        if ( (uart != NULL) && (vpl011_irq > 0) &&
++             (uart->size >= GUEST_PL011_SIZE) )
++        {
++            vpl011->base_addr = uart->base_addr;
++            vpl011->virq = vpl011_irq;
++        }
++        else
+         {
+-            printk(XENLOG_ERR
+-                   "vpl011: Can't re-use the Xen UART MMIO region as it is too small.\n");
+-            return -EINVAL;
++            printk(XENLOG_WARNING
++                   "vpl011: cannot re-use the Xen UART for %pd; placing the vpl011 at the guest-layout address %#"PRIx64" instead\n",
++                   d, (uint64_t)GUEST_PL011_BASE);
++            vpl011->base_addr = GUEST_PL011_BASE;
++            vpl011->virq = GUEST_VPL011_SPI;
+         }
+     }
+     else
