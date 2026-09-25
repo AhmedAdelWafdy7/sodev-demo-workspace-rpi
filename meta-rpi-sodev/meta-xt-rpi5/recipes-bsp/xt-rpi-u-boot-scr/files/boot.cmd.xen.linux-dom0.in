@@ -261,8 +261,13 @@ fdt rm /soc@107c000000/fb
 # ------------------------------------------------------------------
 
 # ------------------------------------------------------------------
-# Disable the Bluetooth UART: nothing in this configuration uses it.
+# Disable the Bluetooth UART and leave it with Dom0.
 # ------------------------------------------------------------------
+# Bluetooth needs the SCMI pin mux this flavour does not set up (above), so
+# domd-vc4.bb strips uart_bt from DomD's partial DT for DOM0_OS=linux, and
+# nothing in this configuration uses the UART. The node is not marked
+# xen,passthrough, so Xen gives it and SPI 276 to Dom0; status "disabled"
+# keeps Dom0's own driver off it.
 fdt set /soc@107c000000/serial@7d50c000 status "disabled"
 
 # ------------------------------------------------------------------
@@ -637,6 +642,8 @@ if fatload mmc 0 0xc000000 Image ; then
     # PV-block. rootwait makes the kernel block until Dom0's xl-attach-disks.service
     # has block-attached phy:/dev/mmcblk0p2 as xvda; rw is required (systemd and sshd
     # write to the root). There is no ramdisk module any more.
+    # No 8250.nr_uarts=1, unlike the zephyr flavour: the Bluetooth UART is
+    # DomD's only 8250-family port, and domd-vc4.bb strips it for this flavour.
     fdt set /chosen/domD/module@0 bootargs "console=ttyAMA0 root=/dev/xvda rootwait rw clk_ignore_unused vhost_xen.nogrant=1 xen_privcmd.unrestricted=1 cma=128M net.ifnames=0 quiet loglevel=3"
     fdt mknode /chosen/domD module@1
     fdt set /chosen/domD/module@1 compatible "multiboot,device-tree" "multiboot,module"

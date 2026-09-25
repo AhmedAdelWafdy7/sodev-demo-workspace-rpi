@@ -1,0 +1,352 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Copyright (C) 2018 The Android Open Source Project
+
+     Licensed under the Apache License, Version 2.0 (the "License");
+     you may not use this file except in compliance with the License.
+     You may obtain a copy of the License at
+
+          http://www.apache.org/licenses/LICENSE-2.0
+
+     Unless required by applicable law or agreed to in writing, software
+     distributed under the License is distributed on an "AS IS" BASIS,
+     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+     See the License for the specific language governing permissions and
+     limitations under the License.
+-->
+
+<!--
+     SPDX-License-Identifier: Apache-2.0
+
+     FORKED from device/google/trout/product_files/vendor/etc/audio_policy_configuration.emulator.xml
+     for aosp_xenvm_trout_rpi5_arm64. Two changes, both load-bearing; everything
+     else is byte-identical to trout's file and should stay that way.
+
+     1. The A2dp include is replaced by a "bluetooth" module.
+
+        trout includes a2dp_audio_policy_configuration.xml, whose module is named
+        "a2dp". That name resolves to a HW module audio.a2dp.default, and
+        audio.a2dp.default DOES NOT EXIST anywhere in AOSP 17. The implementation
+        was replaced by audio.bluetooth.default
+        (packages/modules/Bluetooth/system/audio_bluetooth_hw/), whose module name
+        is "bluetooth". So trout's include is dead configuration: the module can
+        never load and AUDIO_DEVICE_OUT_BLUETOOTH_A2DP is unreachable from
+        AudioPolicyManager. Symptom: Bluetooth pairs and connects, media routes
+        "successfully", and nothing comes out of the speaker.
+
+     2. The three xi:includes trout references but never ships have their
+        files copied, so this document's includes all resolve.
+
+        r_submix_audio_policy_configuration.xml, audio_policy_volumes.xml and
+        default_volume_tables.xml are all xi:included below, and
+        trout's LOCAL_AUDIO_PRODUCT_COPY_FILES copies none of them.
+        Serializer.cpp:869-871 only ALOGEs a failed XInclude and carries on, and
+        EngineBase.cpp:133-142 then fell back to gDefaultVolumeGroups, logging "No
+        legacy volume group found, using default music group", because
+        parseLegacyVolumes() reads the volumes section of THIS file
+        (EngineConfig.cpp:859-867). So the guest ran with ONE volume group and no
+        r_submix module, while audio.r_submix.default.so was installed all along
+        and merely absent from the policy.
+
+        The includes themselves are untouched, exactly as trout wrote them. What
+        changed is the copy list in aosp_xenvm_trout_rpi5_arm64.mk. This DOES
+        change audio behaviour: real legacy volume curves replace the single
+        fallback group, and r_submix becomes reachable.
+
+        Measured on the RPi4's shipped image: all five xi:includes resolve to
+        real files with real content. What is left to check on the board is
+        the media volume slider on the HDMI bus outputs.
+
+     Schema note: this document is version="1.0", so samplingRates lists are
+     COMMA separated. Do not pull in a *_7_0.xml include, because those use spaces
+     and mixing the two is a schema error.
+-->
+<audioPolicyConfiguration version="1.0" xmlns:xi="http://www.w3.org/2001/XInclude">
+    <!-- version section contains a “version” tag in the form “major.minor” e.g version=”1.0” -->
+
+    <!-- Global configuration Decalaration -->
+    <globalConfiguration speaker_drc_enabled="true"/>
+
+    <!-- Modules section:
+        There is one section per audio HW module present on the platform.
+        Each module section will contains two mandatory tags for audio HAL “halVersion” and “name”.
+        The module names are the same as in current .conf file:
+                “primary”, “A2DP”, “remote_submix”, “USB”
+        Each module will contain the following sections:
+        “devicePorts”: a list of device descriptors for all input and output devices accessible via
+        this module.
+        This contains both permanently attached devices and removable devices.
+            "gain": constraints applied to the millibel values:
+                - maxValueMB >= minValueMB
+                - defaultValueMB >= minValueMB && defaultValueMB <= maxValueMB
+                - (maxValueMB - minValueMB) % stepValueMB == 0
+                - (defaultValueMB - minValueMB) % stepValueMB == 0
+        “mixPorts”: listing all output and input streams exposed by the audio HAL
+        “routes”: list of possible connections between input and output devices or between stream
+        and devices.
+            "route": is defined by an attribute:
+                -"type": <mux|mix> means all sources are mutual exclusive (mux) or can be mixed (mix)
+                -"sink": the sink involved in this route
+                -"sources": all the sources than can be connected to the sink via vis route
+        “attachedDevices”: permanently attached devices.
+        The attachedDevices section is a list of devices names. The names correspond to device names
+        defined in <devicePorts> section.
+        “defaultOutputDevice”: device to be used by default when no policy rule applies
+    -->
+    <modules>
+        <!-- Primary Audio HAL -->
+        <module name="primary" halVersion="3.0">
+            <attachedDevices>
+                <!-- One bus per context -->
+                <item>bus0_media_out</item>
+                <item>bus1_navigation_out</item>
+                <item>bus2_voice_command_out</item>
+                <item>bus3_call_ring_out</item>
+                <item>bus4_call_out</item>
+                <item>bus5_alarm_out</item>
+                <item>bus6_notification_out</item>
+                <item>bus7_system_sound_out</item>
+                <!-- names with _audio_zone_# are used for defined an emulator rear seat audio zone
+                     where each number # is the zone id number -->
+                <item>Built-In Mic</item>
+                <item>Built-In Back Mic</item>
+                <item>Echo-Reference Mic</item>
+                <item>FM Tuner</item>
+                <item>Tone Generator 0</item>
+                <item>Tone Generator 1</item>
+            </attachedDevices>
+            <defaultOutputDevice>bus0_media_out</defaultOutputDevice>
+            <mixPorts>
+                <mixPort name="mixport_bus0_media_out" role="source"
+                         flags="AUDIO_OUTPUT_FLAG_PRIMARY">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+                <mixPort name="mixport_bus1_navigation_out" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+                <mixPort name="mixport_bus2_voice_command_out" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+                <mixPort name="mixport_bus3_call_ring_out" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+                <mixPort name="mixport_bus4_call_out" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+                <mixPort name="mixport_bus5_alarm_out" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+                <mixPort name="mixport_bus6_notification_out" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+                <mixPort name="mixport_bus7_system_sound_out" role="source">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+                <mixPort name="primary input" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
+                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK"/>
+                </mixPort>
+                <mixPort name="mixport_tuner0" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000"
+                             channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
+                </mixPort>
+                <mixPort name="mixport_input_bus_tone_zone_0" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000"
+                             channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
+                </mixPort>
+                <mixPort name="mixport_input_bus_tone_zone_1" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000"
+                             channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
+                </mixPort>
+            </mixPorts>
+            <devicePorts>
+                <devicePort tagName="bus0_media_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
+                            address="bus0_media_out">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                    <gains>
+                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
+                              minValueMB="-3200" maxValueMB="600"
+                              defaultValueMB="0" stepValueMB="100"/>
+                    </gains>
+                </devicePort>
+                <devicePort tagName="bus1_navigation_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
+                        address="bus1_navigation_out">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                    <gains>
+                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
+                              minValueMB="-3200" maxValueMB="600"
+                              defaultValueMB="0" stepValueMB="100"/>
+                    </gains>
+                </devicePort>
+                <devicePort tagName="bus2_voice_command_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
+                            address="bus2_voice_command_out">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                    <gains>
+                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
+                              minValueMB="-3200" maxValueMB="600"
+                              defaultValueMB="0" stepValueMB="100"/>
+                    </gains>
+                </devicePort>
+                <devicePort tagName="bus3_call_ring_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
+                            address="bus3_call_ring_out">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                    <gains>
+                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
+                              minValueMB="-3200" maxValueMB="600"
+                              defaultValueMB="0" stepValueMB="100"/>
+                    </gains>
+                </devicePort>
+                <devicePort tagName="bus4_call_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
+                            address="bus4_call_out">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                    <gains>
+                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
+                              minValueMB="-3200" maxValueMB="600"
+                              defaultValueMB="0" stepValueMB="100"/>
+                    </gains>
+                </devicePort>
+                <devicePort tagName="bus5_alarm_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
+                            address="bus5_alarm_out">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                    <gains>
+                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
+                              minValueMB="-3200" maxValueMB="600"
+                              defaultValueMB="0" stepValueMB="100"/>
+                    </gains>
+                </devicePort>
+                <devicePort tagName="bus6_notification_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
+                            address="bus6_notification_out">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                    <gains>
+                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
+                              minValueMB="-3200" maxValueMB="600"
+                              defaultValueMB="0" stepValueMB="100"/>
+                    </gains>
+                </devicePort>
+                <devicePort tagName="bus7_system_sound_out" role="sink" type="AUDIO_DEVICE_OUT_BUS"
+                            address="bus7_system_sound_out">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                    <gains>
+                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
+                              minValueMB="-3200" maxValueMB="600"
+                              defaultValueMB="0" stepValueMB="100"/>
+                    </gains>
+                </devicePort>
+                <devicePort tagName="Built-In Mic" type="AUDIO_DEVICE_IN_BUILTIN_MIC" role="source"
+                    address="Built-In Mic" >
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
+                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK"/>
+                </devicePort>
+                <devicePort tagName="Built-In Back Mic" type="AUDIO_DEVICE_IN_BACK_MIC"
+                            role="source" address="Built-In Back Mic">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
+                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK"/>
+                </devicePort>
+                <devicePort tagName="Echo-Reference Mic" type="AUDIO_DEVICE_IN_ECHO_REFERENCE" role="source"
+                            address="Echo-Reference Mic">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,11025,12000,16000,22050,24000,32000,44100,48000"
+                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO,AUDIO_CHANNEL_IN_FRONT_BACK"/>
+                </devicePort>
+                <devicePort tagName="FM Tuner" type="AUDIO_DEVICE_IN_FM_TUNER" role="source"
+                            address="tuner0">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
+                    <gains>
+                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
+                              minValueMB="-3200" maxValueMB="600" defaultValueMB="0" stepValueMB="100"/>
+                    </gains>
+                </devicePort>
+                <devicePort tagName="Tone Generator 0" type="AUDIO_DEVICE_IN_BUS" role="source"
+                            address="input_bus_tone_zone_0">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
+                    <gains>
+                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
+                              minValueMB="-3200" maxValueMB="600"
+                              defaultValueMB="0" stepValueMB="100"/>
+                    </gains>
+                </devicePort>
+                <devicePort tagName="Tone Generator 1" type="AUDIO_DEVICE_IN_BUS" role="source"
+                            address="input_bus_tone_zone_1">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="48000" channelMasks="AUDIO_CHANNEL_IN_STEREO"/>
+                    <gains>
+                        <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
+                              minValueMB="-3200" maxValueMB="600"
+                              defaultValueMB="0" stepValueMB="100"/>
+                    </gains>
+                </devicePort>
+            </devicePorts>
+            <!-- route declaration, i.e. list all available sources for a given sink -->
+            <routes>
+                <route type="mix" sink="bus0_media_out" sources="mixport_bus0_media_out"/>
+                <route type="mix" sink="bus1_navigation_out" sources="mixport_bus1_navigation_out"/>
+                <route type="mix" sink="bus2_voice_command_out"
+                       sources="mixport_bus2_voice_command_out"/>
+                <route type="mix" sink="bus3_call_ring_out" sources="mixport_bus3_call_ring_out"/>
+                <route type="mix" sink="bus4_call_out" sources="mixport_bus4_call_out"/>
+                <route type="mix" sink="bus5_alarm_out" sources="mixport_bus5_alarm_out"/>
+                <route type="mix" sink="bus6_notification_out"
+                       sources="mixport_bus6_notification_out"/>
+                <route type="mix" sink="bus7_system_sound_out"
+                       sources="mixport_bus7_system_sound_out"/>
+                <route type="mix" sink="primary input"
+                       sources="Built-In Mic,Built-In Back Mic,Echo-Reference Mic"/>
+                <route type="mix" sink="mixport_tuner0" sources="FM Tuner"/>
+                <route type="mix" sink="mixport_input_bus_tone_zone_0" sources="Tone Generator 0"/>
+                <route type="mix" sink="mixport_input_bus_tone_zone_1" sources="Tone Generator 1"/>
+            </routes>
+
+        </module>
+
+        <!-- Bluetooth Audio HAL -->
+        <xi:include href="bluetooth_audio_policy_configuration.xml"/>
+
+        <!-- Usb Audio HAL -->
+        <xi:include href="usb_audio_policy_configuration.xml"/>
+
+        <!-- Remote Submix Audio HAL -->
+        <xi:include href="r_submix_audio_policy_configuration.xml"/>
+
+    </modules>
+    <!-- End of Modules section -->
+
+    <!-- Volume section -->
+
+    <xi:include href="audio_policy_volumes.xml"/>
+    <xi:include href="default_volume_tables.xml"/>
+
+    <!-- End of Volume section -->
+    <!-- End of Modules section -->
+
+</audioPolicyConfiguration>

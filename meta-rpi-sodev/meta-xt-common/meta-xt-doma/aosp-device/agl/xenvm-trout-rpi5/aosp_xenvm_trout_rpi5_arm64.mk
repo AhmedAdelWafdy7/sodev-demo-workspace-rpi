@@ -16,8 +16,9 @@
 # The inherit has to come first for PRODUCT_* : the upstream makefile ends with its own
 # PRODUCT_NAME / PRODUCT_DEVICE / PRODUCT_MODEL assignments, so ours have to be written
 # after it to win. (The one PRODUCT_COPY_FILES line above the inherit is the opposite
-# case on purpose; its comment says why.) The block below is the exact opposite and has
-# to come BEFORE, for a reason worth spelling out because it is easy to get backwards:
+# case on purpose; its comment says why.) The LOCAL_* block below is the exact
+# opposite and has to come BEFORE, for a reason worth spelling out because it is easy
+# to get backwards:
 #
 #   $(call inherit-product) does not include anything at the point it appears. It only
 #   pushes an $(INHERIT_TAG)<path> marker onto every product variable
@@ -26,6 +27,69 @@
 #   :190 and only then recurses into that parent's own inherits at :201. Evaluation
 #   order is therefore leaf -> epam -> trout -> cuttlefish. Anything a parent guards
 #   with ?= or ifndef can be pre-empted by assigning it here, above the inherit.
+#
+#   LOCAL_* audio variables are also plain global Make variables, not entries in
+#   _product_var_list, so clear-var-list in node_fns.mk never resets them and the value
+#   set here survives all the way into trout's file.
+
+# ---------------------------------------------------------------------------
+# Audio policy: give Bluetooth a module that actually exists.
+#
+# device/google/trout/aosp_trout_common.mk:44 wraps its copy list in
+# `ifndef LOCAL_AUDIO_PRODUCT_COPY_FILES`, so defining it here replaces trout's
+# list wholesale. Four differences from trout's five entries:
+#
+#   * audio_policy_configuration.xml comes from this device dir instead of
+#     device/google/trout/product_files/. It is a fork whose header documents both
+#     changes; the short version is that trout includes
+#     a2dp_audio_policy_configuration.xml, whose module is named "a2dp", and
+#     audio.a2dp.default does not exist anywhere in AOSP 17. The implementation is
+#     audio.bluetooth.default now and its module name is "bluetooth". Left alone,
+#     Bluetooth pairs and connects and media routes "successfully" while nothing
+#     comes out of the speaker.
+#
+#   * a2dp_audio_policy_configuration.xml is dropped and
+#     bluetooth_audio_policy_configuration.xml (also a local fork, so the SCO/HFP
+#     ports can be added in one place) is copied instead. The non-_7_0 variant is
+#     REQUIRED: the top-level document is version="1.0" and lists samplingRates
+#     comma-separated, while the _7_0 files use spaces.
+#
+#   * The three XIncludes trout references but never ships
+#     (r_submix_audio_policy_configuration.xml, audio_policy_volumes.xml,
+#     default_volume_tables.xml) ARE SHIPPED HERE.
+#
+#     The bug they caused: Serializer.cpp:869-871 only ALOGEs a failed XInclude and
+#     carries on, and EngineBase.cpp:133-142 then fell back to gDefaultVolumeGroups
+#     ("No legacy volume group found, using default music group"), because
+#     parseLegacyVolumes() reads the <volumes> section of this very file
+#     (EngineConfig.cpp:859-867). So the guest ran with ONE volume group and no
+#     r_submix module, while audio.r_submix.default.so was installed all along and
+#     merely absent from the policy.
+#
+#     THIS CHANGES AUDIO BEHAVIOUR ON PURPOSE. The guest gains the real legacy
+#     volume curves in place of the single fallback group, and r_submix becomes
+#     reachable. The check that confirms it on the board: the media volume slider
+#     still behaves on the HDMI bus outputs and "No legacy volume group found" no
+#     longer appears; `dumpsys audio` before and after is the comparison.
+#
+#     All three come from frameworks/av/services/audiopolicy/config/, i.e. exactly
+#     the files the forked XML's xi:includes already name -- no fork needed.
+#
+#   * car_audio_configuration.xml, android.hardware.broadcastradio.xml and
+#     usb_audio_policy_configuration.xml are unchanged from trout, and are
+#     restated because defining the variable replaces the whole list.
+#
+# The two forked XMLs stay in this board's own directory: their contents differ per
+# board, unlike the shared files named further down.
+LOCAL_AUDIO_PRODUCT_COPY_FILES := \
+    device/agl/xenvm-trout-rpi5/audio/audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_configuration.xml \
+    device/agl/xenvm-trout-rpi5/audio/bluetooth_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/bluetooth_audio_policy_configuration.xml \
+    device/google/trout/product_files/vendor/etc/car_audio_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/car_audio_configuration.xml \
+    frameworks/native/data/etc/android.hardware.broadcastradio.xml:system/etc/permissions/android.hardware.broadcastradio.xml \
+    frameworks/av/services/audiopolicy/config/usb_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/usb_audio_policy_configuration.xml \
+    frameworks/av/services/audiopolicy/config/r_submix_audio_policy_configuration.xml:$(TARGET_COPY_OUT_VENDOR)/etc/r_submix_audio_policy_configuration.xml \
+    frameworks/av/services/audiopolicy/config/audio_policy_volumes.xml:$(TARGET_COPY_OUT_VENDOR)/etc/audio_policy_volumes.xml \
+    frameworks/av/services/audiopolicy/config/default_volume_tables.xml:$(TARGET_COPY_OUT_VENDOR)/etc/default_volume_tables.xml
 
 # ---------------------------------------------------------------------------
 # Vulkan: stop the APEX driver path, so the loader can see a Venus ICD.
@@ -97,10 +161,9 @@ PRODUCT_MODEL := xenvm arm64 trout (Raspberry Pi 5)
 PRODUCT_COPY_FILES += \
     device/agl/common/init.xenvm-buried-eth0.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/init.xenvm-buried-eth0.rc
 
-# Settings.Global defaults for a fresh userdata: Bluetooth off (no transport in this
-# guest, and com.android.bluetooth crash-loops without one) and window/transition
-# animations off (the device model, not the GPU, pays for them). The overlay file
-# carries the measurements and the runtime equivalents for an existing /data.
+# Settings.Global defaults for a fresh userdata: window/transition animations off (the
+# device model, not the GPU, pays for them). The overlay file carries the measurements
+# and the runtime equivalents for an existing /data.
 DEVICE_PACKAGE_OVERLAYS += device/agl/common/overlay
 
 # Shadow-AP Wi-Fi: simulated radios in this guest beaconing the SSIDs DomD really
@@ -192,6 +255,53 @@ PRODUCT_PACKAGES += \
 #   WifiVendorHal: onIfaceRemoved 0, name: wlan0
 #   WifiActiveModeWarden: ClientModeManager start failed!
 PRODUCT_PACKAGES += wificond
+
+# ---------------------------------------------------------------------------
+# Bluetooth audio (A2DP). The HCI transport is separate and lives in DomD; this is
+# only the path from AudioFlinger to the Bluetooth stack, and without it the HAL can
+# be perfect and there will still be no sound.
+#
+# AOSP 17 needs BOTH halves, in the same process, and this image had NEITHER:
+#
+#   audio.bluetooth.default            the HW module AudioFlinger loads from
+#                                      /vendor/lib64/hw/. Module name "bluetooth",
+#                                      which is what the forked policy XML above
+#                                      declares.
+#   android.hardware.bluetooth.audio-impl
+#                                      the AIDL IBluetoothAudioProviderFactory the
+#                                      Bluetooth stack talks to. It is dlopened by
+#                                      the HIDL audio HAL service we already ship:
+#                                      hardware/interfaces/audio/common/all-versions/
+#                                      default/service/service.cpp:136-145 lists it
+#                                      in optionalInterfaceSharedLibs. So staying on
+#                                      the HIDL audio HAL costs nothing here.
+#
+# libbluetooth_audio_session{,_aidl} are the in-process glue between the two and come
+# in automatically as shared_libs; no explicit entry needed.
+#
+# No SELinux work: plat_service_contexts already labels
+# android.hardware.bluetooth.audio.IBluetoothAudioProviderFactory/default as
+# hal_audio_service, and system/sepolicy/private/bluetooth.te already grants
+# `find` on it plus hal_client_domain(bluetooth, hal_audio). No VINTF work either:
+# hardware/interfaces/bluetooth/audio/aidl/default/Android.bp declares
+# vintf_fragments, so the manifest fragment installs itself.
+#
+# audio.bluetooth.default carries visibility: ["//device/generic/goldfish/hals/audio"],
+# which does NOT block this. Soong visibility is only enforced on module DEPENDENCIES
+# (build/soong/android/visibility.go:552, "depends on %s which is not visible"), and
+# PRODUCT_PACKAGES is a Make-level install request. yukawa, hikey and dragonboard all
+# install it exactly like this.
+#
+# Reference product for the whole shape (HIDL primary HAL + Bluetooth audio):
+# device/amlogic/yukawa/device.mk:163-174.
+PRODUCT_PACKAGES += \
+    android.hardware.bluetooth.audio-impl \
+    audio.bluetooth.default
+
+# Bluetooth off on a fresh userdata. A runtime overlay, not the one above: Car's own RRO
+# sets def_bluetooth_on=true and outranks any build-time overlay. The ordering that makes
+# this one win is in its Android.bp (device/agl/doma-common/DomaSettingsProviderRRO).
+PRODUCT_PACKAGES += DomaSettingsProviderRRO
 
 # Render with Vulkan (Venus) by default: SurfaceFlinger's RenderEngine and HWUI in every
 # app. Both are debug.* properties, which is the only switch either has -- SurfaceFlinger

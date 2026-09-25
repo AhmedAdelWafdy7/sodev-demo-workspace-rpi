@@ -4,6 +4,56 @@
 # base recipe is
 # meta-xt-common/meta-xt-driver-domain/recipes-core/images/rpi5-image-xt-domd-v4h.bb.
 
+# ---------------------------------------------------------------------------
+# Bluetooth in DomD, so DomA can use it.
+#
+# BCM2712 makes this far simpler than BCM2711. Bluetooth has its own UART
+# (/soc@107c000000/serial@7d50c000, brcm,bcm7271-uart, GIC SPI 276, 3 Mbaud
+# declared in the DT), the hypervisor console has its own pl011 on dedicated
+# pins, and the 40-pin header's UARTs are in the RP1 behind PCIe. Three
+# independent paths, so unlike the Pi 4 there is no console/Bluetooth trade-off
+# to make here.
+#
+# The hardware side is in this layer: the boot script marks that UART
+# xen,passthrough, and bcm2712-raspberrypi5-domd-vc4.dts gives DomD the UART with
+# its brcm,bcm43438-bt child (BT_ON on gio line 29) and the uarta pin group, which
+# TF-A muxes over SCMI. Without the passthrough hci0 never appears and btproxy has
+# nothing to open.
+#
+# No kernel rebuild. The kernel built from bcm2712_defconfig already has BT=m,
+# BT_HCIUART=m and BT_HCIUART_BCM=y, which the defconfig names, and
+# SERIAL_8250_BCM7271=y, which comes from its Kconfig's `default ARCH_BRCMSTB`
+# with ARCH_BRCMSTB=y. So the modules and the UART driver are already built. They
+# were simply never packaged, because this image installs packagegroup-core-boot
+# rather than packagegroup-base and so never sees MACHINE_EXTRA_RRECOMMENDS --
+# the same reason every kernel-module-* below has to be named explicitly.
+#
+# bluez-firmware-rpidistro-bcm4345c0-hcd is /lib/firmware/brcm/BCM4345C0.hcd, the
+# patchram hci_bcm downloads during bcm_setup(). It is the same part as on the
+# Pi 4: raspberrypi5.conf recommends both 4345c0 and 4345c5, and the 43455
+# firmware package contains brcmfmac43455-sdio.raspberrypi,5-model-b.bin, so this
+# board's radio is the 43455. No PACKAGE_EXCLUDE surgery and no LICENSE_FLAGS
+# acceptance are needed here: the base recipe only excludes
+# linux-firmware-rpidistro-*, and bluez-firmware-rpidistro declares no
+# LICENSE_FLAGS. The Cypress licence file arrives via RDEPENDS.
+#
+# bluez5-noinst-tools is here for one binary, /usr/bin/btproxy, which bridges
+# hci0 to a Unix socket speaking H4 (see xt-domd-bt-proxy). It requires no
+# libbluetooth, so it does not drag in bluez5 -- and therefore neither
+# pi-bluetooth nor bluetoothd. That is deliberate: bluetoothd would power hci0
+# up, and hci_sock_bind() in net/bluetooth/hci_sock.c then refuses the
+# HCI_CHANNEL_USER bind with -EBUSY; that user channel is exactly the
+# interface btproxy needs.
+DOMD_BT_PACKAGES = ""
+DOMD_BT_PACKAGES:raspberrypi5 = " \
+    kernel-module-bluetooth \
+    kernel-module-btbcm \
+    kernel-module-hci-uart \
+    bluez-firmware-rpidistro-bcm4345c0-hcd \
+    bluez5-noinst-tools \
+    xt-domd-bt-proxy \
+    "
+IMAGE_INSTALL:append = " ${DOMD_BT_PACKAGES}"
 
 # ---------------------------------------------------------------------------
 # Wi-Fi in DomD.

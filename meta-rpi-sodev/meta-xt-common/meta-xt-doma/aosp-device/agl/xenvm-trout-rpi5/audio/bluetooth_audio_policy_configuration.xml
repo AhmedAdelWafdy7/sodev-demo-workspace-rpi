@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Bluetooth Audio HAL Audio Policy Configuration file -->
+<!--
+     SPDX-License-Identifier: Apache-2.0
+
+     FORKED from frameworks/av/services/audiopolicy/config/bluetooth_audio_policy_configuration.xml
+     for aosp_xenvm_trout_rpi5_arm64.
+
+     The content is upstream's, unchanged. It is a local copy so that the
+     hands-free (SCO) ports can be added in one place.
+
+     WHY IT IS INCLUDED AT ALL. trout's audio_policy_configuration.emulator.xml
+     includes a2dp_audio_policy_configuration.xml instead, whose module is named
+     "a2dp". That resolves to a HW module audio.a2dp.default, which does not exist
+     in AOSP 17: the implementation is now audio.bluetooth.default
+     (packages/modules/Bluetooth/system/audio_bluetooth_hw/) and its module name is
+     "bluetooth". See the header of the forked audio_policy_configuration.xml next
+     to this file.
+
+     The 1.0 schema is deliberate: the parent document is version="1.0", so
+     samplingRates are COMMA separated here. The *_7_0.xml variant uses spaces and
+     cannot be mixed in.
+-->
+<module name="bluetooth" halVersion="2.0">
+    <mixPorts>
+        <!-- A2DP Audio Ports -->
+        <mixPort name="a2dp output" role="source"/>
+        <!-- Hearing AIDs Audio Ports -->
+        <mixPort name="hearing aid output" role="source">
+            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                     samplingRates="24000,16000"
+                     channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+        </mixPort>
+    </mixPorts>
+    <devicePorts>
+        <!-- A2DP Audio Ports -->
+        <devicePort tagName="BT A2DP Out" type="AUDIO_DEVICE_OUT_BLUETOOTH_A2DP" role="sink">
+            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                     samplingRates="44100,48000,88200,96000"
+                     channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+        </devicePort>
+        <devicePort tagName="BT A2DP Headphones" type="AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES" role="sink">
+            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                     samplingRates="44100,48000,88200,96000"
+                     channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+        </devicePort>
+        <devicePort tagName="BT A2DP Speaker" type="AUDIO_DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER" role="sink">
+            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                     samplingRates="44100,48000,88200,96000"
+                     channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+        </devicePort>
+        <!-- Hearing AIDs Audio Ports -->
+        <devicePort tagName="BT Hearing Aid Out" type="AUDIO_DEVICE_OUT_HEARING_AID" role="sink"/>
+    </devicePorts>
+    <routes>
+        <route type="mix" sink="BT A2DP Out"
+               sources="a2dp output"/>
+        <route type="mix" sink="BT A2DP Headphones"
+               sources="a2dp output"/>
+        <route type="mix" sink="BT A2DP Speaker"
+               sources="a2dp output"/>
+        <route type="mix" sink="BT Hearing Aid Out"
+               sources="hearing aid output"/>
+    </routes>
+</module>

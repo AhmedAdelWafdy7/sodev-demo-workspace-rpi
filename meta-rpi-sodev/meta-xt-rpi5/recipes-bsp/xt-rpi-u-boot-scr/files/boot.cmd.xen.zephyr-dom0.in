@@ -336,9 +336,26 @@ echo "passthrough: /axi/mmc@1100000 (Wi-Fi SDIO -> DomD, SPI 274)"
 fdt set /axi/mmc@1100000 xen,passthrough
 
 # ------------------------------------------------------------------
-# Disable the Bluetooth UART: nothing in this configuration uses it.
+# Bluetooth UART -> DomD
 # ------------------------------------------------------------------
-fdt set /soc@107c000000/serial@7d50c000 status "disabled"
+# DomD claims the UART with xen,path = "/soc@107c000000/serial@7d50c000",
+# runs hci_uart/hci_bcm on it, and btproxy republishes the controller to DomA
+# over virtio-serial.
+#
+# BCM2712 makes this much easier than BCM2711. There is no contention at all: the
+# Xen console is uart10 (a pl011 on dedicated pins, dtuart= below), Bluetooth has
+# its own brcm,bcm7271-uart at 0x7d50c000 on gio pins 24-27, and the 40-pin header's
+# UARTs live in the RP1 behind PCIe. Three separate paths -- unlike BCM2711, where
+# only uart0/uart1 can reach either the header or the BT module, so giving BT the
+# fast pl011 forces the console onto the mini UART.
+#
+# `fdt set`, never `fdt rm`: handle_passthrough_prop() resolves xen,path against the
+# HOST DT (dt_find_node_by_path), so deleting the node is -EINVAL and panics domain
+# construction. No page neighbours to remove either -- 0x7d50c000 holds only this
+# UART (the nearest nodes are at 0x7d504100 and 0x7d508xxx, different pages), and
+# SPI 276 is declared by this node alone in the whole host DT.
+echo "passthrough: /soc/serial@7d50c000 (Bluetooth UART -> DomD, SPI 276)"
+fdt set /soc@107c000000/serial@7d50c000 xen,passthrough
 
 # ------------------------------------------------------------------
 # Why every GPU-related node below is marked xen,passthrough.
@@ -760,7 +777,7 @@ if fatload mmc 0 0xc000000 Image ; then
     # p2 ext4 directly. rw is required (systemd and sshd write to the root); rootwait
     # covers the mmc probe taking longer than the rootfs lookup. There is no ramdisk
     # module any more.
-    fdt set /chosen/domD/module@0 bootargs "console=ttyAMA0 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait rw clk_ignore_unused vhost_xen.nogrant=1 xen_privcmd.unrestricted=1 cma=128M net.ifnames=0 quiet loglevel=3"
+    fdt set /chosen/domD/module@0 bootargs "console=ttyAMA0 8250.nr_uarts=1 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait rw clk_ignore_unused vhost_xen.nogrant=1 xen_privcmd.unrestricted=1 cma=128M net.ifnames=0 quiet loglevel=3"
     fdt mknode /chosen/domD module@1
     fdt set /chosen/domD/module@1 compatible "multiboot,device-tree" "multiboot,module"
     fdt set /chosen/domD/module@1 reg <0x0 0xa000000 0x0 0x${domd_dtb_size}>
