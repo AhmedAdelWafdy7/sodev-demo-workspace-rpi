@@ -21,7 +21,7 @@ This is the authoritative list of what that means:
 | DomD virglrenderer | venus + `render-server` + `minigbm_allocation`, 6 product patches | oe-core's stock build, no venus, no patches |
 | guest cfg (`domu.cfg`/`doma.cfg`) | `hostmem=256M,blob=true,venus=true` on `virtio-gpu-gl-pci`; in `doma.cfg` the Venus `qemu_envs` (`VIRGL_EXTERNAL_GBM`, `V3DV_MAX_BO_CACHE_SIZE`, `VKR_DEVICE_HEAP_MIB`); the options and renames only qemu 10 takes | none of these |
 | Xen + libxl | `4.22-0007/0008/0009/0010` (p2m direction, 0xc0000000/768 MiB window, 256 MiB slices, one SPI per virtio-pci slot); DomD kernel `0014` + gntdev-dmabuf | the same series without them; no `0014`, no gntdev-dmabuf |
-| rpi4 4 GiB SKU memory | DomD 1408 MiB / DomA 2176 MiB | DomD 1024 MiB / DomA 2560 MiB (the 8 GiB SKU and the Pi 5 are the same in both lanes) |
+| rpi4 4 GiB SKU memory | DomD 1440 MiB / DomA 2048 MiB | DomD 1056 MiB / DomA 2560 MiB (the 8 GiB SKU and the Pi 5 are the same in both lanes) |
 | AGL cluster rootfs | four conf lines + the `meta-agl-venus` layer; cluster on the Vulkan (Impeller) embedder | neither; cluster on the shipped OpenGL embedder |
 | DomA hardware decode | `XT_DOMA_HWDEC` is the board yaml's `XT_DOMA_HWDEC_VULKAN`, `true` except with the Raspberry Pi 5's linux Dom0: DomA's device model gets the virtio-media decoder and the AAOS device its c2 HAL settings | `XT_DOMA_HWDEC=false`: not built, because virtio-media exists only in qemu 10.0.2 |
 
@@ -2652,8 +2652,9 @@ MemoryListener**, and `vhost_commit()` re-verified every vring against addresses
 that are pseudo-hvas under Xen, so the device model `abort()`ed the instant Mesa
 created its first Venus context. Fixed by qemu `0119`.
 
-Also from this run: the memory redistribution the 4 GiB SKU needs (DomD 1408 MiB /
-DomA 2176 MiB in the Vulkan lane), and the `VKR_DEVICE_HEAP_MIB` and
+Also from this run: the memory redistribution the 4 GiB SKU needs (in that
+run DomD 1408 MiB / DomA 2176 MiB in the Vulkan lane; this tree's map is
+DomD 1440 / DomA 2048), and the `VKR_DEVICE_HEAP_MIB` and
 `V3DV_MAX_BO_CACHE_SIZE` values in section 5c. `meta-rpi-sodev/meta-xt-rpi4/README.md` carries the per-SKU
 reasoning for the split.
 

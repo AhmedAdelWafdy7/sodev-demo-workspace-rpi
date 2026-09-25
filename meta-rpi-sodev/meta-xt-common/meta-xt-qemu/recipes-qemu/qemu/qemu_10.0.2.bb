@@ -313,6 +313,19 @@ SRC_URI:append:class-target = " file://0215-v10-xen-pvh-common-one-INTX-line-per
 
 SRC_URI:append:class-target = " file://0216-v10-hw-virtio-add-a-native-virtio-media-device.patch"
 
+# 0220-v10: DomA -> HDMI audio. The alsa backend in 10.0.2 switched
+# .buffer_get_free from audio_generic_buffer_get_free to alsa_buffer_get_free,
+# so when the host has no free space audio_run_out() stops calling virtio-snd's
+# callback. virtio-snd's policy is "do not return TX until it is fully
+# consumed", so the guest's ring fills up and it reopens at 23 Hz (measured
+# 2026-09-04). It restores the 7.0 op-table entry and deletes
+# alsa_buffer_get_free(), which is then left without a user.
+# That measurement predates DomD kernel patch 0016, when the HDMI audio DMA
+# did not reach the MAI FIFO, so it does not show 10.0.2's report failing on
+# its own. The patch is kept because doma.cfg's audiodev values were chosen
+# with it (see the patch's description).
+SRC_URI:append:class-target = " file://0220-v10-audio-alsa-report-the-generic-buffer-as-free.patch"
+
 # 0222: move the commandq processing into a BH. On Xen/Arm even an MMIO write
 #   leaves the guest vCPU descheduled until the ioreq completes
 #   (ioreq_needs_completion() excludes only PIO writes), and qemu can complete
@@ -403,6 +416,11 @@ SRC_URI:append:class-target = " file://0234-v10-virtio-media-park-fd-handler-on-
 #   blocked on a fence waits for the next tick, and the 10 ms tick capped
 #   1080p60 at 14.7 fps and 720p60 at 22 fps.
 SRC_URI:append:class-target = " file://0235-v10-virtio-gpu-virgl-poll-retired-fences-every-1-ms.patch"
+
+# 0236-v10: pin virtio-gpu's EDID refresh with the refresh_rate property (mHz).
+#   The 75 Hz default made the guest SurfaceFlinger's vsync 75 Hz, which dropped
+#   60 fps video to 37.5 Hz.
+SRC_URI:append:class-target = " file://0236-v10-virtio-gpu-edid-refresh-rate-property.patch"
 
 # 0242-v10: two levers for the host-side QBUF cost (gpu_wait 449 us / host
 # ioctl 593 us, the latter over both queues, against 84 us native), both off by

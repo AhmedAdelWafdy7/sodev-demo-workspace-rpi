@@ -19,7 +19,8 @@ board, so the same image is a valid guest under Xen on a Pi 4 (BCM2711, GIC-400)
 on a Pi 5. It has no rootfs, no device model, no display and no network — its only
 interface is the Xen PV console.
 
-Build it with `./build.sh -z`; add `--board=rpi4` for a Pi 4. Console:
+Build it with `./build.sh -z`; add `--board=rpi4` for a Pi 4 (8 GiB only: `build.sh`
+refuses `-z` with `--ram=4g`, whose budget is Dom0 + DomD + one guest). Console:
 
 ```sh
 ssh root@192.168.10.10          # the toolstack domain (DomD in the Zephyr-Dom0 flavour)
@@ -109,7 +110,9 @@ on hardware too:
 ## Hardware bring-up
 
 DomZ has been verified on hardware in all four verification patterns (RPi4 and RPi5,
-Zephyr-Dom0 and thin-Linux-Dom0):
+Zephyr-Dom0 and thin-Linux-Dom0). The RPi4 runs used the 4 GiB board, with images built
+before `build.sh` began refusing `-z` on `--ram=4g`; the 8 GiB map that `-z` now needs
+on the RPi4 has not been booted:
 
 ```
 xl list                      # DomZ present, 16 MiB, 1 vCPU

@@ -1,0 +1,63 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 13 Sep 2026 15:19:29 +0900
+Subject: [PATCH] xen/swiotlb: translate MMIO resources through the device's
+ dma-ranges in map_resource
+
+Under Xen every device in a direct-mapped domain (XENFEAT_direct_mapped:
+dom0 and dom0less driver domains with device passthrough) gets
+xen_swiotlb_dma_ops, so dma_map_resource() reaches
+xen_swiotlb_direct_map_resource() instead of dma_direct_map_phys().
+
+In raspberrypi/linux, dma_direct_map_phys() applies phys_to_dma() to
+MMIO addresses as well (372f4e66dad6, "dma-mapping: Use any
+dma_range_map for phys to DMA"), i.e. a slave FIFO address is
+translated through the DMA master's dma-ranges (dev->dma_range_map).
+Mainline does not: its DMA_ATTR_MMIO path uses the physical address as
+is. xen_swiotlb_direct_map_resource() returns the CPU physical address
+untranslated as well, so on this kernel a device tree "dma-ranges" that
+describes a peripheral alias is silently ignored for MMIO targets only
+when running as a Xen guest.
+
+Measured on a Raspberry Pi 4 (BCM2711) driver domain: vc4-hdmi audio
+programs the DMA40 engine (which sees peripherals at 0x4_7exx_xxxx via
+scb's dma-ranges <0x4 0x7c000000  0x0 0xfc000000  0x0 0x3800000>) with
+DEST=0x00_fef2001c -- the CPU address of the MAI FIFO -- because the
+address came back from dma_map_resource() untranslated.  The transfer
+completes at memory speed (2 periods in ~1 ms), the MAI FIFO stays
+EMPTY, ALSA reports XRUN every ~100 ms and no sound is produced, all
+with error code 0.  The same DTB on bare metal (no Xen, direct ops)
+translates correctly.
+
+Use xen_phys_to_dma() here.  For a direct-mapped domain the pfn->bfn
+step is the identity for MMIO, so this reduces to phys_to_dma() and the
+dma-ranges translation; for a non-direct-mapped domain it is exactly the
+bus address the swiotlb-xen page mappings already use.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ drivers/xen/swiotlb-xen.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/xen/swiotlb-xen.c b/drivers/xen/swiotlb-xen.c
+--- a/drivers/xen/swiotlb-xen.c
++++ b/drivers/xen/swiotlb-xen.c
+@@ -398,7 +398,16 @@
+ 						  enum dma_data_direction dir,
+ 						  unsigned long attrs)
+ {
+-	dma_addr_t dma_addr = paddr;
++	/*
++	 * As raspberrypi/linux's dma_direct_map_phys(DMA_ATTR_MMIO) does, put
++	 * an MMIO target through the master's dma-ranges (dev->dma_range_map).
++	 * On a direct-mapped domain xen_phys_to_bus() is the identity for MMIO,
++	 * so this is exactly phys_to_dma(); an untranslated paddr leaves a DT
++	 * dma-ranges peripheral alias silently ineffective under Xen
++	 * (measured: BCM2711 DMA40 -> vc4-hdmi MAI FIFO programmed with the
++	 * CPU address, transfer completes at memory speed, FIFO stays empty).
++	 */
++	dma_addr_t dma_addr = xen_phys_to_dma(dev, paddr);
+ 
+ 	if (unlikely(!dma_capable(dev, dma_addr, size, false))) {
+ 		dev_err_once(dev,

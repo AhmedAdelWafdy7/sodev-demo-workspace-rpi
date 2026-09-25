@@ -204,7 +204,9 @@ Follow *Docker usage* below -- in particular the post-install step that lets you
 
 `-z` adds a second **west** workspace (`zephyr-domz/`) and one more Zephyr build; it
 costs a few minutes and no Yocto work, so it combines freely with any of the rows
-above. The guest is board-independent (`xenvm`), so the same image is valid under Xen on
+above -- except on a 4 GiB Raspberry Pi 4 (`--board=rpi4 --ram=4g`), whose memory
+budget is Dom0 + DomD + one guest: `build.sh` refuses `-z` there. The guest is
+board-independent (`xenvm`), so the same image is valid under Xen on
 either board — see [`meta-xt-domz/README.md`](../meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md) for what the domain is and how
 to bring it up.
 
@@ -218,7 +220,8 @@ Every command above builds for a **Raspberry Pi 5**, which is the default. Add
 `--board=rpi4` to build for a Raspberry Pi 4 Model B instead; that switches the whole
 configuration (`rpi4-sodev.yaml` instead of `rpi5-sodev.yaml`, `meta-xt-rpi4` instead of
 `meta-xt-rpi5`, BCM2711 device trees and memory map) and changes what `--ram` accepts --
-`8g`/`4g` there, `16g`/`8g` on the Pi 5. Nothing else in this walkthrough differs. What
+`8g`/`4g` there, `16g`/`8g` on the Pi 5. Nothing else in this walkthrough differs,
+except that `-z` is refused with `--ram=4g` (see above). What
 is verified on that board is listed in `meta-rpi-sodev/meta-xt-rpi4/README.md`.
 
 > **The builder image needs Zephyr SDK 1.0.1 and a python3.12 virtualenv**, because

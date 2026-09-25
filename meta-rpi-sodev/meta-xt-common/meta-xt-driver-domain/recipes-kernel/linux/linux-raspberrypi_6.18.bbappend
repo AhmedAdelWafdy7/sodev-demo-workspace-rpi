@@ -91,6 +91,24 @@ SRC_URI:append = " \
     file://0015-bcm2835-codec-allow-cache-hints-on-both-queues.patch \
 "
 
+# 0016 makes a DT dma-ranges peripheral alias effective for MMIO targets inside a
+# direct-mapped Xen domain. Every device in such a domain gets
+# xen_swiotlb_dma_ops, so dma_map_resource() lands in
+# xen_swiotlb_direct_map_resource(), which without 0016 returns the CPU
+# physical address untranslated, while raspberrypi/linux's
+# dma_direct_map_phys() puts MMIO addresses through phys_to_dma()
+# (372f4e66dad6; mainline does not).
+#
+# Measured on a Raspberry Pi 4 DomD: vc4-hdmi audio programmed DMA40 with
+# DEST=0x00_fef2001c, the CPU address of the MAI FIFO, instead of the 0x4_7exx_xxxx
+# alias scb's dma-ranges describes. The transfer then completed at memory speed
+# (2 periods in ~1 ms), the FIFO stayed EMPTY, ALSA reported an XRUN every ~100 ms
+# and nothing was audible -- all with error code 0. The same DTB on bare metal,
+# with the direct ops, translates correctly.
+SRC_URI:append = " \
+    file://0016-xen-swiotlb-translate-MMIO-resource-through-dma-ranges.patch \
+"
+
 # rpi5-0004: V4H Xen patchset for the Dom0/DomD kernel. The base meta-xt-rpi5
 # linux-raspberrypi_6.12.bbappend (pristine) does NOT carry these; they were
 # being applied by editing the base bbappend directly. Moved here so meta-xt-rpi5

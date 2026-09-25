@@ -1,0 +1,100 @@
+From fe49cf3f1f6ab67c599f311395c1fa7924e491cc Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 24 Sep 2026 01:25:41 +0900
+Subject: [PATCH] v3d: fill the tiled blit temporary with the TFU
+
+v3d_render_blit() cannot sample a raster source, so it first copies the
+source into a tiled temporary. It does that with resource_copy_region,
+which v3d sets to util_resource_copy_region: both resources are mapped
+on the CPU, the map waits for every job still writing the source, and
+each pixel is retiled in software. This is the path every flipped blit
+from a linear source takes, because the TFU and TLB paths refuse a
+flip.
+
+That is what qemu's SDL display does for each frame of a virtio-gpu
+guest: egl_fb_blit() blits the guest's scanout, which is a linear
+buffer, into the window with a y-flip. Measured on a Raspberry Pi 4,
+with V3D_DEBUG=perf and backtraces taken on the board:
+"Blocking on winsys BO for bo map" about 20 times a second, all from
+virgl_cmd_resource_flush -> sdl2_gl_scanout_flush -> egl_fb_blit ->
+v3d_render_blit -> util_resource_copy_region. qemu's main thread spent
+19-29% of its time in v3d_wait_bo_ioctl. The guest's ioreqs wait on
+that thread too.
+
+The temporary always has the source's format and size and is filled
+without scaling or flipping, which is exactly what the TFU does: it
+converts raster to tiled on the GPU. Fill it with v3d_tfu_blit() and
+keep the CPU copy only for what the TFU rejects.
+
+On the same board the blocking maps go from about 20/s to none. qemu's
+main thread goes from 44% to 35% CPU. The guest compositor's average
+frame time goes from 14.7 to 9.9 ms, and its missed frames from 7.8/s
+to 2.1/s.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ src/gallium/drivers/v3d/v3d_blit.c | 39 ++++++++++++++++++++++++++----
+ 1 file changed, 34 insertions(+), 5 deletions(-)
+
+diff --git a/src/gallium/drivers/v3d/v3d_blit.c b/src/gallium/drivers/v3d/v3d_blit.c
+index c5c07d1..f416254 100644
+--- a/src/gallium/drivers/v3d/v3d_blit.c
++++ b/src/gallium/drivers/v3d/v3d_blit.c
+@@ -83,6 +83,9 @@ v3d_blitter_save(struct v3d_context *v3d, enum v3d_blitter_op op)
+         }
+ }
+ 
++static void
++v3d_tfu_blit(struct pipe_context *pctx, struct pipe_blit_info *info);
++
+ static void
+ v3d_render_blit(struct pipe_context *ctx, struct pipe_blit_info *info)
+ {
+@@ -118,11 +121,37 @@ v3d_render_blit(struct pipe_context *ctx, struct pipe_blit_info *info)
+                         mesa_loge("Failed to create tiled blit temp");
+                         return;
+                 }
+-                ctx->resource_copy_region(ctx,
+-                                          tiled, 0,
+-                                          0, 0, 0,
+-                                          info->src.resource, info->src.level,
+-                                          &box);
++
++                /* Fill the temporary with the TFU, which converts raster to
++                 * tiled on the GPU. resource_copy_region here is
++                 * util_resource_copy_region, which maps both resources on the
++                 * CPU -- waiting for the GPU to finish writing the source --
++                 * and retiles every pixel in software.
++                 */
++                struct pipe_blit_info copy = {
++                        .dst = {
++                                .resource = tiled,
++                                .level = 0,
++                                .box = box,
++                                .format = tmpl.format,
++                        },
++                        .src = {
++                                .resource = info->src.resource,
++                                .level = info->src.level,
++                                .box = box,
++                                .format = info->src.resource->format,
++                        },
++                        .mask = PIPE_MASK_RGBA,
++                };
++                v3d_tfu_blit(ctx, &copy);
++                if (copy.mask & PIPE_MASK_RGBA) {
++                        ctx->resource_copy_region(ctx,
++                                                  tiled, 0,
++                                                  0, 0, 0,
++                                                  info->src.resource,
++                                                  info->src.level,
++                                                  &box);
++                }
+                 info->src.level = 0;
+                 info->src.resource = tiled;
+         }
+-- 
+2.43.0
+

@@ -1,0 +1,108 @@
+From daef679330fafeb4b5387078802143b1a4e95b2b Mon Sep 17 00:00:00 2001
+From: Hannes Reynaert <hannes.reynaert@barco.com>
+Date: Tue, 11 Aug 2026 15:40:00 +0200
+Subject: [PATCH] kiosk-shell: guard against NULL output during hotplug
+
+Several call sites in kiosk-shell.c dereference a kiosk_shell_output
+(or shsurf->output) without checking for NULL, unlike other call sites
+in the same file that already guard with "if (shsurf->output)":
+
+ - desktop_surface_committed() dereferences the kiosk_shell_output
+   returned by kiosk_shell_surface_find_best_output()/shsurf->output.
+ - kiosk_shell_output_set_active_surface_tree() and
+   kiosk_shell_output_raise_surface_subtree() both dereference their
+   "shoutput" argument unconditionally, even though every caller
+   ultimately passes shsurf->output.
+
+shsurf->output/find_best_output() can legitimately be NULL: it is
+reset to NULL by kiosk_shell_surface_notify_output_destroy() whenever
+the underlying weston_output's destroy_signal fires. The DRM backend
+defers that destroy_signal while a page flip is in flight ("delaying
+output destruction because of a pending flip, wait until it
+completes"), so a quick monitor unplug+replug can leave
+shsurf->output NULL right when a client (re)commits or
+(re)activates its surface (e.g. via
+kiosk_shell_surface_activate() -> kiosk_shell_output_raise_surface_subtree()).
+When that happens weston segfaults in kiosk-shell.so:
+
+  kernel: weston[1092]: segfault at 60 ip 00007f4552f64c0c ... in
+  kiosk-shell.so[6c0c,7f4552f63000+5000]
+
+(offset 0x60 matches both offsetof(struct weston_output, width/height)
+and offsetof(struct kiosk_shell_output, active_surface_tree), reached
+through a NULL output/shoutput pointer), taking down every Wayland
+client with it, including the kiosk browser.
+
+Add the same NULL guards already used elsewhere in the file, so a
+commit/activate that races with a pending output reassignment is
+simply deferred instead of crashing the whole compositor.
+
+Signed-off-by: Hannes Reynaert <hannes.reynaert@barco.com>
+Signed-off-by: Thomas Devoogdt <thomas.devoogdt@barco.com>
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Backport [https://gitlab.freedesktop.org/wayland/weston/-/commit/daef679330fafeb4b5387078802143b1a4e95b2b]
+---
+ kiosk-shell/kiosk-shell.c | 23 +++++++++++++++++------
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/kiosk-shell/kiosk-shell.c b/kiosk-shell/kiosk-shell.c
+index 2b9cb23..9832cd5 100644
+--- a/kiosk-shell/kiosk-shell.c
++++ b/kiosk-shell/kiosk-shell.c
+@@ -632,9 +632,14 @@ kiosk_shell_output_set_active_surface_tree(struct kiosk_shell_output *shoutput,
+ 					   struct kiosk_shell_surface *shroot)
+ 
+ {
+-	struct kiosk_shell *shell = shoutput->shell;
++	struct kiosk_shell *shell;
+ 	struct kiosk_shell_surface *s;
+ 
++	if (!shoutput)
++		return;
++
++	shell = shoutput->shell;
++
+ 	/* Remove the previous active surface tree (i.e., move the tree to
+ 	 * WESTON_LAYER_POSITION_HIDDEN) */
+ 	if (shoutput->active_surface_tree) {
+@@ -666,6 +671,9 @@ kiosk_shell_output_raise_surface_subtree(struct kiosk_shell_output *shoutput,
+ 	struct wl_list tmp_list;
+ 	struct kiosk_shell_surface *s, *tmp_s;
+ 
++	if (!shoutput)
++		return;
++
+ 	wl_list_init(&tmp_list);
+ 
+ 	if (!shoutput->active_surface_tree)
+@@ -1012,9 +1020,10 @@ desktop_surface_committed(struct weston_desktop_surface *desktop_surface,
+ 		shoutput = kiosk_shell_surface_find_best_output(shsurf);
+ 
+ 		kiosk_shell_surface_set_output(shsurf, shoutput);
+-		weston_desktop_surface_set_size(shsurf->desktop_surface,
+-						shoutput->output->width,
+-						shoutput->output->height);
++		if (shoutput)
++			weston_desktop_surface_set_size(shsurf->desktop_surface,
++							shoutput->output->width,
++							shoutput->output->height);
+ 		/* even if we couldn't find an appid set for a particular
+ 		 * output still flag the shsurf as to a avoid changing the
+ 		 * output every time */
+@@ -1033,8 +1042,10 @@ desktop_surface_committed(struct weston_desktop_surface *desktop_surface,
+ 
+ 	if (!weston_surface_is_mapped(surface) || (is_resized && is_fullscreen)) {
+ 		if (is_fullscreen || !shsurf->xwayland.is_set) {
+-			weston_shell_utils_center_on_output(shsurf->view,
+-							    shsurf->output->output);
++			struct kiosk_shell_output *shoutput = shsurf->output;
++			if (shoutput)
++				weston_shell_utils_center_on_output(shsurf->view,
++								    shoutput->output);
+ 		} else {
+ 			struct weston_coord_surface offset;
+ 			struct weston_geometry geometry =
+-- 
+2.43.0
+

@@ -15,6 +15,7 @@ SRC_URI = " \
     file://doma.dts \
     file://xl-create-doma.service \
     file://doma-devmodel-sweep.sh \
+    file://doma-pick-hdmi-audio \
     "
 
 S = "${UNPACKDIR}"
@@ -39,6 +40,12 @@ BOARD_RAM ??= "16g"
 # Board layers whose SKUs are not the Pi 5's 16g/8g set this to DomA's size in MiB
 # and the BOARD_RAM map in do_install is not consulted. Empty means "use the map".
 DOMA_MEM_MiB ??= ""
+
+# DomA's vCPU count and its physical-core mask: 2 vCPUs on pcpu 2-3 on every board,
+# off the pcpus DomD and its device model run on. The measurements behind it are in
+# doma.cfg next to the two tokens. Board layers can still override either.
+DOMA_VCPUS ?= "2"
+DOMA_CPUS ?= "2-3"
 
 # [Venus] virtio-gpu-gl device-model options, from the moulin GPU parameter (see
 # do_install). Defaulted for the same reason BOARD_RAM is defaulted a few lines above:
@@ -144,6 +151,17 @@ XT_DOMA_HWDEC ??= "false"
 XT_DOMA_HWDEC_DEVARG ?= "v4l2-device=/dev/video10,output-coherent=on,gpu-fence-fd=on"
 XT_DOMA_HWDEC_DEVARG:raspberrypi5 = "decoder=hevc"
 
+# [display] Extra virtio-gpu-gl-pci properties, substituted only on the qemu 10
+# device model (see XT_DOMA_GPU_PROPS_PLACEHOLDER in doma.cfg).
+#
+# refresh_rate=60000 pins the EDID refresh the device model reports to the guest at
+# 60 Hz (the value is mHz; qemu patch 0236). Without it qemu's EDID advertises 75 Hz
+# and the guest's SurfaceFlinger runs its vsync at 75 Hz against a 60 Hz panel:
+# measured on the RPi4 2026-09-05, a 60 fps video layer could then only be served at
+# 37.5 Hz. The RPi5 verification image ran with the same value (2026-09-21). Both
+# boards' DomA panels are 60 Hz, so it is the default rather than a board override.
+XT_DOMA_GPU_PROPS ??= "refresh_rate=60000,"
+
 
 do_compile() {
     dtc -I dts -O dtb -o ${WORKDIR}/doma.dtb ${UNPACKDIR}/doma.dts
@@ -186,6 +204,19 @@ do_install() {
     # because bitbake leaves unknown names untouched -- a bitbake variable of that
     # name appearing later would silently substitute the wrong value.
     sed -i "s/^memory = DOMA_MEM_PLACEHOLDER\$/memory = $doma_mem/" \
+        ${D}${sysconfdir}/xen/doma.cfg
+
+    # Same treatment for the vCPU count and the pCPU mask: `xl create` rejects a
+    # non-numeric `vcpus`, so DomA would never start -- and the same applies if a
+    # future edit renames either token.
+    if ! grep -q '^vcpus = DOMA_VCPUS_PLACEHOLDER$' ${D}${sysconfdir}/xen/doma.cfg; then
+        bbfatal "DOMA_VCPUS_PLACEHOLDER not found in doma.cfg"
+    fi
+    if ! grep -q '^cpus = "DOMA_CPUS_PLACEHOLDER"$' ${D}${sysconfdir}/xen/doma.cfg; then
+        bbfatal "DOMA_CPUS_PLACEHOLDER not found in doma.cfg"
+    fi
+    sed -i -e "s/^vcpus = DOMA_VCPUS_PLACEHOLDER\$/vcpus = ${DOMA_VCPUS}/" \
+           -e "s/^cpus = \"DOMA_CPUS_PLACEHOLDER\"\$/cpus = \"${DOMA_CPUS}\"/" \
         ${D}${sysconfdir}/xen/doma.cfg
 
     # [Venus] Substitute the virtio-gpu-gl device-model options. XT_VENUS_GPU_OPTS
@@ -331,6 +362,29 @@ do_install() {
         bbfatal "doma.cfg: tx-poll-us left in for qemu ${XT_DM_QEMU_VERSION}, whose device model has no such property"
     fi
 
+    # [display] Substitute the board's extra virtio-gpu-gl-pci properties on the
+    # qemu 10 device model, and empty the token on 7.0.0. Keyed on the device
+    # model's version for the same reason as tx-poll-us above: the properties this
+    # carries come from patches only the 10.0.2 device model has (refresh_rate is
+    # 0236), and a 7.0.0 device model exits on an unknown property.
+    if ! grep -q 'virtio-gpu-gl-pci,XT_DOMA_GPU_PROPS_PLACEHOLDER' ${D}${sysconfdir}/xen/doma.cfg; then
+        bbfatal "XT_DOMA_GPU_PROPS_PLACEHOLDER not found in doma.cfg"
+    fi
+    case "${XT_DM_QEMU_VERSION}" in
+    7.*) doma_gpu_props="" ;;
+    *)   doma_gpu_props="${XT_DOMA_GPU_PROPS}" ;;
+    esac
+    sed -i -e '/^    # XT_DOMA_GPU_PROPS_PLACEHOLDER is SUBSTITUTED AT BUILD TIME/,/^    # xt-xen-cfg-doma\.$/d' \
+           -e "s/XT_DOMA_GPU_PROPS_PLACEHOLDER/$doma_gpu_props/" \
+        ${D}${sysconfdir}/xen/doma.cfg
+    if grep -q XT_DOMA_GPU_PROPS_PLACEHOLDER ${D}${sysconfdir}/xen/doma.cfg; then
+        bbfatal "doma.cfg: XT_DOMA_GPU_PROPS_PLACEHOLDER was not substituted"
+    fi
+    if [ -n "$doma_gpu_props" ]; then
+        grep -q "virtio-gpu-gl-pci,$doma_gpu_props" ${D}${sysconfdir}/xen/doma.cfg || \
+            bbfatal "doma.cfg: '$doma_gpu_props' did not reach the virtio-gpu -device line"
+    fi
+
     # [qemu 10] Device-model argument fixups. Two of the options in doma.cfg are
     # 7.0.0-xt-only and qemu 10 EXITS on either one -- both measured on RPi5:
     #   virtio-snd-pci        -> "'virtio-snd-pci' is not a valid device model name"
@@ -371,6 +425,20 @@ do_install() {
     # systemd rejects with "Ignoring unknown escape sequences".
     install -d ${D}${libexecdir}
     install -m 0755 ${UNPACKDIR}/doma-devmodel-sweep.sh ${D}${libexecdir}/doma-devmodel-sweep
+
+    # ALSO an ExecStartPre, and it has to be the LAST one: it edits doma.cfg and
+    # ExecStart is what reads the result.
+    #
+    # doma.cfg names the HDMI card the qemu audio backend opens, and which
+    # vc4hdmi card is the connected one depends on the cable, among the cards DomD
+    # has (one per HDMI node its DT gives `dmas`). The script reads
+    # /proc/asound/card*/eld*, picks the card
+    # whose ELD reports sad_count > 0 -- the one a display actually answered on --
+    # and rewrites out.dev, keeping a .hdmiaudio.bak. At boot rather than at build
+    # time because the answer changes when the cable moves. It sees only the
+    # toolstack domain's cards: in the linux flavour that is Dom0, which has none,
+    # so there the literal out.dev doma.cfg was built with is what DomA opens.
+    install -m 0755 ${UNPACKDIR}/doma-pick-hdmi-audio ${D}${libexecdir}/doma-pick-hdmi-audio
 }
 
 # doma.cfg now depends on BOARD_RAM, so switching SKUs must not reuse a doma.cfg
@@ -379,6 +447,8 @@ do_install() {
 do_install[vardeps] += "BOARD_RAM"
 # Same reason, for the board-layer override that bypasses the BOARD_RAM map.
 do_install[vardeps] += "DOMA_MEM_MiB"
+# Same reason for the two CPU tokens, which a board layer may override.
+do_install[vardeps] += "DOMA_VCPUS DOMA_CPUS"
 # Same reason again, for the Venus device-model options substituted into doma.cfg.
 do_install[vardeps] += "XT_VENUS_GPU_OPTS"
 # Same reason for the two memory knobs substituted into the same qemu_envs line.
@@ -390,6 +460,7 @@ do_install[vardeps] += "XT_DM_QEMU_VERSION"
 # lanes or boards must not reuse a doma.cfg from sstate that carries the other
 # lane's device, or the other board's backend argument.
 do_install[vardeps] += "XT_DOMA_HWDEC XT_DOMA_HWDEC_DEVARG"
+do_install[vardeps] += "XT_DOMA_GPU_PROPS"
 
 FILES:${PN} = " \
     ${sysconfdir}/xen/doma.cfg \
@@ -397,4 +468,5 @@ FILES:${PN} = " \
     /usr/lib/xen/boot/doma.dtb \
     ${systemd_system_unitdir}/xl-create-doma.service \
     ${libexecdir}/doma-devmodel-sweep \
+    ${libexecdir}/doma-pick-hdmi-audio \
     "

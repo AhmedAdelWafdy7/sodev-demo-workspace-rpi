@@ -141,10 +141,10 @@ disables the heavy Android/Flatcar guests by default).
 |---|---|---|
 | `--board=<board>` (`BOARD`) | **rpi5** | Which board to build: `rpi5` or `rpi4`. Selects `<board>-sodev.yaml`, and with it the SoC, MACHINE, Zephyr Dom0 board, passthrough set, physical memory map and board layer (`meta-xt-rpi5` or `meta-xt-rpi4` — never both). Raspberry Pi 5 is the reference platform; see *meta-xt-rpi4/README.md* for what the Raspberry Pi 4 configuration is verified against |
 | `--dom0=<os>` (`DOM0_OS`) | **zephyr** | Selects the entire Dom0 component body: Zephyr xenstore-only Dom0 (disaggregated; DomD owns the toolstack) or the thin Linux control Dom0 (classic; Dom0 owns xl). The Zephyr flavour is the shipping default. On the RPi5 the linux flavour gives DomD no Wi-Fi, no Bluetooth and no hardware video decode: Wi-Fi and Bluetooth need their pins muxed over SCMI, which only the Zephyr flavour sets up. On the RPi4 the linux flavour gives DomD no Wi-Fi either: the Wi-Fi SDIO controller shares GIC SPI 126 with the SD card controller, which that flavour's Dom0 keeps, so it stays with Dom0 as well. What has been run on hardware, and with which flavour, is in *Build & hardware verification (RPi5)* below. |
-| `--ram=<sku>` (`BOARD_RAM`) | **16g** (rpi5) / **8g** (rpi4) | Board SKU; the valid values and the default depend on `--board`. **rpi5: `16g`\|`8g`.** `16g` = the full 4-domain map (Dom0 512 + DomD 4096 + DomU 1024 + DomA 4096 = 9728 MiB). `8g` takes **DomD to 3072 MiB** (static-mem bank4 at `0x180000000` dropped) **and DomA to 3072 MiB**; Dom0/DomU keep their sizes, so the four total 7680 MiB and fit an 8 GB board. Splitting the reduction is measured, not a preference — see *Board RAM size* (`docs/DESIGN.md`). **rpi4: `8g`\|`4g`.** `8g` = Dom0 128 (zephyr, the default) or 256 (linux) + DomD 1920 + DomU 1024 + DomA 2560; `4g` drops bank2 and shrinks DomD (the per-lane DomD and DomA sizes are in *meta-xt-rpi4/README.md*), and DomA and DomU can no longer RUN at the same time — each fits alone, and `build.sh` says so |
+| `--ram=<sku>` (`BOARD_RAM`) | **16g** (rpi5) / **8g** (rpi4) | Board SKU; the valid values and the default depend on `--board`. **rpi5: `16g`\|`8g`.** `16g` = the full 4-domain map (Dom0 512 + DomD 4096 + DomU 1024 + DomA 4096 = 9728 MiB). `8g` takes **DomD to 3072 MiB** (static-mem bank4 at `0x180000000` dropped) **and DomA to 3072 MiB**; Dom0/DomU keep their sizes, so the four total 7680 MiB and fit an 8 GB board. Splitting the reduction is measured, not a preference — see *Board RAM size* (`docs/DESIGN.md`). **rpi4: `8g`\|`4g`.** `8g` = Dom0 128 (zephyr, the default) or 256 (linux) + DomD 1920 + DomU 1024 + DomA 2560; `4g` drops bank2 and shrinks DomD (the per-lane DomD and DomA sizes are in *meta-xt-rpi4/README.md*), and DomA and DomU can no longer RUN at the same time — each fits alone, and `build.sh` says so; it also refuses `-z` there |
 | `-u`, `--domu` (`ENABLE_DOMU`) | **off** | Adds the AGL instrument-cluster DomU: Xen-aware kernel `linux-virtio-armv8` (p1) + AGL rootfs (p3). V4H-aligned minimal domu layer set (kernel via moulin; AGL rootfs via `build.sh`'s AGL bitbake) |
 | `-a`, `--android` (`ENABLE_ANDROID`) | **off** | Include DomA (AAOS, p4 nested GPT). Alias for `--aaos=auto` — the mode chooses how DomA is produced |
-| `-z`, `--domz` (`ENABLE_DOMZ`) | **off** | Adds DomZ, the Zephyr RTOS domain: Zephyr built for its own Xen-guest board (`xenvm`, GICv2, Xen PV console) out of a second west workspace, staged on p1 as `zephyr-domz.bin` and started by the xl toolstack from `/etc/xen/domz.cfg`. 16 MiB / 1 vCPU, no rootfs and **no new partition**, so the p2/p3/p4 layout is unchanged. Console: `xl console DomZ`. See [`meta-xt-domz/README.md`](meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md) |
+| `-z`, `--domz` (`ENABLE_DOMZ`) | **off** | Adds DomZ, the Zephyr RTOS domain: Zephyr built for its own Xen-guest board (`xenvm`, GICv2, Xen PV console) out of a second west workspace, staged on p1 as `zephyr-domz.bin` and started by the xl toolstack from `/etc/xen/domz.cfg`. 16 MiB / 1 vCPU, no rootfs and **no new partition**, so the p2/p3/p4 layout is unchanged. Console: `xl console DomZ`. **Refused on the 4 GiB RPi4** (`--board=rpi4 --ram=4g`), whose budget is Dom0 + DomD + one guest. See [`meta-xt-domz/README.md`](meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md) |
 | `--domains-only` (`NINJA_TARGET=""`) | off | Build the domains but skip SD-image assembly |
 | `--gpu=<stack>` (`GPU`) | **vulkan** | Which graphics stack the guests get. **`vulkan`** (default): DomA and DomU render with Vulkan through Venus — device model qemu 10.0.2-xt, virglrenderer's venus backend plus `render-server`/`minigbm_allocation`, `hostmem=256M,blob=true,venus=true` on the guests' `virtio-gpu-gl`, the Vulkan runtime in the DomD and DomU rootfs, DomA compositing with SkiaVk and the DomU cluster on the Vulkan (Impeller) embedder. On the rpi4 4g SKU it also moves memory from DomA to DomD (sizes in *meta-xt-rpi4/README.md*), because a host-visible blob window is unreclaimable device-model memory. **`gl`**: the pre-Venus OpenGL stack — qemu 7.0.0-xt with its six device-model patches, no venus backend, no blob window, the pre-Venus memory split (rpi4 4g SKU only). Two things it does **not** revert: DomD's mesa is 26.2.2 in both lanes (the pin is a v3dv fix both lanes use), and DomA's AOSP-side settings (the Venus ICD and SkiaVk compositing), which this tree applies whatever `--gpu` says, so a pre-Venus DomA needs them reverted. [`docs/VULKAN-VENUS.md`](docs/VULKAN-VENUS.md) has the authoritative per-lane table |
 | `--devel` (`ENABLE_DEVEL`) | **off** | Add `meta-rpi-sodev-devel` to the DomD build: the Venus phase 0–3 gate (`sodev-venus-gate.sh`), the three Vulkan reproducers, the VRAM/CMA tools, and the **diagnostic** virglrenderer and Xen patches (command-stream dump with a live sanity assert, a log line per guest allocation ≥ 64 MiB, and Xen's injected-abort paths made loud on a release hypervisor). Diagnostics only — never part of a shipping image |
@@ -250,12 +250,19 @@ assembled the V4H way from the `doma`/`doma_kernel` moulin components).
   touch panel depends on passing that controller through. What is and is not verified on
   this board, and the open items, are listed in
   `meta-rpi-sodev/meta-xt-rpi4/README.md`.
-- HDMI-A-1: 1920x720 cluster panel (forced CVT modeline — its EDID does not come through).
-- HDMI-A-2: 1920x720 IVI panel (forced modeline transcribed from its EDID). This panel
-  answers the EDID read **3.7 s late**, which used to leave it dark for the whole
-  session; weston's start is held until the DRM mode lists settle. See *Late EDID on
-  HDMI-A-2* below.
-- Native USB touch on the IVI panel (RP1 passthrough + virtio-tablet forward).
+- RPi5, HDMI-A-1: 1920x720 cluster panel for DomU (forced CVT modeline — its EDID does
+  not come through).
+- RPi5, HDMI-A-2: DomA's display, a 1920x1080 HDMI monitor driven at CEA-861 VIC 16
+  (1920x1080@60), with DomA's virtio-gpu at 1920x1080 to match. The shared weston.ini
+  and doma.cfg keep the 1920x720 IVI panel's values; meta-xt-rpi5's weston-init and
+  xt-xen-cfg-doma bbappends rewrite both, and a 1920x720 panel on this output means
+  dropping those two bbappends together. weston's start is held until the DRM mode lists
+  settle, because that 1920x720 panel answered the EDID read **3.7 s late** and stayed
+  dark for the whole session. See *Late EDID on HDMI-A-2* below.
+- RPi4: only HDMI-A-1 has a panel, and it carries DomA at 1280x720 (CEA-861 VIC 4); see
+  `meta-rpi-sodev/meta-xt-rpi4/README.md`.
+- Native USB touch on DomA's display where it has a USB touch controller (RP1 on the
+  RPi5, the VL805 on the RPi4, passed through to DomD + virtio-tablet forward).
 
 ## Domain / CPU map
 
@@ -395,7 +402,17 @@ kernel and the `super.img` vendor_dlkm modules must come from one coherent build
 (same `module_layout` ABI; see *How the DomA artifacts are produced* (`docs/BUILD.md`)). The **thin Linux-Dom0** flavour
 has been booted end to end on both boards, in the Xen 4.22 run of 2026-08-18
 described below. That run does not cover DomD's Wi-Fi, Bluetooth or hardware
-decode, and on the RPi5 the linux flavour gives DomD none of the three.
+decode, and on the RPi5 the linux flavour gives DomD none of the three. HDMI
+audio on the RPi5 is wired in that flavour as in the Zephyr one but has not been
+played in it; its DMA engine in DomD (/axi/dma@10600) shares a 4 KiB page with
+/axi/dma@10000, which stays with the Linux Dom0. bcm2835-dma writes only
+per-channel registers, so the two should not conflict, but this has not been run
+on the board. The HDMI card is not chosen from the ELD in the linux flavour, on
+either board: doma-pick-hdmi-audio runs where xl-create-doma runs, which there is
+Dom0, and Dom0 has no HDMI card, so DomA opens the card doma.cfg was built with --
+vc4hdmi1 (HDMI-A-2) on the RPi5, the only HDMI card its DomD has, and vc4hdmi0
+(HDMI-A-1, the panel) on the RPi4. No linux-flavour HDMI audio run is recorded on
+either board.
 The Zephyr full-image HW checklist. **[4.22] The list below was first measured on Xen
 4.21.** On **Xen 4.22** the four verification patterns of this tree were run on hardware
 on 2026-08-18 and all passed -- RPi4 and RPi5 x Zephyr-Dom0 and thin-Linux-Dom0 -- with
@@ -427,13 +444,17 @@ RPi5, Zephyr-Dom0 and thin-Linux-Dom0): `xl list` shows the domain at 16 MiB / 1
 `xl console DomZ` prints `DomZ up: Zephyr 4.4.1 as Xen DomU (AGL SoDeV)` and the
 heartbeat, and the interval measured 10 s with no missed ticks. The unit that creates it
 lands in the toolstack domain of either flavour (DomD for Zephyr-Dom0, the thin Dom0 for
-the Linux one) and is `active` in both.
+the Linux one) and is `active` in both. The RPi4 runs used the 4 GiB board, with images
+built before `build.sh` began refusing `-z` on `--ram=4g`. This tree builds DomZ for the
+RPi4 only with `--ram=8g`, and the 8 GiB RPi4 has not been booted (see
+*meta-xt-rpi4/README.md*).
 
 On a PC, before that:
 
 - the moulin graph resolves for every flag combination (`-z`, both Dom0 flavours, with
   and without `-u`/`-a`, both `--ram` values) and `ninja image-full` has a rule for
-  every artifact;
+  every artifact (moulin's graph; `build.sh` refuses some of those combinations on the
+  4 GiB RPi4, `-u` together with `-a`, and `-z`);
 - the DomZ image builds through the real path (`moulin` + `ninja domz`, second west
   workspace, Zephyr SDK 1.0.1) for the `xenvm` board -- 304 KB of the domain's 16 MiB
   (1.86%; the figure is Zephyr's own RAM report, not the size of zephyr.bin, which is

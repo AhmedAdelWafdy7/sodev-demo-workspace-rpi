@@ -4,7 +4,7 @@
 #
 # Enable glvnd in mesa so the vendor-neutral GL dispatch libraries
 # (libOpenGL.so.0 / libEGL.so.1 / libGLESv2.so.2 via libglvnd) are produced.
-# The DomD qemu device-model (-display sdl,gl=on + virtio-gpu-gl/virgl) probes
+# The DomD qemu device-model (-display sdl,gl=es + virtio-gpu-gl/virgl) probes
 # "libGL.so.1 or libOpenGL.so.0"; without glvnd this wayland-only (x11 removed)
 # mesa builds neither, so the GL display init fails. With glvnd, libglvnd provides
 # libOpenGL.so.0 (libGL.so.1 needs glx/x11, not built here) which satisfies the probe,
@@ -41,9 +41,12 @@ PACKAGECONFIG:append = " glvnd"
 #   sha256 matches docs.mesa3d.org/relnotes/26.2.2
 #
 # Revisit at the next poky upgrade: once poky's mesa is >= 26.2.0 this whole
-# block goes away. Nothing else here is version-specific -- this recipe carries
-# no source patches of its own, and the guest-side venus/virgl patches live in
-# meta-agl-venus (DomU's mesa 24.0.7) and are untouched by this pin.
+# block goes away. Nothing else in this block is version-specific. The recipe's
+# own source patches (egl/wayland and v3d, at the end of this file) are not part
+# of the pin, but they were written against 26.2.2, so re-check their do_patch at
+# that upgrade.
+# The guest-side venus/virgl patches live in meta-agl-venus (DomU's mesa 24.0.7)
+# and are untouched by this pin.
 # DELIBERATELY NOT gated on the venus DISTRO_FEATURE, unlike everything else
 # this series adds. The reason is that both lanes run weston on the same V3DV,
 # and the MR this pin is for (!42407) is a v3dv submit-path fix, not a Venus
@@ -69,3 +72,29 @@ SRC_URI[sha256sum] = "eeb29ca7e56cfaa8e8a79538dcf834e3b18e501c31bef5145e959ea437
 # tree and stops. So a do_patch failure in this recipe after a poky bump means "re-check
 # this block", not "the pin is broken".
 SRC_URI:remove = "file://0001-gallivm-Fix-armhf-build-against-LLVM-22.patch file://0001-freedreno-don-t-encode-build-path-into-binaries.patch"
+
+# egl/wayland: let a Wayland client allocate its scanout buffers on vc4.
+# DomA's picture reaches HDMI through qemu's SDL window (doma.cfg '-display sdl,gl=es',
+# both GPU lanes), which kiosk-shell makes fullscreen, and weston tries every repaint
+# to put it straight on the vc4 primary plane. It fails: weston-debug drm-backend logs
+# "couldn't get FB for view: gbm bo get handle failed" and weston composes the window
+# with V3D instead (measured on the RPi4, 2026-09-23). qemu opens
+# only v3d's render node, because weston advertises that as the dma-buf main device;
+# without kmsro, v3d answers a SCANOUT allocation with non-contiguous memory that vc4
+# (no IOMMU on BCM2711) cannot import. The patch checks whether the display-only
+# device the scanout tranche names can import the buffer; if not, it allocates the
+# buffer there as a dumb buffer and imports that into v3d. A device that can import
+# (BCM2712's HVS sits behind an IOMMU) keeps the render GPU's buffer.
+FILESEXTRAPATHS:prepend := "${THISDIR}/mesa:"
+SRC_URI += "file://0001-egl-wayland-allocate-scanout-buffers-on-a-display-on.patch"
+
+# v3d: fill the tiled blit temporary with the TFU instead of the CPU.
+# qemu's SDL display blits DomA's (linear) scanout into its window with a y-flip
+# every frame. A flipped blit from a linear source ends in v3d_render_blit, which
+# copied the source into a tiled temporary with util_resource_copy_region: a CPU
+# map that waits for the guest's rendering, then a software retile, on qemu's main
+# thread -- the thread that also answers DomA's ioreqs. Measured on the RPi4
+# (2026-09-24, V3D_DEBUG=perf + backtraces): ~20 blocking maps/s, qemu's main
+# thread 19-29% in v3d_wait_bo_ioctl; with the patch none, and the guest
+# compositor's frame time 14.7 -> 9.9 ms.
+SRC_URI += "file://0002-v3d-fill-the-tiled-blit-temporary-with-the-TFU.patch"

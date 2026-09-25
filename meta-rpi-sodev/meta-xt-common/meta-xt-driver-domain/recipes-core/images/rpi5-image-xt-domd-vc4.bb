@@ -86,12 +86,20 @@ VENUS_PACKAGES = "${@bb.utils.contains('DISTRO_FEATURES', 'venus', 'mesa-vulkan-
 # CONFIG_DRM_VC4 is =m (so Dom0 can blacklist it), which means DomD must
 # explicitly install kernel-module-vc4.
 #
+# snd-soc-hdmi-codec is part of that aggregate and is NOT optional, even on a
+# board nobody wants audio from: without it vc4-drm's component bind waits for
+# the codec and stays in deferred probe, no KMS card appears, weston exits with
+# "no drm device found", and xl-create-doma then fails on its 120 s wait for
+# weston -- so DomA never starts. Measured on the board, 2026-09-13. Its own
+# dependencies (snd-soc-core, snd-pcm, soundcore) are kernel builtins, so this
+# one package is the whole addition.
 KMOD_PACKAGES = " \
     kernel-module-vc4 \
     kernel-module-v3d \
     kernel-module-drm-shmem-helper \
     kernel-module-gpu-sched \
     kernel-module-i2c-brcmstb \
+    kernel-module-snd-soc-hdmi-codec \
 "
 
 #

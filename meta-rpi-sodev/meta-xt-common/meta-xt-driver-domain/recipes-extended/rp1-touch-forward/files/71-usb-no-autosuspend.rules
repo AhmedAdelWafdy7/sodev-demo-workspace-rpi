@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+# Never autosuspend USB in DomD.
+#
+# WHY. The touch display -- its own internal hub, Prolific 067b:2586, behind the
+# Raspberry Pi 4's internal VL805 hub 2109:3431 -- kept vanishing during 1080p
+# playback: "usb 1-1.2: USB disconnect" every ~6.4 s, and eventually it did not
+# come back at all. Measured on the Raspberry Pi 4, 2026-09-16: both usb1 and 1-1
+# were left with
+# power/control=auto, autosuspend_delay_ms=0, runtime_status=suspended and every
+# port "not attached", with over_current_count=0 (so not an over-current) and no
+# xhci error. Writing power/control=on to the tree brought the hub straight back.
+#
+# A 0 ms autosuspend delay suspends the tree as soon as nobody touches the panel,
+# which is exactly what happens while a video plays, and this hub does not resume
+# cleanly.
+#
+# rp1-touch-bridge installs this rule in DomD on both boards. On the Raspberry
+# Pi 5, whose USB is RP1's, it has not been measured.
+ACTION=="add", SUBSYSTEM=="usb", TEST=="power/control", ATTR{power/control}="on"

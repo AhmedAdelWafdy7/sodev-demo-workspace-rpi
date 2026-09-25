@@ -99,6 +99,7 @@ Domain options:
                          staged on p1 as zephyr-domz.bin and started by the xl
                          toolstack from /etc/xen/domz.cfg. Console:
                          `xl console DomZ` from the toolstack domain.
+                         Refused with --board=rpi4 --ram=4g.
       --dom0=<os>        Dom0 OS: zephyr (default) | linux
       --ram=<sku>        Board SKU. Valid values and the default depend on --board.
                          rpi5: 16g (default) = full 4-domain map (Dom0 512 +
@@ -107,12 +108,15 @@ Domain options:
                            Dom0/DomU unchanged, total 7680 MiB, ~436 MiB headroom.
                          rpi4: 8g (default) = Dom0 128 (zephyr, the default) or 256
                            (linux) + DomD 1920 MiB (three static-mem banks) + DomU 1024
-                           + DomA 2560; 4g = DomD 1024 MiB (bank2 dropped, bank0 640
-                           MiB); DomA and DomU then cannot RUN at the same time (each
-                           fits alone) -- build.sh says so and both still go on the SD,
-                           so pick one at run time. With --gpu=vulkan the 4g SKU moves
-                           384 MiB from DomA to DomD (DomD 1408, DomA 2176); the 8g SKU
-                           is unchanged.
+                           + DomA 2560; 4g = DomD 1056 MiB (bank2 dropped, bank0 640
+                           MiB, bank1 0x06000000 + 416 MiB for a 336 MiB CMA); DomA and
+                           DomU then cannot RUN at the same time (each fits
+                           alone; DomA with --gpu=gl and --dom0=linux only by
+                           4 MiB, not booted), so build.sh refuses -u together
+                           with -a on 4g. With
+                           --gpu=vulkan the 4g SKU moves 384 MiB from DomA to DomD
+                           (DomD 1440, DomA 2048 -- DomA gives up 128 MiB more to keep
+                           its RAM in one memory zone); the 8g SKU is unchanged.
       --domains-only     Build the domains but skip SD-image assembly (no full.img;
                          with -a this also skips the DomA p4 nested GPT, which rouge
                          assembles only during SD-image assembly)
@@ -366,8 +370,9 @@ AAOS_KERNEL_DIR_NAME=$(sed -n 's/^[[:space:]]*ANDROID_KERNEL_DIR:[[:space:]]*"\(
 #   The split is measured: DomD 2048 alone left the DomA device model unable to serve a
 #   4 GiB guest and AAOS crash-looped in binder (hardware, 2026-08-03).
 # rpi4: 8g (default) or 4g. 4g drops DomD static-mem bank2 and shrinks bank0 to 640 MiB,
-#   taking DomD to 1024 MiB. DomA still fits there (verified on hardware with 158 MiB
-#   of Xen free memory left) -- what does not fit is DomA and DomU running together.
+#   taking DomD to 1056 MiB (1440 with --gpu=vulkan, where DomA is 2048). DomA
+#   alone fits there -- see the 4 GiB checks below for the margins -- what does
+#   not fit is DomA and DomU running together.
 case "$BOARD" in
   rpi5) BOARD_RAM_VALID="16g 8g"; BOARD_RAM_DEFAULT="16g" ;;
   rpi4) BOARD_RAM_VALID="8g 4g";  BOARD_RAM_DEFAULT="8g"  ;;
@@ -512,10 +517,12 @@ if [ "$ENABLE_DOMU_RESERVED" = yes ] && [ -n "$NINJA_TARGET" ]; then
 fi
 
 # --- 4 GiB Raspberry Pi 4: DomU and DomA cannot both run -> refuse -------------
-# On the 4 GiB SKU Dom0 (128, the default zephyr flavour -- the hardware row in
-# meta-rpi-sodev/meta-xt-rpi4/README.md records the flavour for this measurement) +
-# DomD (1024) + DomA (2560) has been booted on hardware with 158 MiB of Xen free
-# memory left; DomU alone fits too. What does not fit is DomU
+# On the 4 GiB SKU Dom0 (128, the default zephyr flavour) + DomD (1440) +
+# DomA (2048), the default Venus lane, has been booted on hardware with
+# 262 MiB of Xen free memory left (2026-09-23, recorded in
+# boot.cmd.xen.zephyr-dom0.in); in the gl lane tools/check-rpi4-memory-map.py
+# leaves DomA 132 MiB with that Dom0 and 4 MiB with the linux one (see the
+# warning below). DomU alone fits too. What does not fit is DomU
 # and DomA together, so an image carrying both is an image whose two guests cannot both
 # start. This used to be only a NOTE, because DomA's p4 needed DomU's p3 to exist and
 # refusing would have blocked the only 4 GiB configuration that can run DomA at all.
@@ -529,14 +536,45 @@ if [ "$BOARD" = "rpi4" ] && [ "$BOARD_RAM" = "4g" ] \
    && [ "$ENABLE_ANDROID" = "yes" ] && [ "$ENABLE_DOMU" = "yes" ]; then
   echo "ERROR: a 4 GiB Raspberry Pi 4 cannot run DomU and DomA at the same time." >&2
   echo "       Dom0 + DomD leave one guest's worth of free pool: DomA alone has booted" >&2
-  echo "       on hardware with 158 MiB of Xen free memory left, and DomU alone fits" >&2
-  echo "       too, but together they exceed it. Refusing to build an image whose two" >&2
-  echo "       guests cannot both start." >&2
+  echo "       on hardware with 262 MiB of Xen free memory left (Venus lane, zephyr" >&2
+  echo "       Dom0), and DomU alone fits too, but together they exceed it. Refusing" >&2
+  echo "       to build an image whose two guests cannot both start." >&2
   echo "       Pick one:  drop -u/--domu  (DomA image; p3 becomes an empty reserved" >&2
   echo "                  partition so DomA keeps p4)" >&2
   echo "                  drop -a/--android/--aaos  (DomU image)" >&2
   echo "                  --ram=8g  (all four domains together)" >&2
   exit 1
+fi
+
+# DomZ is not part of the 4 GiB Raspberry Pi 4 configuration: that budget is Dom0 +
+# DomD + one guest, and tools/check-rpi4-memory-map.py does not reserve DomZ's 16 MiB
+# on it (with a linux Dom0 its gl lane leaves DomA 4 MiB, see below). The refusal is
+# a choice of configuration, wider than the arithmetic: by the checker's budget only
+# DomA in the gl lane with a linux Dom0 would miss with DomZ added (2576 MiB against
+# 2564), and every other single-guest 4 GiB combination would leave 116 MiB or more.
+# DomZ was run on the 4 GiB board before this refusal existed.
+if [ "$BOARD" = "rpi4" ] && [ "$BOARD_RAM" = "4g" ] && [ "$ENABLE_DOMZ" = "yes" ]; then
+  echo "ERROR: DomZ (-z/--domz) is not part of the 4 GiB Raspberry Pi 4 configuration." >&2
+  echo "       Its memory budget is Dom0 + DomD + one guest. Build without -z, or use" >&2
+  echo "       --ram=8g." >&2
+  exit 1
+fi
+
+# DomA with --gpu=gl and a linux Dom0 on the 4 GiB Raspberry Pi 4 fits the
+# memory budget by 4 MiB (tools/check-rpi4-memory-map.py) and has not been
+# booted with this map. That budget's 80 MiB of Xen overhead was measured with
+# DomU running, and libxl gives every guest a paging pool of
+# 4 KiB x (256 x vCPUs + MiB + 128): 5.5 MiB for DomU, 12.5 MiB for DomA. A
+# warning, not a refusal: whether 4 MiB is enough is below what that model can
+# decide, and only a boot can.
+if [ "$BOARD" = "rpi4" ] && [ "$BOARD_RAM" = "4g" ] && [ "$GPU" = "gl" ] \
+   && [ "$DOM0_OS" = "linux" ] && [ "$ENABLE_ANDROID" = "yes" ]; then
+  echo ">> WARNING: DomA with --gpu=gl and --dom0=linux on a 4 GiB Raspberry Pi 4" >&2
+  echo ">>   has not been booted. The memory budget leaves it 4 MiB, less than the" >&2
+  echo ">>   7 MiB more paging memory libxl gives DomA than the DomU that budget's" >&2
+  echo ">>   Xen overhead was measured with. If creating DomA fails to allocate" >&2
+  echo ">>   memory, build with the zephyr Dom0 or with --gpu=vulkan (the default)," >&2
+  echo ">>   or use an 8 GiB board." >&2
 fi
 
 if [ "$BOARD" = "rpi5" ] && [ "$BOARD_RAM" = "8g" ] && [ "$ENABLE_ANDROID" = "yes" ]; then

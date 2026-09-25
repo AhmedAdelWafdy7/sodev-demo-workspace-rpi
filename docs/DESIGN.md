@@ -42,7 +42,9 @@ interface is the Xen PV console.
 
 DomZ is also the one domain that is **not RPi5-specific**: `xenvm` is Zephyr's generic
 ARMv8 Xen-guest board, so the same image is a valid guest under Xen on an RPi4 —
-verified on both boards, in both Dom0 flavours.
+verified on both boards, in both Dom0 flavours. On the RPi4 that was the 4 GiB board,
+with images built before `build.sh` began refusing `-z` on `--ram=4g`; this tree builds
+DomZ for the RPi4 only with `--ram=8g`, a map that has not been booted.
 
 ## Board RAM size
 
@@ -336,7 +338,9 @@ identical and what this port changes:
   the 24.2.7 recipes. DomD's Mesa is pinned again now, ahead of wrynose, to
   26.2.2: a v3dv submit-path fix (mesa MR !42407) first ships in 26.2.0.
   `meta-xt-driver-domain`'s `mesa.bbappend` carries the pin (in both `--gpu`
-  lanes) and glvnd.
+  lanes), glvnd, and two source patches of its own: egl/wayland allocating a
+  client's scanout buffers on the display device, and v3d filling its tiled blit
+  temporary with the TFU.
 
 ## DomD compositor startup and rootfs (V4H-aligned)
 

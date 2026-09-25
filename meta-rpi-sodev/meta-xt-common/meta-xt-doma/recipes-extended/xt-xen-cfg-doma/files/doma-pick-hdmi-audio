@@ -1,0 +1,111 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Point DomA's qemu audio backend at the HDMI port a display is actually
+# answering on, by reading the ELD, and rewrite out.dev in the xl cfg.
+#
+# WHY IT EXISTS. doma.cfg carries a literal out.dev=plughw:vc4hdmiN, and which
+# vc4hdmi card is the connected one depends on the CABLE, among the cards DomD
+# has (one per HDMI node its DT gives `dmas`). Measured 2026-09-01: the value
+# that was right on one rig
+# (vc4hdmi1) pointed at a dead port on the other, where
+#     card0 eld: monitor_name=12.3FHD  sad_count=1   <- the display is here
+#     card1 eld: monitor_name=(empty)  sad_count=0   <- nothing here
+# With the wrong card, qemu ended up with zero sound file descriptors and DomA
+# played silently while AudioFlinger was writing frames at a real-time 48 kHz.
+#
+# sad_count > 0 in the ELD is the measurable form of "a display that can take
+# audio is attached", so this runs at boot rather than at build time: the answer
+# changes when the cable moves, and nothing in the image can know that.
+#
+# WHERE IT CAN SEE THE CARDS. It runs as an ExecStartPre of xl-create-doma, i.e.
+# in the toolstack domain: DomD in the zephyr flavour, where the vc4hdmi cards
+# are, but Dom0 in the linux flavour, which has none. There the scan below finds
+# nothing, the script exits 0 without touching the cfg, and DomA opens the
+# literal out.dev doma.cfg was built with.
+set -u
+# Which cfgs to rewrite. A glob, not a list of names: a cfg added later is picked
+# up automatically instead of being skipped in silence by the `[ -f ]` test
+# below. domd.cfg does not match doma*, and the backups this script keeps do not
+# end in .cfg, so neither is touched. If the glob matches nothing the pattern
+# survives literally and that same test rejects it, which is why set -u is safe.
+#
+# XEN_CFG_DIR and PICK_OVERRIDE are seams for testing this script off the board,
+# where there is no /etc/xen and no vc4hdmi card -- without the second one the
+# scan below can only ever come up empty, so the rewriting half, which is where
+# the defects were, could never be exercised. Nothing on the board sets either.
+XEN_CFG_DIR="${XEN_CFG_DIR:-/etc/xen}"
+CFGS="${*:-$XEN_CFG_DIR/doma*.cfg}"
+
+PICK="${PICK_OVERRIDE:-}"
+if [ -n "$PICK" ]; then
+    echo "doma-pick-hdmi-audio: PICK_OVERRIDE=$PICK (skipping the ELD scan)" >&2
+fi
+[ -n "$PICK" ] || for c in 0 1 2 3; do
+    [ -d "/proc/asound/card$c" ] || continue
+    id=$(cat "/sys/class/sound/card$c/id" 2>/dev/null) || continue
+    case "$id" in vc4hdmi*) ;; *) continue ;; esac
+    e=$(ls /proc/asound/card$c/eld* 2>/dev/null | head -n1)
+    [ -n "$e" ] || continue
+    sad=$(awk '/^sad_count/{print $2}' "$e" 2>/dev/null)
+    name=$(awk '/^monitor_name/{$1=""; sub(/^[ \t]+/,""); print}' "$e" 2>/dev/null)
+    printf 'doma-pick-hdmi-audio: card%s (%s) sad_count=%s monitor=%s\n' \
+        "$c" "$id" "${sad:-0}" "${name:-none}"
+    if [ "${sad:-0}" -gt 0 ] 2>/dev/null && [ -z "$PICK" ]; then
+        PICK="$id"
+    fi
+done
+
+if [ -z "$PICK" ]; then
+    echo "doma-pick-hdmi-audio: no HDMI port can take audio; leaving the cfgs alone" >&2
+    exit 0
+fi
+echo "doma-pick-hdmi-audio: picked plughw:$PICK"
+
+# Count what was seen and read the value back after the sed. The unit calls this
+# with `ExecStartPre=-`, so a silent no-op would leave the unit green, DomA
+# running and the reason for the silence unreadable in the journal: a cfg with no
+# out.dev line, or a cfg whose spelling changed so the sed matches nothing, both
+# have to say so. The `-` stays: a failed audio choice is not a reason to refuse
+# to start DomA.
+#
+# The read, the rewrite and the read-back all look at the '-audiodev' line
+# only. doma.cfg's comments quote out.dev=plughw: as well and are installed
+# with it, so a pattern over the whole file reads and rewrites a comment and
+# reports success while the real line, spelled differently, stays as it was.
+AUDIODEV="^[[:space:]]*'-audiodev',"
+SEEN=0      # cfgs that exist
+CHANGED=0   # cfgs actually rewritten
+ALREADY=0   # cfgs that were already right
+for f in $CFGS; do
+    [ -f "$f" ] || continue
+    SEEN=$((SEEN+1))
+    cur=$(grep -- "$AUDIODEV" "$f" | grep -o 'out\.dev=plughw:[A-Za-z0-9_]*' | head -n1 | sed 's/.*plughw://')
+    if [ -z "$cur" ]; then
+        echo "  $f: no out.dev=plughw: on an '-audiodev' line (a cfg with no audio device, or the spelling changed)" >&2
+        continue
+    fi
+    if [ "$cur" = "$PICK" ]; then
+        echo "  $f: already plughw:$PICK"
+        ALREADY=$((ALREADY+1))
+        continue
+    fi
+    [ -f "$f.hdmiaudio.bak" ] || cp "$f" "$f.hdmiaudio.bak"
+    sed -i "/$AUDIODEV/s/out\.dev=plughw:[A-Za-z0-9_]*/out.dev=plughw:$PICK/" "$f"
+    new=$(grep -- "$AUDIODEV" "$f" | grep -o 'out\.dev=plughw:[A-Za-z0-9_]*' | head -n1 | sed 's/.*plughw://')
+    if [ "$new" = "$PICK" ]; then
+        echo "  $f: plughw:$cur -> plughw:$PICK"
+        CHANGED=$((CHANGED+1))
+    else
+        echo "  $f: rewrite failed, still plughw:$cur (the sed did not match)" >&2
+    fi
+done
+
+if [ "$SEEN" -eq 0 ]; then
+    echo "doma-pick-hdmi-audio: no cfg found at all (CFGS=$CFGS); nothing was done" >&2
+    exit 0
+fi
+if [ "$CHANGED" -eq 0 ] && [ "$ALREADY" -eq 0 ]; then
+    echo "doma-pick-hdmi-audio: looked at $SEEN cfg(s) and NOT ONE ended up on plughw:$PICK" >&2
+    exit 0
+fi
+echo "doma-pick-hdmi-audio: rewritten $CHANGED / already right $ALREADY / cfgs seen $SEEN"

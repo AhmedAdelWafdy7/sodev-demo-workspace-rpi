@@ -1,0 +1,323 @@
+From 4edc2e86cc1dfc2e5f3d0a582e959cd6c0b3bc6b Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 24 Sep 2026 00:01:33 +0900
+Subject: [PATCH] egl/wayland: allocate scanout buffers on a display-only
+ target device
+
+When the compositor sends a scanout tranche, the client allocates with
+__DRI_IMAGE_USE_SCANOUT on its render device. On a split SoC such as
+BCM2711 (vc4 displays, v3d renders) the compositor advertises the v3d
+render node as the main device, so a Wayland client opens v3d directly
+and its screen has no renderonly object. v3d then satisfies SCANOUT with
+ordinary, non-contiguous memory. vc4 on BCM2711 has no IOMMU and cannot
+import it, so the compositor never gets a KMS framebuffer for the buffer
+and keeps composing it with the GPU.
+
+Measured with weston 15 on a Raspberry Pi 4: a fullscreen qemu SDL
+window fails every repaint with "couldn't get FB for view: gbm bo get
+handle failed" and falls back to mixed composition. That failure is one
+of the reasons weston answers with a scanout tranche, but a buffer the
+client allocates for it still comes from v3d. The comment above the
+tranche loop already notes the limitation: the client cannot yet ask
+for memory on the tranche's target device.
+
+After allocating for a scanout tranche whose target device differs from
+the main device and is display-only (a primary node, no render node),
+check whether that device can import the buffer. If it can (an IOMMU, or
+a driver with its own scanout path), keep the buffer, modifiers and all.
+If it cannot, allocate a linear dumb buffer on the display device and
+import it into the render GPU with dri2_from_dma_bufs(), the same call
+the PRIME path here uses for its linear copy. Unlike v3d's own kmsro
+path, which lays a page-sized blob out in v3d's own format and keeps the
+dumb handle, this uses the pitch the KMS driver chose and drops the
+handle at once; the exported dma-buf holds the buffer.
+
+The display device's primary node is opened once per surface, so no
+locking is added. The fd is given up if opening it made the client DRM
+master, which would lock the compositor out after a VT switch. On this
+kernel (6.18) dumb buffers, PRIME import/export and GEM_CLOSE on a
+primary node need no DRM authentication. The replacement is only tried
+for [AX]RGB8888/[AX]BGR8888, not for protected content or PRIME, and only
+when the tranche (and any surface-specific modifier list) offers LINEAR.
+For a PresentOpaque surface (SDL2 asks for one on Wayland) the tranche is
+checked for the opaque format it lists, as create_dri_image() does. Any
+step that fails leaves the render GPU's buffer in place.
+
+The dumb buffer gets at least 64 spare bytes after the last row: V3D's
+TFU reads up to V3D_TFU_READAHEAD_SIZE past the end of a buffer it
+converts, and an importer only sees the dma-buf's size.
+
+With this, on the same Raspberry Pi 4 weston stops logging the failure,
+puts the qemu window on a vc4 plane and no longer composes it with V3D.
+Its V3D render and TFU time each falls below 0.5% of wall time during
+1080p30 playback (from 6.8% and 7.0%), with no HVS underrun.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ src/egl/drivers/dri2/egl_dri2.h         |   4 +
+ src/egl/drivers/dri2/platform_wayland.c | 211 +++++++++++++++++++++++-
+ 2 files changed, 209 insertions(+), 6 deletions(-)
+
+diff --git a/src/egl/drivers/dri2/egl_dri2.h b/src/egl/drivers/dri2/egl_dri2.h
+index aa5692a..92d6a7f 100644
+--- a/src/egl/drivers/dri2/egl_dri2.h
++++ b/src/egl/drivers/dri2/egl_dri2.h
+@@ -336,6 +336,10 @@ struct dri2_egl_surface {
+    int format;
+    bool resized;
+    bool received_dmabuf_feedback;
++   /* Display-only device a scanout tranche pointed at, opened on demand. */
++   int kms_scanout_fd;
++   dev_t kms_scanout_dev;
++   bool kms_scanout_probed;
+ #endif
+ 
+ #ifdef HAVE_DRM_PLATFORM
+diff --git a/src/egl/drivers/dri2/platform_wayland.c b/src/egl/drivers/dri2/platform_wayland.c
+index cdc790b..b5fe423 100644
+--- a/src/egl/drivers/dri2/platform_wayland.c
++++ b/src/egl/drivers/dri2/platform_wayland.c
+@@ -965,6 +965,9 @@ dri2_wl_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
+                 dri2_surf->color_buffers[i].data_size);
+    }
+ 
++   if (dri2_surf->kms_scanout_probed && dri2_surf->kms_scanout_fd >= 0)
++      close(dri2_surf->kms_scanout_fd);
++
+    if (dri2_surf->throttle_callback)
+       wl_callback_destroy(dri2_surf->throttle_callback);
+ 
+@@ -1208,6 +1211,195 @@ cleanup_present:
+       u_vector_finish(&modifiers_subset_opaque);
+ }
+ 
++/* Returns an fd for the device a scanout tranche targets, but only when that
++ * device is display-only (a primary node and no render node), e.g. vc4 next to
++ * v3d. The fd is kept on the surface, so no locking is needed.
++ */
++static int
++kms_scanout_fd(struct dri2_egl_surface *dri2_surf, dev_t dev)
++{
++   drmDevicePtr device;
++   int fd = -1;
++
++   if (dri2_surf->kms_scanout_probed && dri2_surf->kms_scanout_dev == dev)
++      return dri2_surf->kms_scanout_fd;
++
++   if (drmGetDeviceFromDevId(dev, 0, &device) != 0)
++      return -1;
++
++   if (!(device->available_nodes & (1 << DRM_NODE_RENDER)) &&
++       (device->available_nodes & (1 << DRM_NODE_PRIMARY)))
++      fd = loader_open_device(device->nodes[DRM_NODE_PRIMARY]);
++   drmFreeDevice(&device);
++
++   /* Opening a primary node while nobody holds DRM master makes the opener
++    * master, which would lock the compositor out when it comes back. Give it
++    * up at once and try again on a later allocation.
++    */
++   if (fd >= 0 && drmIsMaster(fd)) {
++      close(fd);
++      return -1;
++   }
++
++   if (dri2_surf->kms_scanout_probed && dri2_surf->kms_scanout_fd >= 0)
++      close(dri2_surf->kms_scanout_fd);
++   dri2_surf->kms_scanout_fd = fd;
++   dri2_surf->kms_scanout_dev = dev;
++   dri2_surf->kms_scanout_probed = true;
++
++   return fd;
++}
++
++/* Allocates the back buffer on the display device as a linear dumb buffer and
++ * imports it into the render GPU. Returns NULL whenever that does not apply.
++ */
++static struct dri_image *
++create_dri_image_on_kms_device(struct dri2_egl_surface *dri2_surf, int kms_fd,
++                               struct dmabuf_feedback_tranche *tranche,
++                               uint64_t *surf_modifiers,
++                               int surf_modifiers_count)
++{
++   struct dri2_egl_display *dri2_dpy =
++      dri2_egl_display(dri2_surf->base.Resource.Display);
++   int visual_idx = dri2_wl_visual_idx_from_fourcc(dri2_surf->format);
++   struct drm_mode_create_dumb create = {0};
++   struct drm_mode_destroy_dumb destroy = {0};
++   struct dri_image *image;
++   bool has_linear = false;
++   uint64_t *mod;
++   int prime_fd, stride, offset = 0;
++   unsigned error;
++
++   if (visual_idx < 0)
++      return NULL;
++
++   /* A PresentOpaque surface renders in its own format but is presented, and
++    * listed in the feedback, in the opaque one.
++    */
++   if (dri2_surf->base.PresentOpaque)
++      visual_idx = dri2_wl_visual_idx_from_fourcc(
++         dri2_wl_visuals[visual_idx].opaque_wl_drm_format);
++
++   switch (dri2_surf->format) {
++   case DRM_FORMAT_XRGB8888:
++   case DRM_FORMAT_ARGB8888:
++   case DRM_FORMAT_XBGR8888:
++   case DRM_FORMAT_ABGR8888:
++      break;
++   default:
++      return NULL;
++   }
++
++   if (dri2_surf->base.ProtectedContent ||
++       dri2_dpy->fd_render_gpu != dri2_dpy->fd_display_gpu ||
++       dri2_surf->base.Width <= 0 || dri2_surf->base.Height <= 0)
++      return NULL;
++
++   if (visual_idx < 0 ||
++       !BITSET_TEST(tranche->formats.formats_bitmap, visual_idx))
++      return NULL;
++
++   u_vector_foreach(mod, &tranche->formats.modifiers[visual_idx]) {
++      if (*mod == DRM_FORMAT_MOD_LINEAR) {
++         has_linear = true;
++         break;
++      }
++   }
++   if (!has_linear)
++      return NULL;
++
++   if (surf_modifiers_count > 0) {
++      has_linear = false;
++      for (int i = 0; i < surf_modifiers_count; i++) {
++         if (surf_modifiers[i] == DRM_FORMAT_MOD_LINEAR) {
++            has_linear = true;
++            break;
++         }
++      }
++      if (!has_linear)
++         return NULL;
++   }
++
++   /* V3D's TFU reads up to 64 bytes past the end of a buffer it converts
++    * (V3D_TFU_READAHEAD_SIZE) and an importer only sees the dma-buf's size,
++    * so leave at least that much after the last row.
++    */
++   create.width = dri2_surf->base.Width;
++   create.height = dri2_surf->base.Height +
++                   DIV_ROUND_UP(64, dri2_surf->base.Width * 4);
++   create.bpp = 32;
++   if (drmIoctl(kms_fd, DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0)
++      return NULL;
++
++   if (drmPrimeHandleToFD(kms_fd, create.handle, DRM_CLOEXEC | DRM_RDWR,
++                          &prime_fd) != 0)
++      prime_fd = -1;
++
++   /* The dma-buf keeps its own reference on the buffer. */
++   destroy.handle = create.handle;
++   drmIoctl(kms_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
++
++   if (prime_fd < 0)
++      return NULL;
++
++   stride = create.pitch;
++   image = dri2_from_dma_bufs(
++      dri2_dpy->dri_screen_render_gpu, dri2_surf->base.Width,
++      dri2_surf->base.Height, dri2_surf->format, DRM_FORMAT_MOD_LINEAR,
++      &prime_fd, 1, &stride, &offset, __DRI_YUV_COLOR_SPACE_UNDEFINED,
++      __DRI_YUV_RANGE_UNDEFINED, __DRI_YUV_CHROMA_SITING_UNDEFINED,
++      __DRI_YUV_CHROMA_SITING_UNDEFINED, 0, &error, NULL);
++   close(prime_fd);
++
++   if (image && surf_modifiers_count > 0)
++      update_surface(dri2_surf, image);
++
++   return image;
++}
++
++/* The render GPU allocated this back buffer for a scanout tranche. If the
++ * tranche's display-only target device cannot import it, the compositor cannot
++ * put it on a plane either and composes it with the GPU: vc4 on BCM2711 has no
++ * IOMMU and rejects memory that is not contiguous, which is what v3d hands a
++ * client that opened its render node. Replace it with a buffer allocated on
++ * that device. A device that can import the buffer keeps it, modifiers and all.
++ */
++static void
++use_kms_buffer_if_not_importable(struct dri2_egl_surface *dri2_surf,
++                                 struct dmabuf_feedback_tranche *tranche,
++                                 uint64_t *surf_modifiers,
++                                 int surf_modifiers_count)
++{
++   struct drm_gem_close gem_close = {0};
++   struct dri_image *image;
++   uint32_t handle;
++   int kms_fd, fd = -1, ret;
++
++   kms_fd = kms_scanout_fd(dri2_surf, tranche->target_device);
++   if (kms_fd < 0)
++      return;
++
++   if (!dri2_query_image(dri2_surf->back->dri_image, __DRI_IMAGE_ATTRIB_FD,
++                         &fd) || fd < 0)
++      return;
++
++   ret = drmPrimeFDToHandle(kms_fd, fd, &handle);
++   close(fd);
++   if (ret == 0) {
++      gem_close.handle = handle;
++      drmIoctl(kms_fd, DRM_IOCTL_GEM_CLOSE, &gem_close);
++      return;
++   }
++
++   image = create_dri_image_on_kms_device(dri2_surf, kms_fd, tranche,
++                                          surf_modifiers, surf_modifiers_count);
++   if (!image)
++      return;
++
++   dri2_destroy_image(dri2_surf->back->dri_image);
++   dri2_surf->back->dri_image = image;
++}
++
+ static void
+ create_dri_image_from_dmabuf_feedback(struct dri2_egl_surface *dri2_surf,
+                                       enum pipe_format pipe_format,
+@@ -1225,12 +1417,13 @@ create_dri_image_from_dmabuf_feedback(struct dri2_egl_surface *dri2_surf,
+     * tranches are sent in descending order of preference by the compositor, so
+     * the first set that we can pick is the best one. For now we still can't
+     * specify the target device in order to make the render device try its best
+-    * to allocate memory that can be directly scanned out by the KMS device. But
+-    * in the future this may change (newer versions of
+-    * createImageWithModifiers). Also, we are safe to pick modifiers from
+-    * tranches whose target device differs from the main device, as compositors
+-    * do not expose (in dma-buf feedback tranches) formats/modifiers that are
+-    * incompatible with the main device. */
++    * to allocate memory that can be directly scanned out by the KMS device
++    * (a display-only target device is the exception, see
++    * use_kms_buffer_if_not_importable()). But in the future this may change
++    * (newer versions of createImageWithModifiers). Also, we are safe to pick
++    * modifiers from tranches whose target device differs from the main device,
++    * as compositors do not expose (in dma-buf feedback tranches)
++    * formats/modifiers that are incompatible with the main device. */
+    util_dynarray_foreach (&dri2_surf->dmabuf_feedback.tranches,
+                           struct dmabuf_feedback_tranche, tranche) {
+       flags = use_flags;
+@@ -1240,6 +1433,12 @@ create_dri_image_from_dmabuf_feedback(struct dri2_egl_surface *dri2_surf,
+       create_dri_image(dri2_surf, pipe_format, flags, surf_modifiers,
+                        surf_modifiers_count, &tranche->formats);
+ 
++      if (dri2_surf->back->dri_image &&
++          (tranche->flags & ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT) &&
++          tranche->target_device != dri2_surf->dmabuf_feedback.main_device)
++         use_kms_buffer_if_not_importable(dri2_surf, tranche, surf_modifiers,
++                                          surf_modifiers_count);
++
+       if (dri2_surf->back->dri_image)
+          return;
+    }
+-- 
+2.43.0
+

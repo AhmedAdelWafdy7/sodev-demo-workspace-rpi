@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 04 Sep 2026 09:22:29 +0900
+Subject: [PATCH] audio/alsa: report the generic buffer as free, as 7.0 did
+
+DomA -> HDMI audio does not play on RPi4 under qemu 10.0.2. The guest side is
+fine: AudioFlinger writes (Frames written: 9,989,760, no underruns) and the
+virtio-snd driver sends, but the host ALSA device never advances -- appl_ptr
+reaches exactly one period (1920 frames) and then stops, and the guest cycles
+PREPARE -> START -> STOP -> RELEASE 23 times a second.
+
+This is not a regression of the qemu upgrade in the sense of "it worked before
+on this board" -- audio on it was never verified working ("Frames written: 0"
+was recorded under 7.0 on 2026-09-03). But the mechanism is a 7.0 -> 10.0.2
+behaviour change, and the
+device model is not at fault: hw/audio/virtio-snd.c is function-for-function
+identical to the 8.2.0 implementation that plays on RPi5.
+
+What changed is one line in the ALSA backend's op table:
+
+    7.0     .buffer_get_free = audio_generic_buffer_get_free
+    10.0.2  .buffer_get_free = alsa_buffer_get_free
+
+audio_pcm_hw_get_free() feeds that into hw_free, and audio_run_out() turns
+hw_free into the `available` it hands the device callback:
+
+    if (hw_free > sw->total_hw_samples_mixed) { free = ...; } else { free = 0; }
+    if (free > sw->resample_buf.pos) {
+            free = MIN(free, sw->resample_buf.size) - sw->resample_buf.pos;
+            sw->callback.fn(sw->callback.opaque, free * sw->info.bytes_per_frame);
+    }
+
+With audio_generic_buffer_get_free the answer comes from qemu's own buffer and
+is essentially always positive, so virtio_snd_pcm_out_cb() runs on every timer
+tick. With alsa_buffer_get_free the answer comes from snd_pcm_avail_update() on
+the host device; when the host has no room, free becomes 0 and the callback is
+not called at all. virtio-snd returns a TX buffer to the guest only once
+AUD_write() has consumed it (return_tx_buffer() in the drain loop), so no
+callback means no buffers returned, the guest's ring fills, and the guest's
+ALSA gives up and closes the stream -- which is the 23 Hz open/close cycle
+observed, and why the host PCM never gets past PREPARED.
+
+Restore the 7.0 behaviour. The upstream change buys lower latency by pacing on
+the real device, but that pacing assumes a frontend that can be handed a
+partial `available` and make progress; virtio-snd's all-or-nothing buffer
+return does not satisfy it. That leaves alsa_buffer_get_free() with no user,
+so it goes too rather than stay behind as an unused static.
+
+Verified: the audiodev timing hints tuned for 7.0's core
+(out.period-length=40000 / out.buffer-length=160000 / out.try-poll=off) are NOT
+the cause -- removing all three and letting 10.0.2 pick its defaults leaves the
+symptom unchanged (measured on hardware 2026-09-04).
+
+Later finding (2026-09-13): every observation above was made before DomD kernel
+patch 0016, while vc4-hdmi audio programmed the DMA with the MAI FIFO's
+untranslated CPU address, so the DMA never reached the FIFO. They therefore do
+not show that 10.0.2's report breaks playback on its own once the DMA flows,
+and the two reports have not been compared since 0016. The patch stays because
+doma.cfg's audiodev values were chosen with it: its 60 ms buffer-length rests
+on the backend answering from its own buffer, and was measured with qemu
+10.0.2 and a virtio-media decode running. It also makes the qemu 10 lane
+answer as the 7.0.0 device model of the gl lane does, so one set of audiodev
+values serves both.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [platform-specific interaction with virtio-snd]
+---
+ audio/alsaaudio.c | 38 +-------------------------------------
+ 1 file changed, 1 insertion(+), 37 deletions(-)
+
+diff --git a/audio/alsaaudio.c b/audio/alsaaudio.c
+index cacae1ea59c..34c9469cd7c 100644
+--- a/audio/alsaaudio.c
++++ b/audio/alsaaudio.c
+@@ -598,42 +598,6 @@ static int alsa_open(bool in, struct alsa_params_req *req,
+     return -1;
+ }
+ 
+-static size_t alsa_buffer_get_free(HWVoiceOut *hw)
+-{
+-    ALSAVoiceOut *alsa = (ALSAVoiceOut *)hw;
+-    snd_pcm_sframes_t avail;
+-    size_t alsa_free, generic_free, generic_in_use;
+-
+-    avail = snd_pcm_avail_update(alsa->handle);
+-    if (avail < 0) {
+-        if (avail == -EPIPE) {
+-            if (!alsa_recover(alsa->handle)) {
+-                avail = snd_pcm_avail_update(alsa->handle);
+-            }
+-        }
+-        if (avail < 0) {
+-            alsa_logerr(avail,
+-                        "Could not obtain number of available frames\n");
+-            avail = 0;
+-        }
+-    }
+-
+-    alsa_free = avail * hw->info.bytes_per_frame;
+-    generic_free = audio_generic_buffer_get_free(hw);
+-    generic_in_use = hw->samples * hw->info.bytes_per_frame - generic_free;
+-    if (generic_in_use) {
+-        /*
+-         * This code can only be reached in the unlikely case that
+-         * snd_pcm_avail_update() returned a larger number of frames
+-         * than snd_pcm_writei() could write. Make sure that all
+-         * remaining bytes in the generic buffer can be written.
+-         */
+-        alsa_free = alsa_free > generic_in_use ? alsa_free - generic_in_use : 0;
+-    }
+-
+-    return alsa_free;
+-}
+-
+ static size_t alsa_write(HWVoiceOut *hw, void *buf, size_t len)
+ {
+     ALSAVoiceOut *alsa = (ALSAVoiceOut *) hw;
+@@ -943,7 +907,7 @@ static struct audio_pcm_ops alsa_pcm_ops = {
+     .init_out = alsa_init_out,
+     .fini_out = alsa_fini_out,
+     .write    = alsa_write,
+-    .buffer_get_free = alsa_buffer_get_free,
++    .buffer_get_free = audio_generic_buffer_get_free,
+     .run_buffer_out = audio_generic_run_buffer_out,
+     .enable_out = alsa_enable_out,
+ 

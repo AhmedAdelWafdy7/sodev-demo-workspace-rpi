@@ -38,7 +38,7 @@
 +    "8g":
 +    desc: "DomD rootfs only (RPi5)"
 +    desc: "Full RPi5(BCM2711)+Xen SD image (thin Linux or Zephyr Dom0 + dom0less DomD + DomU AGL + DomA AAOS)"
-+    desc: "Target Raspberry Pi 5 SKU: 8g (default; all four domains up together) or 4g (DomD 1408 MiB with GPU=vulkan, the default, or 1024 with gl; DomU or DomA, one at a time)"
++    desc: "Target Raspberry Pi 5 SKU: 8g (default; all four domains up together) or 4g (DomD 1440 MiB with GPU=vulkan, the default, or 1056 with gl; DomU or DomA, one at a time)"
 +  ANDROID_KERNEL_DIR: "android_kernel-rpi5"
 +  BOARD_RAM:
 +  DOM0_OS: "zephyr"          # default zephyr; overridable: --DOM0_OS {zephyr|linux}. On a new board bring the thin-Linux Dom0 up first: it is a relocatable arm64 Image, so it does not depend on the Zephyr SRAM relink being right.
@@ -55,7 +55,7 @@
 -          "overlays/bcm2712d0.dtbo": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/bcm2712d0.dtbo"
 -          BOARD_RAM: "16g"
 -          BOARD_RAM: "8g"
--          XT_DOMA_BBMASK: " meta-xt-common/meta-xt-doma/"
+-          XT_DOMA_BBMASK: " meta-xt-common/meta-xt-doma/ meta-xt-rpi5/recipes-extended/xt-xen-cfg-doma/"
 -          XT_DOMA_HWDEC_VULKAN: "false"
 -        - "../../meta-rpi-sodev/xt-prod-devel-rpi5-domd"
 -        - "tmp/deploy/images/%{MACHINE}/%{XT_SCMI_HOST_DTBO_NAME}"

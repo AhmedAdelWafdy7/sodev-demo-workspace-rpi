@@ -54,6 +54,13 @@ ExecStartPre=/usr/libexec/doma-devmodel-sweep
 # connection). Mounting the p2 ext4 rootfs plus a full systemd boot before weston
 # is ready takes a while, hence the generous 120s timeout.
 ExecStartPre=/bin/sh -c 'for i in $$(seq 1 120); do [ "$$(xenstore-read /local/domain/1/drivers/weston-up/status 2>/dev/null)" = "ready" ] && exit 0; sleep 1; done; echo "DomD weston-up not ready after 120s"; exit 1'
+# Choose the HDMI card DomA's audio backend opens, from the ELD. MUST be the last
+# ExecStartPre: it rewrites doma.cfg and ExecStart below reads the result.
+# Prefixed with `-` because losing the audio choice is not a reason to refuse to
+# start DomA; the script reports what it did, and did not do, to the journal.
+# In the linux flavour this unit runs in Dom0, which has no HDMI card, so the
+# script changes nothing there and DomA opens doma.cfg's literal out.dev.
+ExecStartPre=-/usr/libexec/doma-pick-hdmi-audio
 # Do not pass -F (with Type=oneshot, -F keeps xl in the foreground and would block
 # subsequent units forever).
 ExecStart=/usr/sbin/xl create /etc/xen/doma.cfg
