@@ -6,8 +6,8 @@
      FORKED from frameworks/av/services/audiopolicy/config/bluetooth_audio_policy_configuration.xml
      for aosp_xenvm_trout_rpi5_arm64.
 
-     The content is upstream's, unchanged. It is a local copy so that the
-     hands-free (SCO) ports can be added in one place.
+     The SCO/HFP ports below are the fork's reason for existing. Everything else is
+     upstream, unchanged.
 
      WHY IT IS INCLUDED AT ALL. trout's audio_policy_configuration.emulator.xml
      includes a2dp_audio_policy_configuration.xml instead, whose module is named
@@ -20,11 +20,58 @@
      The 1.0 schema is deliberate: the parent document is version="1.0", so
      samplingRates are COMMA separated here. The *_7_0.xml variant uses spaces and
      cannot be mixed in.
+
+     SCO/HFP. These ports route into a module that can serve them: with the
+     packages/modules/Bluetooth patch for the HF-client role,
+     device_port_proxy.cc's init_session_type() maps the four SCO device types
+     onto SessionType::HFP_SOFTWARE_{ENCODING,DECODING}_DATAPATH.
+
+     ON THE SAMPLE RATES. kScoMixPortFixedSampleRate = 32000 does not apply
+     here: that constant belongs to a DIFFERENT HAL. It lives only in
+     hardware/interfaces/audio/aidl/default/bluetooth/DevicePortProxy.cpp:140, i.e.
+     the AIDL audio HAL, which resamples between 32 kHz and the codec rate at
+     :447-474. This product uses the HIDL audio HAL with
+     audio.bluetooth.default (packages/modules/Bluetooth/system/audio_bluetooth_hw/),
+     and that module contains NO resampler at all (measured: zero hits for
+     resampl/src_process/speex). It reports whatever the session's
+     PcmConfiguration says, straight through LoadAudioConfig().
+
+     So the mix ports declare the three rates the stack can actually negotiate,
+     taken from the codec mapping in bta_hf_client_sco.cc (which mirrors the AG's
+     codec_uuid_to_sample_rate()):
+         CVSD -> 8000,  mSBC -> 16000,  LC3 -> 32000
+     MONO and PCM_16_BIT are fixed: hfp::pcm_config
+     (bta/include/bta_ag_api.h:295-320) documents channel_mode = MONO and
+     bits_per_sample = 16 as invariants, and only the rate is configurable.
+
+     No conflict with other modules: HwModule::getModuleForDeviceType() gives SCO
+     to whichever module declares it first, and no other module in this policy
+     declares a BLUETOOTH_SCO device port (checked across the primary module and
+     every xi:include; the only other BLUETOOTH_SCO mentions in the tree are
+     volume-curve entries in audio_policy_volumes.xml, which are not device ports).
+
+     STILL NOT ENOUGH ON ITS OWN. Audio flows only once two properties are set as
+     well: bluetooth.sco.managed_by_audio and
+     bluetooth.hfp.software_datapath.enabled, both in the product makefile. They
+     have to take effect together with this file and with the HF client's software
+     data path, or HFP ends up with neither the legacy setParameters route nor the
+     new session route. Measured on the board, 2026-08-27.
 -->
 <module name="bluetooth" halVersion="2.0">
     <mixPorts>
         <!-- A2DP Audio Ports -->
         <mixPort name="a2dp output" role="source"/>
+        <!-- HFP (SCO) Audio Ports. See the header for why three rates. -->
+        <mixPort name="hfp output" role="source">
+            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                     samplingRates="8000,16000,32000"
+                     channelMasks="AUDIO_CHANNEL_OUT_MONO"/>
+        </mixPort>
+        <mixPort name="hfp input" role="sink">
+            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                     samplingRates="8000,16000,32000"
+                     channelMasks="AUDIO_CHANNEL_IN_MONO"/>
+        </mixPort>
         <!-- Hearing AIDs Audio Ports -->
         <mixPort name="hearing aid output" role="source">
             <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
@@ -49,6 +96,27 @@
                      samplingRates="44100,48000,88200,96000"
                      channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
         </devicePort>
+        <!-- HFP (SCO) Audio Ports -->
+        <devicePort tagName="BT SCO" type="AUDIO_DEVICE_OUT_BLUETOOTH_SCO" role="sink">
+            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                     samplingRates="8000,16000,32000"
+                     channelMasks="AUDIO_CHANNEL_OUT_MONO"/>
+        </devicePort>
+        <devicePort tagName="BT SCO Headset" type="AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET" role="sink">
+            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                     samplingRates="8000,16000,32000"
+                     channelMasks="AUDIO_CHANNEL_OUT_MONO"/>
+        </devicePort>
+        <devicePort tagName="BT SCO Car Kit" type="AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT" role="sink">
+            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                     samplingRates="8000,16000,32000"
+                     channelMasks="AUDIO_CHANNEL_OUT_MONO"/>
+        </devicePort>
+        <devicePort tagName="BT SCO Headset Mic" type="AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET" role="source">
+            <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                     samplingRates="8000,16000,32000"
+                     channelMasks="AUDIO_CHANNEL_IN_MONO"/>
+        </devicePort>
         <!-- Hearing AIDs Audio Ports -->
         <devicePort tagName="BT Hearing Aid Out" type="AUDIO_DEVICE_OUT_HEARING_AID" role="sink"/>
     </devicePorts>
@@ -59,6 +127,16 @@
                sources="a2dp output"/>
         <route type="mix" sink="BT A2DP Speaker"
                sources="a2dp output"/>
+        <!-- HFP (SCO). The three outputs take the mix port as their source; the
+             input route is the other way round, mix port as sink. -->
+        <route type="mix" sink="BT SCO"
+               sources="hfp output"/>
+        <route type="mix" sink="BT SCO Headset"
+               sources="hfp output"/>
+        <route type="mix" sink="BT SCO Car Kit"
+               sources="hfp output"/>
+        <route type="mix" sink="hfp input"
+               sources="BT SCO Headset Mic"/>
         <route type="mix" sink="BT Hearing Aid Out"
                sources="hearing aid output"/>
     </routes>

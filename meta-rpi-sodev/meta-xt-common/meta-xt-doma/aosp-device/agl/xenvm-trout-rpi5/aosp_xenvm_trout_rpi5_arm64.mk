@@ -298,6 +298,60 @@ PRODUCT_PACKAGES += \
     android.hardware.bluetooth.audio-impl \
     audio.bluetooth.default
 
+# ---------------------------------------------------------------------------
+# HFP: hand SCO to the audio framework and pick the software data path.
+#
+# These two properties are the last piece of the HFP work and MUST come after the code
+# and policy changes, not before. Those are, in order:
+#
+#   1. bta_hf_client_sco.cc asks for the HCI data path
+#   2. bta/hf_client implements the software data path
+#   3. audio_bluetooth_hw maps SCO devices to HFP_SOFTWARE_*
+#   4. the forked bluetooth_audio_policy_configuration.xml above declares the SCO ports
+#   5. these properties                                                        <- here
+#
+# Setting them earlier would have left HFP with neither the legacy
+# setParameters("hfp_enable") route nor the new session route.
+#
+# bluetooth.sco.managed_by_audio
+#   BluetoothProperties.sysprop calls it "Set by vendors overlay, read at
+#   Bluetooth initialization". AudioDeviceBroker.java:225-226 ANDs it with the
+#   android.media.audio sco_managed_by_audio aconfig flag; both that flag and
+#   amsco_available_api are ENABLED in trunk_staging (checked with `aconfig
+#   dump-cache` on all_aconfig_declarations.pb), so this property is the only
+#   remaining switch. It is what makes AudioService own SCO activation and
+#   routing instead of emitting setParameters("hfp_enable=...").
+#
+# bluetooth.hfp.software_datapath.enabled
+#   Read natively with osi_property_get_bool by both the AG
+#   (bta_ag_init_hfp_client_interface() in bta_ag_sco.cc) and, with the HF
+#   role's software data path, by bta_hf_client_sco.cc as well. Selects
+#   software over offload.
+#
+# WHY PRODUCT_VENDOR_PROPERTIES. The sysprop file names the vendor overlay as
+# the setter, and read-only properties are readable from every process
+# regardless of partition, so both the BT apex (native) and system_server
+# (Java) see them. This is NOT the vendor.ser.bt-uart situation: neither key is
+# assigned anywhere else in the tree (checked across device/,
+# packages/services/Car/ and build/), so there is no duplicate-mandatory
+# collision to work around -- post_process_props.py:127-130 only errors on a
+# repeated mandatory assignment of the SAME key.
+#
+# EFFECT ON THE AG ROLE, which is off on this product. NOT because a parent mk
+# disables it -- this product does NOT inherit
+# device/google_car/common/post_google_car.mk. bluetooth.profile.hfp.ag.enabled is
+# simply UNSET (verified in the built system/product/vendor build.prop), and
+# HeadsetService.java:290 reads it as
+# BluetoothProperties.isProfileHfpAgEnabled().orElse(false), so it defaults to
+# false. AG reads the same software_datapath property, but
+# bta_ag_init_hfp_client_interface() is gated on bta_ag_is_sco_managed_by_audio(), a
+# value pushed down from Java by HeadsetService, which does not run here. So there is
+# no contention for the HfpClientInterface singleton; the HF client code logs and
+# bails if it ever loses that race.
+PRODUCT_VENDOR_PROPERTIES += \
+    bluetooth.sco.managed_by_audio=true \
+    bluetooth.hfp.software_datapath.enabled=true
+
 # Bluetooth off on a fresh userdata. A runtime overlay, not the one above: Car's own RRO
 # sets def_bluetooth_on=true and outranks any build-time overlay. The ordering that makes
 # this one win is in its Android.bp (device/agl/doma-common/DomaSettingsProviderRRO).

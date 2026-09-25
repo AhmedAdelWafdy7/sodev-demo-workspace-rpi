@@ -1116,6 +1116,12 @@
 				 * and this node carries no local-bd-address, so here
 				 * it changes nothing. */
 				fallback-bd-address;
+				/* sco-routing = 1 (Transport = HCI) so SCO does not go to
+				 * the chip's PCM pins, which this guest does not have.
+				 * hci_bcm.c sends it during bcm_setup() as HCI opcode
+				 * 0xfc1c; byte order per the brcm,bluetooth.yaml binding.
+				 * Needed for HFP, harmless for A2DP. */
+				brcm,bt-pcm-int-params = [01 02 00 01 01];
 				/* vbat / vddio. hci_bcm.c's bcm_get_resources() takes both with
 				 * devm_regulator_get(), not the _optional variant, so they are
 				 * mandatory. A plain Raspberry Pi DT does not declare them either,

@@ -329,7 +329,14 @@
 
         </module>
 
-        <!-- Bluetooth Audio HAL -->
+        <!-- Bluetooth Audio HAL.
+             The included file declares the SCO/HFP ports as well as A2DP
+             (bluetooth_audio_policy_configuration.xml: the BT SCO / BT SCO Headset /
+             BT SCO Car Kit sinks and the BT SCO Headset Mic source), and
+             audio_bluetooth_hw's SCO implementation is in the shipped image.
+             Declaring the ports is harmless on its own: the bluetooth module has no
+             <attachedDevices>, so none of them becomes available until something
+             calls setDeviceConnectionState for it. -->
         <xi:include href="bluetooth_audio_policy_configuration.xml"/>
 
         <!-- Usb Audio HAL -->
