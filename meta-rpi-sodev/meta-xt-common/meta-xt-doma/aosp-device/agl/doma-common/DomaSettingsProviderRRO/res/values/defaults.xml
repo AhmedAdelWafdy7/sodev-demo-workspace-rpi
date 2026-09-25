@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!--
+  Applies to a FRESH /data only: SettingsProvider seeds Settings.Global once. On a board
+  that is already provisioned, turn Bluetooth off once in Settings (or run
+  `svc bluetooth disable`); the choice persists in /data from then on.
+-->
+<resources>
+    <bool name="def_bluetooth_on">false</bool>
+</resources>

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
-Date: Sun, 26 Jul 2026 00:00:00 +0900
+Date: Sat, 08 Aug 2026 20:58:15 +0900
 Subject: [PATCH] boards/rpi_4b: add Zephyr Dom0 board conf + overlay (BCM2711)
 
 Add the Raspberry Pi 4 (BCM2711) counterpart of boards/rpi_5.{conf,overlay}.
@@ -26,12 +26,13 @@ Three things are genuinely different on BCM2711 and are commented in place:
   root -- the opposite of what the overlay body says, and wrong.)
 
 * CONSOLE. rpi_4b.dts points zephyr,console at &uart1, the BCM2711 aux/mini
-  UART. Xen owns the console (boot.cmd passes dtuart=/soc/serial@7e201000, the
-  pl011) and Xen's rpi4 platform blacklists the aux peripheral's page
-  neighbours, so Dom0 uses the Xen PV console and &uart1 is disabled. The pinned
-  Zephyr rev does define pl011 nodes for BCM2711 (uart0 at 0xfe201000, which is the
-  very UART Xen takes, plus uart2..uart5), but they are all status = "disabled"
-  there and none is enabled here.
+  UART, and that UART is Xen's console (boot.cmd passes
+  dtuart=/soc/serial@7e215040); Xen's rpi4 platform also blacklists the aux
+  peripheral's page neighbours. So Dom0 uses the Xen PV console and &uart1 is
+  disabled. The pinned Zephyr rev does define pl011 nodes for BCM2711 (uart0 at
+  0xfe201000, which is passed through to DomD for Bluetooth, plus
+  uart2..uart5), but they are all status = "disabled" there and none is
+  enabled here.
 
 * SRAM RELINK to 0x20000000, derived rather than measured. Xen's rpi4 platform
   sets .dma_bitsize = 30, so allocate_memory_11() confines Dom0's bank[0] to
@@ -85,7 +86,7 @@ Upstream-Status: Pending [xen-troops/zephyr-dom0-xt]
 ---
 diff --git a/boards/rpi_4b.conf b/boards/rpi_4b.conf
 new file mode 100644
-index 0000000..de2a59d
+index 0000000..e1c7411
 --- /dev/null
 +++ b/boards/rpi_4b.conf
 @@ -0,0 +1,131 @@
@@ -222,7 +223,7 @@ index 0000000..de2a59d
 +CONFIG_DOM_CFG_SODEV=y
 diff --git a/boards/rpi_4b.overlay b/boards/rpi_4b.overlay
 new file mode 100644
-index 0000000..494f965
+index 0000000..4f3f660
 --- /dev/null
 +++ b/boards/rpi_4b.overlay
 @@ -0,0 +1,219 @@
@@ -245,13 +246,13 @@ index 0000000..494f965
 + *     were ever needed here.
 + *
 + *  2. CONSOLE. rpi_4b.dts points zephyr,console at &uart1, the BCM2711 aux/mini
-+ *     UART. Under Xen that UART is not Dom0's to use: Xen owns the console
-+ *     (boot.cmd passes console=dtuart dtuart=/soc/serial@7e201000, the pl011) and
-+ *     the aux peripheral's page neighbours are on Xen's rpi4 device blacklist.
++ *     UART. Under Xen that UART is not Dom0's to use: it is Xen's console
++ *     (boot.cmd passes console=dtuart dtuart=/soc/serial@7e215040), and the
++ *     aux peripheral's page neighbours are on Xen's rpi4 device blacklist.
 + *     Dom0 therefore talks over the Xen PV console, exactly as on RPi5, and the
-+ *     board's UART is disabled. NOTE: bcm2711.dtsi DOES define pl011 nodes (uart0
-+ *     at 0xfe201000 is the one Xen takes, plus uart2..uart5), but they ship
-+ *     status = "disabled" and none is enabled here.
++ *     board's UART is disabled. NOTE: bcm2711.dtsi DOES define pl011 nodes
++ *     (uart0 at 0xfe201000, passed through to DomD for Bluetooth, and
++ *     uart2..uart5), but they ship status = "disabled"; none is enabled here.
 + *
 + *  3. NO SDHC. The RPi4 SD controller (/emmc2bus/mmc@7e340000) is handed to DomD
 + *     by boot.cmd.xen.zephyr-dom0.in, and the pinned rpi_4b board does not define

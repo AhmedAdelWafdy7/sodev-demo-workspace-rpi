@@ -315,10 +315,15 @@ Run from the toolstack domain after boot:
   (`vhost_xen_map_desc: Failed to map pages`). Reboot the board to restart DomA
   (this is also why DomA is created before DomU). A per-device domid fix is
   future work.
-- **AAOS guest niceties** (guest-image side): Bluetooth-without-HCI log noise —
-  suppress at runtime with `settings put global bluetooth_on 0` (NOT
-  `pm disable com.android.bluetooth`, which crashes system_server); a benign
-  boot-window dropbox race.
+- **AAOS guest niceties** (guest-image side): where DomD has no Bluetooth
+  controller to hand over (for example the Raspberry Pi 5 with
+  `DOM0_OS=linux`), leave Bluetooth off in DomA: it has nothing to talk to. A
+  guest with no Bluetooth transport at all, measured on hardware (2026-08-18),
+  crash-looped com.android.bluetooth about every 44 s, each time writing a
+  tombstone to `/data`, which reaches the SD through DomD's device model.
+  Bluetooth starts off on a fresh `/data`; `settings put global bluetooth_on 0`
+  turns it off again (NOT `pm disable com.android.bluetooth`, which crashes
+  system_server). Also a benign boot-window dropbox race.
 - Occasional qemu cleanup timeouts leave a zombie domain on `xl destroy`; a
   board reboot recovers.
 - **DomA's AAOS home screen intermittently fails to appear, and the real cause is a

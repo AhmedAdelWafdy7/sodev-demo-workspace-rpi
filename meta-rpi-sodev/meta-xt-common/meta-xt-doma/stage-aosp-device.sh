@@ -82,14 +82,14 @@ rpi4)
 	[ -f "$DEV/$DEVICE/BoardConfig.mk" ] || { echo "ERROR: $DEV/$DEVICE/BoardConfig.mk is missing." >&2; exit 1; }
 	[ -f "$DEV/init.xenvm-buried-eth0.rc" ] || { echo "ERROR: $DEV/init.xenvm-buried-eth0.rc is missing." >&2; exit 1; }
 	OVERLAY_XML="$DEV/overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml"
-	# A missing overlay does not fail the build, it just silently ships the AOSP defaults
-	# (Bluetooth on, animations at 100%), so say so here where it is cheap to notice.
+	# A missing overlay does not fail the build, it just silently ships the AOSP
+	# default for every value it sets, so say so here where it is cheap to notice.
 	[ -f "$OVERLAY_XML" ] || { echo "ERROR: $OVERLAY_XML is missing." >&2; exit 1; }
 	check_overlay_xml "$OVERLAY_XML"
-	# The device installs DomaWifiRelay from its own copy. A checkout that was
-	# staged for rpi5 still has device/agl/doma-common with the same module
-	# name, and soong rejects a duplicate module name.
-	for m in DomaWifiRelay; do
+	# The device installs DomaWifiRelay and DomaSettingsProviderRRO from its own
+	# copies. A checkout that was staged for rpi5 still has device/agl/doma-common
+	# with the same module names, and soong rejects a duplicate module name.
+	for m in DomaWifiRelay DomaSettingsProviderRRO; do
 		n=$(grep -rl --include=Android.bp "name: \"$m\"" "$ROOT/device" 2>/dev/null | wc -l)
 		if [ "$n" != "1" ]; then
 			echo "ERROR: found $n Android.bp defining $m under $ROOT/device (expected 1)." >&2
@@ -124,15 +124,15 @@ rpi5)
 		echo "ERROR: device/agl/common/overlay SettingsProvider defaults not staged." >&2; exit 1; }
 	check_overlay_xml "$OVERLAY_XML"
 
-	# device/agl/doma-common holds what the product installs by MODULE name
-	# (DomaWifiRelay). soong rejects a duplicate module name across the
-	# whole tree, so there must be exactly one Android.bp defining each. The
-	# rpi4 does not stage this directory: its device repository carries its
-	# own copies of the modules it installs, kept identical to these by
-	# hand.
+	# device/agl/doma-common holds the modules the product installs by
+	# MODULE name (DomaWifiRelay, DomaSettingsProviderRRO). soong rejects a
+	# duplicate module name across the whole tree, so there must be exactly
+	# one Android.bp defining each. The rpi4 does not stage this directory:
+	# its device repository carries its own copies of the modules it
+	# installs, kept identical to these by hand.
 	rm -rf "$ROOT/device/agl/doma-common"
 	cp -a "$here/aosp-device/agl/doma-common" "$ROOT/device/agl/doma-common"
-	for m in DomaWifiRelay; do
+	for m in DomaWifiRelay DomaSettingsProviderRRO; do
 		# --include=Android.bp: without it a comment in an .rc file that merely names
 		# the module would count as a second definition.
 		n=$(grep -rl --include=Android.bp "name: \"$m\"" "$ROOT/device" 2>/dev/null | wc -l)

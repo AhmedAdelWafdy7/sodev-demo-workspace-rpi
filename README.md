@@ -140,7 +140,7 @@ disables the heavy Android/Flatcar guests by default).
 | Flag (env var) | Default | Effect |
 |---|---|---|
 | `--board=<board>` (`BOARD`) | **rpi5** | Which board to build: `rpi5` or `rpi4`. Selects `<board>-sodev.yaml`, and with it the SoC, MACHINE, Zephyr Dom0 board, passthrough set, physical memory map and board layer (`meta-xt-rpi5` or `meta-xt-rpi4` — never both). Raspberry Pi 5 is the reference platform; see *meta-xt-rpi4/README.md* for what the Raspberry Pi 4 configuration is verified against |
-| `--dom0=<os>` (`DOM0_OS`) | **zephyr** | Selects the entire Dom0 component body: Zephyr xenstore-only Dom0 (disaggregated; DomD owns the toolstack) or the thin Linux control Dom0 (classic; Dom0 owns xl). The Zephyr flavour is the shipping default. On the RPi5 the linux flavour gives DomD no Wi-Fi: its pins need muxing over SCMI, which only the Zephyr flavour sets up. On the RPi4 the linux flavour gives DomD no Wi-Fi either: the Wi-Fi SDIO controller shares GIC SPI 126 with the SD card controller, which that flavour's Dom0 keeps, so it stays with Dom0 as well. What has been run on hardware, and with which flavour, is in *Build & hardware verification (RPi5)* below. |
+| `--dom0=<os>` (`DOM0_OS`) | **zephyr** | Selects the entire Dom0 component body: Zephyr xenstore-only Dom0 (disaggregated; DomD owns the toolstack) or the thin Linux control Dom0 (classic; Dom0 owns xl). The Zephyr flavour is the shipping default. On the RPi5 the linux flavour gives DomD no Wi-Fi and no Bluetooth: their pins need muxing over SCMI, which only the Zephyr flavour sets up. On the RPi4 the linux flavour gives DomD no Wi-Fi either: the Wi-Fi SDIO controller shares GIC SPI 126 with the SD card controller, which that flavour's Dom0 keeps, so it stays with Dom0 as well. What has been run on hardware, and with which flavour, is in *Build & hardware verification (RPi5)* below. |
 | `--ram=<sku>` (`BOARD_RAM`) | **16g** (rpi5) / **8g** (rpi4) | Board SKU; the valid values and the default depend on `--board`. **rpi5: `16g`\|`8g`.** `16g` = the full 4-domain map (Dom0 512 + DomD 4096 + DomU 1024 + DomA 4096 = 9728 MiB). `8g` takes **DomD to 3072 MiB** (static-mem bank4 at `0x180000000` dropped) **and DomA to 3072 MiB**; Dom0/DomU keep their sizes, so the four total 7680 MiB and fit an 8 GB board. Splitting the reduction is measured, not a preference — see *Board RAM size* (`docs/DESIGN.md`). **rpi4: `8g`\|`4g`.** `8g` = Dom0 128 (zephyr, the default) or 256 (linux) + DomD 1920 + DomU 1024 + DomA 2560; `4g` drops bank2 and shrinks DomD (the per-lane DomD and DomA sizes are in *meta-xt-rpi4/README.md*), and DomA and DomU can no longer RUN at the same time — each fits alone, and `build.sh` says so |
 | `-u`, `--domu` (`ENABLE_DOMU`) | **off** | Adds the AGL instrument-cluster DomU: Xen-aware kernel `linux-virtio-armv8` (p1) + AGL rootfs (p3). V4H-aligned minimal domu layer set (kernel via moulin; AGL rootfs via `build.sh`'s AGL bitbake) |
 | `-a`, `--android` (`ENABLE_ANDROID`) | **off** | Include DomA (AAOS, p4 nested GPT). Alias for `--aaos=auto` — the mode chooses how DomA is produced |
@@ -194,7 +194,8 @@ Accept it with `--accept-synaptics-killswitch` (or
 (DomD's `local.conf` requires it). Editing either file by hand does not last:
 `build.sh` regenerates DomD's `conf/` on every run. Without the flag the image
 still builds, but DomD has no Wi-Fi firmware and no `wlan0`, so DomA's shadow-AP
-Wi-Fi has nothing to relay.
+Wi-Fi has nothing to relay. The Bluetooth firmware (`bluez-firmware-rpidistro`)
+declares no licence flag and is installed either way.
 
 ## Build — details & options
 The *Quick start* above is the happy path (`./build.sh` → `full.img`); *Build
@@ -393,8 +394,8 @@ renders on HDMI-A-2 (all guest modules load, SurfaceFlinger up) — the guest
 kernel and the `super.img` vendor_dlkm modules must come from one coherent build
 (same `module_layout` ABI; see *How the DomA artifacts are produced* (`docs/BUILD.md`)). The **thin Linux-Dom0** flavour
 has been booted end to end on both boards, in the Xen 4.22 run of 2026-08-18
-described below. That run does not cover DomD's Wi-Fi, which the linux flavour
-does not give DomD on the RPi5.
+described below. That run does not cover DomD's Wi-Fi or Bluetooth, and on the
+RPi5 the linux flavour gives DomD neither.
 The Zephyr full-image HW checklist. **[4.22] The list below was first measured on Xen
 4.21.** On **Xen 4.22** the four verification patterns of this tree were run on hardware
 on 2026-08-18 and all passed -- RPi4 and RPi5 x Zephyr-Dom0 and thin-Linux-Dom0 -- with

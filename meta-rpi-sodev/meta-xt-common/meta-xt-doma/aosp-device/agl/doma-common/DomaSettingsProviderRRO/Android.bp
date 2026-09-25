@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// DomaSettingsProviderRRO -- Bluetooth starts off on a fresh /data.
+//
+// SettingsProvider seeds Settings.Global bluetooth_on from def_bluetooth_on once, on the
+// first boot of an empty /data, and the Settings toggle keeps the user's choice from
+// then on. CarSettingsProviderConfigRRO sets def_bluetooth_on=true
+// (packages/services/Car/car_product/rro/overlay-config/SettingsProviderRRO/res/values/
+// defaults.xml:24), and a build-time DEVICE_PACKAGE_OVERLAYS value loses to any runtime
+// overlay: on a fresh RPi4 /data (2026-09-24) bluetooth_on came up 1 and
+// `cmd overlay lookup` resolved def_bluetooth_on to true, with the device overlay saying
+// false.
+//
+// Static overlays are applied in partition order (PackagePartitions: system, vendor, odm,
+// oem, product, system_ext) and, within one partition, by android:priority
+// (OverlayConfig.java, sStaticOverlayComparator); the last one applied wins. Car's RRO is
+// in product with no priority, i.e. 0, so this is a product RRO at priority 1. A vendor
+// RRO would lose whatever its priority. Signed with the platform key, like Car's.
+runtime_resource_overlay {
+    name: "DomaSettingsProviderRRO",
+    resource_dirs: ["res"],
+    certificate: "platform",
+    product_specific: true,
+}

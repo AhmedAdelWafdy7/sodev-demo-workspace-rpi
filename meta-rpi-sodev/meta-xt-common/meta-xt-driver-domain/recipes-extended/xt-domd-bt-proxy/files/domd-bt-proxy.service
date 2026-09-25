@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Bluetooth HCI bridge for DomA (btproxy: hci0 user channel <-> H4 on a Unix socket)
+# Without this, a start that fails before hci0 exists (early boot, or a board whose
+# BT UART was not passed through) latches the unit permanently failed and it never
+# comes back. Must live in [Unit], not [Service]. Same reasoning as
+# domd-wifi-agent.service, gnss_replay.service and cluster-service.service.
+StartLimitIntervalSec=0
+
+[Service]
+# hci0 appears once hci_uart has bound over serdev to the brcm,bcm43438-bt child
+# of the board's Bluetooth UART, which needs the module loaded and the patchram
+# present. Wait in a loop rather than fail fast: with Restart=always a failing
+# check would restart every RestartSec and fill the journal. The wait still
+# counts against DefaultTimeoutStartSec (90 s), so where DomD has no Bluetooth
+# UART (the Raspberry Pi 5 with DOM0_OS=linux) the start times out and the unit
+# is started again, about every 92 s.
+ExecStartPre=/bin/sh -c 'while [ ! -d /sys/class/bluetooth/hci0 ]; do sleep 0.5; done'
+# --unix=<path> MUST use the `=` form. btproxy declares the option as
+# { "unix", optional_argument, NULL, 'u' } (tools/btproxy.c), and getopt does not
+# consume a space-separated value for an optional_argument -- `-u /run/bt-hci.sock`
+# leaves optarg NULL and btproxy silently listens on its built-in default
+# /tmp/bt-server-bredr instead. qemu would then just retry forever against a socket
+# that never appears, so the failure is invisible without reading this journal.
+ExecStart=/usr/bin/btproxy --unix=/run/bt-hci.sock -i 0
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
