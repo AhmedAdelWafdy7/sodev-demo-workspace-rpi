@@ -3,7 +3,8 @@
 > **Documentation map** — [`README.md`](../README.md) build and run |
 > [`docs/BUILD.md`](BUILD.md) build details |
 > [`docs/DESIGN.md`](DESIGN.md) why the tree looks like this |
-> [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md) when it does not work
+> [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md) when it does not work |
+> [`docs/VULKAN-VENUS.md`](VULKAN-VENUS.md) Vulkan in the guests
 
 Symptoms seen on real hardware, what caused them, and what to do. Each entry keeps
 the log lines it was diagnosed from, so a recurrence can be recognised rather than

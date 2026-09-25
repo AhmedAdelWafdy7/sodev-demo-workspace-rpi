@@ -1,0 +1,117 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 08 Sep 2026 00:23:38 +0900
+Subject: [PATCH] vhost: do not verify vring host mappings under Xen, it
+ abort()s the device model
+
+Enabling Vulkan (Venus) in DomA killed DomA's device model the instant Mesa
+created its first Venus context. Measured on RPi4 hardware 2026-09-07, three
+times on three freshly created domains, 100 % reproducible from
+`adb shell cmd gpu vkjson`:
+
+    info: xen-arm: device RAM 'blob' at gpa 0xc0000000, 33 pages, hva 0xffff6998e000
+    info: xen-arm: shared 33 pages of device RAM into dom2 at 0xc0000000 (pagemap, ...)
+    descriptor table relocated for ring 0
+    Verify ring failure on region 0
+
+then SIGABRT. From the coredump, the call chain is
+
+    virgl_cmd_resource_map_blob            hw/display/virtio-gpu-virgl.c:868
+      virtio_gpu_virgl_map_resource_blob   hw/display/virtio-gpu-virgl.c:188
+        memory_region_transaction_commit   system/memory.c:1169
+          vhost_commit                     hw/virtio/vhost.c:698  -> abort()
+
+i.e. adding the blob's MemoryRegion to the guest's address space drives the
+vhost MemoryListener, and vhost_commit() re-verifies every vring against the
+rebuilt memory table.
+
+That verification cannot succeed under Xen. qemu does not map the whole of a
+Xen guest's RAM -- from the same coredump:
+
+    sect[0] mr name=xen.ram  gpa=0x40000000 size=0x80000000
+            rb->idstr=xen.ram  rb->host=(nil)          <-- no host mapping
+    region[0] guest_phys_addr=0x40000000 userspace_addr=0x40000000   <-- hva == gpa
+
+memory_region_get_ram_ptr() returns NULL for that section. vhost_commit()
+computes userspace_addr as that pointer plus section->offset_within_region, so
+with the base NULL what it records is the offset alone -- and for xen.ram the
+offset within the region happens to be the guest physical address, which is why
+the value reads as a pseudo-hva equal to the gpa. Meanwhile vq->desc holds a
+real map-cache pointer:
+
+    reg_gpa  = 0x40000000   reg_hva  = 0x40000000
+    ring_gpa = 0xb0106000   ring_hva = 0xffffb83b6000
+    expected = reg_hva + (ring_gpa - reg_gpa) = 0xb0106000  !=  0xffffb83b6000  -> -EBUSY
+
+So the "check that ring's MemoryRegion wasn't replaced" test reports every ring
+as relocated. The ring had not moved -- 0xffffb83b6000 was still live; only the
+recorded region hva was never an hva at all. All three of DomA's vhost devices
+(two vhost-net, one vhost-vsock) carry region[0] userspace_addr = 0x40000000,
+which is why turning vhost off on the netdevs only moved the abort onto the
+vsock device (region 0 -> region 2, measured).
+
+This is therefore not blob- or Venus-specific: ANY memory topology change that
+occurs while a vhost device has ->started set will abort the device model on a
+Xen guest. It has simply never been reached before, because vhost_dev_start()
+commits before it sets ->started, and a virtio-gpu host-visible blob mapping is
+the first post-start topology change this configuration has ever produced.
+
+Address translation for these backends is done by domid, not by host VA, so the
+mapping identity this function tries to police is not the one in use. Skip the
+check when Xen is in use. vhost_commit() still rebuilds and pushes the memory
+table itself; only the (meaningless, fatal) verification is dropped.
+
+vhost_dev_has_iommu() already returns early here for the same reason -- when
+translation is somebody else's job, there is nothing to compare -- so this sits
+next to it.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [not yet submitted to qemu-devel; the check it skips
+ cannot succeed under Xen, where qemu never maps the whole of a guest's RAM.
+ Note that the vhost backends this unblocks get their Xen address translation
+ from the fork's own guest-side vhost-Xen work, which upstream does not have]
+---
+--- a/hw/virtio/vhost.c
++++ b/hw/virtio/vhost.c
+@@ -27,6 +27,7 @@
+ #include "migration/blocker.h"
+ #include "migration/qemu-file-types.h"
+ #include "system/dma.h"
++#include "system/xen.h"
+ #include "trace.h"
+ 
+ /* enabled until disconnected backend stabilizes */
+@@ -520,6 +521,33 @@
+         return 0;
+     }
+ 
++    /*
++     * Under Xen there is nothing here to verify, and verifying anyway is fatal.
++     *
++     * qemu does not map the whole of a Xen guest's RAM: the RAMBlock backing
++     * "xen.ram" has host == NULL and the vrings are reached on demand through
++     * the map cache (xen_map_cache()). memory_region_get_ram_ptr() therefore
++     * returns NULL for those sections, so the userspace_addr that
++     * vhost_commit() records in the vhost memory table is a pseudo-hva equal to
++     * the guest physical address -- while vq->desc holds a real map-cache
++     * pointer. The "ring's MemoryRegion wasn't replaced" comparison below can
++     * then never hold, so every ring looks "relocated" and vhost_commit()
++     * abort()s the device model on the FIRST memory topology change that
++     * happens after the device was started. vhost_dev_start() commits before it
++     * sets ->started, which is the only reason this is not hit at boot.
++     *
++     * On Arm that first post-start change is a virtio-gpu host-visible blob
++     * being mapped into the guest (Venus/Vulkan), so enabling Vulkan in a guest
++     * killed its device model as soon as Mesa created its first Venus context.
++     * Address translation for these backends is done by domid rather than by
++     * host VA, so the mapping identity this function tries to police is not the
++     * one actually in use. Skip it; vhost_commit() still updates the memory
++     * table itself below.
++     */
++    if (xen_enabled()) {
++        return 0;
++    }
++
+     for (i = 0; i < dev->nvqs; ++i) {
+         struct vhost_virtqueue *vq = dev->vqs + i;
+ 

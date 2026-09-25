@@ -1,0 +1,150 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 12 Sep 2026 01:02:25 +0900
+Subject: [PATCH] xen: do not silently drop IOREQ MMIO range (un)registration
+ failures; self-heal -EEXIST partial overlaps (qemu 10.0.2 port of 0110)
+
+Forward-port of meta-xt-driver-domain's 0110-xen-ioreq-isr-range-fix.patch
+from qemu 7.0.0 to 10.0.2. The file moved from include/hw/xen/xen_common.h
+to include/hw/xen/xen_native.h in qemu 8.2; the four (un)map_*_section
+helpers are otherwise unchanged, so the hunks are the same fix on the new
+path. The 7.0.0 lane version-gates 0110 on PV 7.x, which is correct for
+that lane, but it meant the Venus-capable 10.0.2 device model shipped
+WITHOUT this fix -- and the exact fault 0110 describes came back on RPi4.
+
+Measured on RPi4 / Xen 4.22.0 (debug=n) / DomA = AAOS 6.18.32, 2026-09-10..12,
+twelve identical guest panics over several boots:
+
+    Unable to handle kernel ttbr address size fault at virtual address ffffffc0836xx000
+    ESR = 0x0000000096000000  (EC=0x25 DABT current EL, ISS=0 -> DFSC=0x00)
+    pte=006800003400d713     (a VALID Device-nGnRE mapping of PA 0x3400d000)
+    pc : readb+0x14/0xa0 [virtio_pci]   lr : vp_interrupt+0x2c/0xf0   (9 of 12)
+    pc : writew+0x18/0x98 [virtio_pci]  lr : vp_notify+0x1c/0x30      (2 of 12)
+    (the twelfth panic's register dump was lost with the console buffer; its
+     faulting PA is in the table below)
+    Code: ... d503201f (39400008)       = plain `ldrb w8, [x0]`, ISV=1
+
+Faulting physical pages, against the guest's BAR map:
+    0x3400d000 x8  = 00:04.0 virtio-net ISR (BAR+0x1000)
+    0x3400b000 x1  = 00:03.0 virtio-net notify (BAR+0x3000)
+    0x34019000 x2  = 00:07.0 virtio-gpu-gl ISR
+    0x3401b000 x1  = 00:07.0 virtio-gpu-gl notify
+
+ESR 0x96000000 with ISS=0 is bit-exactly what Xen's inject_abt64_exception
+writes (union hsr esr = { .iss = 0, .len = 1 }, ec = HSR_EC_DATA_ABORT_CURR_EL):
+the guest's page table is valid because the abort was manufactured by Xen for
+an MMIO access that no ioreq server covered. Three devices fault, vhost on or
+off (reproduced with both netdevs at vhost=off), with SurfaceFlinger on GL
+(after hours) as well as on Vulkan/Venus (after minutes -- Venus multiplies
+the memory-topology commits, and with them the per-FlatRange map/unmap
+churn that opens the hole). `xl debug-keys q` shows the low PCI area held as
+ONE merged rangeset entry, 33000000-3affffff, which is the precondition for
+the -EEXIST partial-overlap rejection.
+
+Both diagnostics on the Xen side of this path are gdprintk and are compiled
+out in this release hypervisor, so nothing is ever logged there; with this
+patch the device model logs the rejected span itself and heals it.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/include/hw/xen/xen_native.h
++++ b/include/hw/xen/xen_native.h
+@@ -20,6 +20,9 @@
+ #include "hw/xen/xen.h"
+ #include "hw/pci/pci_device.h"
+ #include "hw/xen/trace.h"
++/* error_report()/errno for the IOREQ range self-heal below. */
++#include "qemu/error-report.h"
++#include <errno.h>
+ 
+ extern xc_interface *xen_xc;
+ 
+@@ -370,14 +373,59 @@
+     hwaddr start_addr = section->offset_within_address_space;
+     ram_addr_t size = int128_get64(section->size);
+     hwaddr end_addr = start_addr + size - 1;
++    int rc;
+ 
+     if (use_default_ioreq_server) {
+         return;
+     }
+ 
+     trace_xen_map_mmio_range(ioservid, start_addr, end_addr);
+-    xendevicemodel_map_io_range_to_ioreq_server(xen_dmod, dom, ioservid, 1,
+-                                                start_addr, end_addr);
++    rc = xendevicemodel_map_io_range_to_ioreq_server(xen_dmod, dom, ioservid,
++                                                     1, start_addr, end_addr);
++    if (rc) {
++        int saved_errno = errno;
++        /*
++         * Surface IOREQ MMIO-range registration failures that stock qemu
++         * silently drops (this call used to be fire-and-forget).  Xen
++         * merges adjacent ranges in its rangeset, so the
++         * region_del/region_add churn of a 64-bit BAR relocation (lo/hi
++         * split config write) can leave a partial overlap behind; this add
++         * is then rejected with -EEXIST, leaving holes such as the
++         * virtio-pci ISR page at BAR+0x1000 unregistered.  A guest read of
++         * an unregistered page is answered by Xen with an injected data
++         * abort (ISS=0) => vp_interrupt panic in the guest.
++         */
++        error_report("xen: map_io_range_to_ioreq_server FAILED rc=%d errno=%d"
++                     " ioservid=%u start=0x%" HWADDR_PRIx
++                     " end=0x%" HWADDR_PRIx,
++                     rc, saved_errno, ioservid, start_addr, end_addr);
++        if (saved_errno == EEXIST) {
++            /*
++             * Self-heal: the span is only partially covered by a coalesced
++             * rangeset entry.  Remove the exact [start,end] span and add it
++             * back as one clean range so that every subregion is guaranteed
++             * to be present (Xen re-merges it with its neighbours).
++             */
++            xendevicemodel_unmap_io_range_from_ioreq_server(xen_dmod, dom,
++                                                            ioservid, 1,
++                                                            start_addr,
++                                                            end_addr);
++            rc = xendevicemodel_map_io_range_to_ioreq_server(xen_dmod, dom,
++                                                             ioservid, 1,
++                                                             start_addr,
++                                                             end_addr);
++            if (rc) {
++                error_report("xen: ioreq range re-register STILL FAILED"
++                             " rc=%d errno=%d start=0x%" HWADDR_PRIx
++                             " end=0x%" HWADDR_PRIx,
++                             rc, errno, start_addr, end_addr);
++            } else {
++                error_report("xen: ioreq range re-register OK"
++                             " start=0x%" HWADDR_PRIx " end=0x%" HWADDR_PRIx,
++                             start_addr, end_addr);
++            }
++        }
++    }
+ }
+ 
+ static inline void xen_unmap_memory_section(domid_t dom,
+@@ -387,14 +435,23 @@
+     hwaddr start_addr = section->offset_within_address_space;
+     ram_addr_t size = int128_get64(section->size);
+     hwaddr end_addr = start_addr + size - 1;
++    int rc;
+ 
+     if (use_default_ioreq_server) {
+         return;
+     }
+ 
+     trace_xen_unmap_mmio_range(ioservid, start_addr, end_addr);
+-    xendevicemodel_unmap_io_range_from_ioreq_server(xen_dmod, dom, ioservid,
+-                                                    1, start_addr, end_addr);
++    rc = xendevicemodel_unmap_io_range_from_ioreq_server(xen_dmod, dom,
++                                                         ioservid, 1,
++                                                         start_addr, end_addr);
++    if (rc && errno != ENOENT) {
++        /* -ENOENT (range already absent / split away) is expected churn. */
++        error_report("xen: unmap_io_range_from_ioreq_server FAILED rc=%d"
++                     " errno=%d ioservid=%u start=0x%" HWADDR_PRIx
++                     " end=0x%" HWADDR_PRIx,
++                     rc, errno, ioservid, start_addr, end_addr);
++    }
+ }
+ 
+ static inline void xen_map_io_section(domid_t dom,

@@ -3,7 +3,8 @@
 > **Documentation map** — [`README.md`](README.md) build and run |
 > [`docs/BUILD.md`](docs/BUILD.md) build details |
 > [`docs/DESIGN.md`](docs/DESIGN.md) why the tree looks like this |
-> [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) when it does not work
+> [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) when it does not work |
+> [`docs/VULKAN-VENUS.md`](docs/VULKAN-VENUS.md) Vulkan in the guests
 A **Raspberry Pi 5** port of the AGL (Automotive Grade Linux) SoDeV
 disaggregated-cockpit demo (R-Car V4H / Sparrow Hawk): **Xen 4.22** running a
 minimal control Dom0 (Zephyr by default, thin Linux as an alternative), a GPU
@@ -29,8 +30,9 @@ was kept identical.
   DOM0_OS=zephyr (default — disaggregated control plane)
   |- Dom0 : Zephyr, xenstore server only (no toolstack, no drivers)      [1 vCPU  @ pCPU 0]
   |- DomD : dom0less direct-mapped driver domain — vc4/v3d GPU, RP1,
-  |         SDHCI, Mesa 26.0.5 + weston 15.0.0 + qemu 7.0.0 device-models,
-  |         AND the xl toolstack that creates DomU/DomA/DomZ             [2 vCPUs @ pCPU 0-1]
+  |         SDHCI, Mesa 26.2.2 + weston 15.0.0 + qemu 10.0.2-xt device-models
+  |         (7.0.0-xt with --gpu=gl), AND the xl toolstack that creates
+  |         DomU/DomA/DomZ                                               [2 vCPUs @ pCPU 0-1]
   |- DomU : AGL instrument cluster (Flutter cluster demo) -> HDMI-A-1    [1 vCPU  @ pCPU 1]
   |- DomA : Android Automotive OS (trout/xenvm)           -> HDMI-A-2    [2 vCPUs @ pCPU 2-3]
   |- DomZ : Zephyr RTOS domain (xenvm board)                             [1 vCPU  @ pCPU 0]
@@ -71,11 +73,14 @@ does not replace the first and a card you flashed months ago can still be
 identified:
 
 ```
-rpi5-16GB-Dom0Zephyr-DomU-DomA-20260809-1750.img
-^^^^ ^^^^ ^^^^^^^^^^ ^^^^^^^^^ ^^^^^^^^^^^^^
-board SKU  Dom0       guests    build date and time (local)
-                      present
+rpi5-16GB-Dom0Zephyr-DomU-Venus-DomA-20260809-1750.img
+^^^^ ^^^^ ^^^^^^^^^^ ^^^^ ^^^^^ ^^^^ ^^^^^^^^^^^^^
+board SKU  Dom0      |    GPU   |    build date and time (local)
+                     guests present
 ```
+
+`Venus` or `GL` names the `--gpu` stack and is always there; a guest's token is
+there only when that guest was built.
 
 `full.img` is a symlink to the newest one, so the `dd` line above — and anything
 else that refers to `full.img` — keeps working.
@@ -136,11 +141,13 @@ disables the heavy Android/Flatcar guests by default).
 |---|---|---|
 | `--board=<board>` (`BOARD`) | **rpi5** | Which board to build: `rpi5` or `rpi4`. Selects `<board>-sodev.yaml`, and with it the SoC, MACHINE, Zephyr Dom0 board, passthrough set, physical memory map and board layer (`meta-xt-rpi5` or `meta-xt-rpi4` — never both). Raspberry Pi 5 is the reference platform; see *meta-xt-rpi4/README.md* for what the Raspberry Pi 4 configuration is verified against |
 | `--dom0=<os>` (`DOM0_OS`) | **zephyr** | Selects the entire Dom0 component body: Zephyr xenstore-only Dom0 (disaggregated; DomD owns the toolstack) or the thin Linux control Dom0 (classic; Dom0 owns xl). Both flavours are HW-verified on a real RPi5, at both `--ram` values; the Zephyr flavour is the shipping default. See the verification note in *Boot process* (`docs/DESIGN.md`). |
-| `--ram=<sku>` (`BOARD_RAM`) | **16g** (rpi5) / **8g** (rpi4) | Board SKU; the valid values and the default depend on `--board`. **rpi5: `16g`\|`8g`.** `16g` = the full 4-domain map (Dom0 512 + DomD 4096 + DomU 1024 + DomA 4096 = 9728 MiB). `8g` takes **DomD to 3072 MiB** (static-mem bank4 at `0x180000000` dropped) **and DomA to 3072 MiB**; Dom0/DomU keep their sizes, so the four total 7680 MiB and fit an 8 GB board. Splitting the reduction is measured, not a preference — see *Board RAM size* (`docs/DESIGN.md`). **rpi4: `8g`\|`4g`.** `8g` = Dom0 128 (zephyr, the default) or 256 (linux) + DomD 1920 + DomU 1024 + DomA 2560; `4g` takes DomD to 1024 MiB (bank2 dropped, bank0 to 640 MiB) and DomA and DomU can no longer RUN at the same time — each fits alone, and `build.sh` says so |
+| `--ram=<sku>` (`BOARD_RAM`) | **16g** (rpi5) / **8g** (rpi4) | Board SKU; the valid values and the default depend on `--board`. **rpi5: `16g`\|`8g`.** `16g` = the full 4-domain map (Dom0 512 + DomD 4096 + DomU 1024 + DomA 4096 = 9728 MiB). `8g` takes **DomD to 3072 MiB** (static-mem bank4 at `0x180000000` dropped) **and DomA to 3072 MiB**; Dom0/DomU keep their sizes, so the four total 7680 MiB and fit an 8 GB board. Splitting the reduction is measured, not a preference — see *Board RAM size* (`docs/DESIGN.md`). **rpi4: `8g`\|`4g`.** `8g` = Dom0 128 (zephyr, the default) or 256 (linux) + DomD 1920 + DomU 1024 + DomA 2560; `4g` drops bank2 and shrinks DomD (the per-lane DomD and DomA sizes are in *meta-xt-rpi4/README.md*), and DomA and DomU can no longer RUN at the same time — each fits alone, and `build.sh` says so |
 | `-u`, `--domu` (`ENABLE_DOMU`) | **off** | Adds the AGL instrument-cluster DomU: Xen-aware kernel `linux-virtio-armv8` (p1) + AGL rootfs (p3). V4H-aligned minimal domu layer set (kernel via moulin; AGL rootfs via `build.sh`'s AGL bitbake) |
 | `-a`, `--android` (`ENABLE_ANDROID`) | **off** | Include DomA (AAOS, p4 nested GPT). Alias for `--aaos=auto` — the mode chooses how DomA is produced |
 | `-z`, `--domz` (`ENABLE_DOMZ`) | **off** | Adds DomZ, the Zephyr RTOS domain: Zephyr built for its own Xen-guest board (`xenvm`, GICv2, Xen PV console) out of a second west workspace, staged on p1 as `zephyr-domz.bin` and started by the xl toolstack from `/etc/xen/domz.cfg`. 16 MiB / 1 vCPU, no rootfs and **no new partition**, so the p2/p3/p4 layout is unchanged. Console: `xl console DomZ`. See [`meta-xt-domz/README.md`](meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md) |
 | `--domains-only` (`NINJA_TARGET=""`) | off | Build the domains but skip SD-image assembly |
+| `--gpu=<stack>` (`GPU`) | **vulkan** | Which graphics stack the guests get. **`vulkan`** (default): DomA and DomU render with Vulkan through Venus — device model qemu 10.0.2-xt, virglrenderer's venus backend plus `render-server`/`minigbm_allocation`, `hostmem=256M,blob=true,venus=true` on the guests' `virtio-gpu-gl`, the Vulkan runtime in the DomD and DomU rootfs, DomA compositing with SkiaVk and the DomU cluster on the Vulkan (Impeller) embedder. On the rpi4 4g SKU it also moves memory from DomA to DomD (sizes in *meta-xt-rpi4/README.md*), because a host-visible blob window is unreclaimable device-model memory. **`gl`**: the pre-Venus OpenGL stack — qemu 7.0.0-xt with its six device-model patches, no venus backend, no blob window, the pre-Venus memory split (rpi4 4g SKU only). Two things it does **not** revert: DomD's mesa is 26.2.2 in both lanes (the pin is a v3dv fix both lanes use), and DomA's AOSP-side settings (the Venus ICD and SkiaVk compositing), which this tree applies whatever `--gpu` says, so a pre-Venus DomA needs them reverted. [`docs/VULKAN-VENUS.md`](docs/VULKAN-VENUS.md) has the authoritative per-lane table |
+| `--devel` (`ENABLE_DEVEL`) | **off** | Add `meta-rpi-sodev-devel` to the DomD build: the Venus phase 0–3 gate (`sodev-venus-gate.sh`), the three Vulkan reproducers, the VRAM/CMA tools, and the **diagnostic** virglrenderer and Xen patches (command-stream dump with a live sanity assert, a log line per guest allocation ≥ 64 MiB, and Xen's injected-abort paths made loud on a release hypervisor). Diagnostics only — never part of a shipping image |
 | `--aaos=<mode>` (`AAOS_MODE`) | off (`-a`⇒auto) | `off` \| `auto` \| `source` \| `prebuilt`. **auto** = prebuilt if a bundle is found (default probe `<workspace>/aaos-prebuilt-<board>`, then `<workspace>/aaos-prebuilt`), else source if an AOSP checkout is found, else off (or a hard error when DomA was required via `-a`) |
 | `--aaos-prebuilt=<dir>` (`AAOS_PREBUILT_DIR`) | `<ws>/aaos-prebuilt-<board>`, then `<ws>/aaos-prebuilt` | Prebuilt AAOS bundle (`files/` + `images/` + `BUNDLE-INFO`, plus an optional `MANIFEST.md5`); consumed by `prebuilt`/`auto`. **Skips the AOSP source build entirely.** See *AAOS build modes* |
 | (`AAOS_PREBUILT_ASSUME_BOARD`) | — | Accept a prebuilt bundle that has **no** `BUNDLE-INFO`, asserting -- unverified -- that it was built by this tree for this `--board`. A bundle without `BUNDLE-INFO` is otherwise refused; add the file instead (`board=`, `device=`, `android=`, `guest_kernel=`) |
@@ -241,12 +248,12 @@ Moved to [`docs/DESIGN.md`](docs/DESIGN.md) — the 16 GB and 8 GB memory maps, 
 | Component | Version |
 |---|---|
 | Yocto / OpenEmbedded | Wrynose 6.0 LTS (bitbake 2.18, oe-core `wrynose`, meta-raspberrypi master @6d81e22c) |
-| Hypervisor | **Xen 4.22.0 — interim local `xen_4.22.bb`** (meta-virtualization master at `526c9725` stops at 4.21; the copy lives in `meta-xt-common/meta-xt-domx` so both board products see it, and is to be submitted upstream and deleted once accepted) + an ordered patch series in the shared `recipes-extended/xen-common` recipe (30 `.patch` files, required by both Dom0 flavours' Xen bbappends) plus the `0025` dom0less static-mem xenstore-page patch, which each board layer carries a copy of and both apply. Which of them a board applies, and in what order, is listed in its own `xen_4.22.bbappend`: the rpi4 one leaves out `4.22-0002`, which routes the BCM2712 MIP MSI that board has no equivalent of, and gives the reasoning. Of the 30, **6 are authored here** (`4.22-000{1..6}`), **1 is a backport** from upstream Xen (`4.22-0013`, the SMCCC argument fix of stable-4.22 `781b60f951`, which keeps its original author and carries `Upstream-Status: Backport`), and **23 come from the xen-troops fork** — 14 carried verbatim and 9 (`0004`, `0008`, `0010`, `0013`, `0016`, `0018`, `0019`, `0022`, `0024`) with local modifications declared on a `Local-Modifications:` line. Moving 4.21 → 4.22 left 25 of the 29 it carried then untouched: `0008`/`0018` were regenerated against stable-4.22 (context drift only, emitted code identical) and `0022`/`4.22-0001` were rebased, each recording it on its `Local-Modifications:` line. The fork-derived patches keep their original authors and carry `Upstream-Status: Inappropriate` with an `Origin:` line naming the fork commit, because xen-troops is a downstream fork and not the upstream of Xen. The six authored here are build-verified (compile+link clean on arm64 Xen 4.22.0); three carry `Upstream-Status: Pending` (`0002`, `0005`, `0006` -- `0006` is the 4.22 dom0less phandle regression fix this series exists on top of, measured on hardware) and three carry `Upstream-Status: Inappropriate` because they are deliberately downstream: `0001` is the RPi5/BCM2712 working delta, `0003` reverts upstream hardening `2fbd7e609e` to re-permit bufioreq on Arm for this virtio-heavy configuration -- a security relaxation for the demo, not for upstream -- and `0004` locks a field that only the fork's legacy-PCI series (`0013`/`0019`) creates, so it cannot be submitted as-is |
+| Hypervisor | **Xen 4.22.0 — interim local `xen_4.22.bb`** (meta-virtualization master at `526c9725` stops at 4.21; the copy lives in `meta-xt-common/meta-xt-domx` so both board products see it, and is to be submitted upstream and deleted once accepted) + an ordered patch series in the shared `recipes-extended/xen-common` recipe (32 `.patch` files, required by both Dom0 flavours' Xen bbappends) plus the `0025` dom0less static-mem xenstore-page patch, which each board layer carries a copy of and both apply. Which of them a board applies, and in what order, is listed in its own `xen_4.22.bbappend`: the rpi4 one leaves out `4.22-0002`, which routes the BCM2712 MIP MSI that board has no equivalent of, and gives the reasoning. Of the 32, **8 are authored here** (`4.22-000{1..8}`), **1 is a backport** from upstream Xen (`4.22-0013`, the SMCCC argument fix of stable-4.22 `781b60f951`, which keeps its original author and carries `Upstream-Status: Backport`), and **23 come from the xen-troops fork** — 14 carried verbatim and 9 (`0004`, `0008`, `0010`, `0013`, `0016`, `0018`, `0019`, `0022`, `0024`) with local modifications declared on a `Local-Modifications:` line. Moving 4.21 → 4.22 left 25 of the 29 it carried then untouched: `0008`/`0018` were regenerated against stable-4.22 (context drift only, emitted code identical) and `0022`/`4.22-0001` were rebased, each recording it on its `Local-Modifications:` line. The fork-derived patches keep their original authors and carry `Upstream-Status: Inappropriate` with an `Origin:` line naming the fork commit, because xen-troops is a downstream fork and not the upstream of Xen. The six `4.22-000{1..6}` are build-verified (compile+link clean on arm64 Xen 4.22.0); three carry `Upstream-Status: Pending` (`0002`, `0005`, `0006` -- `0006` is the 4.22 dom0less phandle regression fix this series exists on top of, measured on hardware) and three carry `Upstream-Status: Inappropriate` because they are deliberately downstream: `0001` is the RPi5/BCM2712 working delta, `0003` reverts upstream hardening `2fbd7e609e` to re-permit bufioreq on Arm for this virtio-heavy configuration -- a security relaxation for the demo, not for upstream -- and `0004` locks a field that only the fork's legacy-PCI series (`0013`/`0019`) creates, so it cannot be submitted as-is. `0007` and `0008`, which only the Vulkan lane applies, carry `Upstream-Status: Inappropriate` as well: `0007` lets a device model share its own memory into its guest, which upstream would want behind an XSM hook of its own, and `0008` moves the guest's virtio-pci prefetch window, and the guest memory map is ABI |
 | Virtualization layer | **meta-virtualization, pinned** (`781735b9`) — fetched by moulin at build time, not vendored. It supplies `xen.inc`/`xen-hypervisor.inc`/`xen-tools.inc` but **not** a 4.22 version recipe, so `xen_4.22.bb` / `xen-tools_4.22.bb` (PV `4.22.0+stable` / `4.22+stable`, xenbits `stable-4.22` @ `d45d5687f1`) are carried locally in `meta-xt-common/meta-xt-domx` and selected via `PREFERRED_VERSION_xen` / `PREFERRED_VERSION_xen-tools`. Both are interim, pending upstream acceptance |
 | Dom0 (zephyr) | Zephyr xenstore server (patch series under `meta-rpi-sodev/meta-xt-common/meta-xt-dom0-zephyr/`, applied on the upstream Zephyr Dom0 tree) |
 | Dom0 (linux) / DomD kernel | Linux 6.18.33 (`linux-raspberrypi`) |
-| DomD graphics | Mesa 26.0.5, weston 15.0.0 (kiosk-shell), libdrm 2.4.131 |
-| DomD device-model | QEMU 7.0.0 (Xen IOREQ, virtio-gpu-gl, vhost-net/-vsock) |
+| DomD graphics | Mesa 26.2.2 (pinned ahead of wrynose's 26.0.5 by `meta-xt-driver-domain`'s `mesa.bbappend`, in both `--gpu` lanes), weston 15.0.0 (kiosk-shell), libdrm 2.4.131 |
+| DomD device-model | QEMU 10.0.2-xt (`--gpu=vulkan`, the default) or 7.0.0-xt (`--gpu=gl`); Xen IOREQ, virtio-gpu-gl, vhost-net/-vsock |
 | DomU guest | AGL SoDeV instrument cluster (`agl-cluster-demo-flutter-guest`, kernel 6.8.0-rc1 — historically aligned with the V4H AGL SoDeV DomU kernel: torvalds linux `6613476e` + the single Xen backend-domid patch, plus the RPi5-specific `xen-force-grant.cfg`; the current V4H submodule has since moved to a 6.12-series DomU kernel; MACHINE virtio-aarch64) |
 | DomA guest | AAOS (`aosp_xenvm_trout_rpi5_arm64` / `aosp_xenvm_trout_rpi4_arm64`), Xen virtio (CONFIG_XEN / XEN_VIRTIO). The virtio contract is the V4H one: a complete V4H-built AAOS image (kernel, ramdisk and p4 from one build) boots unmodified -- measured in 2026-07 with a V4H Android 17 image on this stack while it was still Android 15. `build.sh` nevertheless accepts only prebuilt bundles that declare this tree's own generation (Android 17 / GKI 6.18.32, `BUNDLE-INFO`): the failure it guards against is a *mixed* set, a guest kernel and a `vendor_dlkm` from different builds, which share no `module_layout` and boot to a black panel |
 | DomZ guest | Zephyr 4.4.1 (the same manifest and pins as Dom0 — its own west workspace, brought to 4.4.1 by `apply-zephyr-patches.sh --manifest-only`), board `xenvm` (GICv2, Xen PV console), Zephyr SDK 1.0.1 / `aarch64-zephyr-elf`. Application in [`meta-xt-domz/zephyr-apps/domz/`](meta-rpi-sodev/meta-xt-common/meta-xt-domz/README.md) |
@@ -277,10 +284,14 @@ See also:
 │   │   │                            #   Zephyr application (zephyr-apps/domz/), plus its README
 │   │   ├── meta-xt-doma/            # DomA xl cfg + AAOS host services + guest binaries
 │   │   ├── meta-xt-domx/            # shared cross-guest recipes (libc-headers, base-files, ...)
-│   │   ├── meta-xt-{qemu,security}/ # vendored upstream
+│   │   ├── meta-xt-qemu/            # vendored upstream, plus this tree's qemu_10.0.2.bb
+│   │   │                            #   (the Vulkan lane's device model) and its patches
+│   │   ├── meta-xt-security/        # vendored upstream
 │   │   └── recipes-extended/xen-common/   # shared Xen 4.22 hypervisor patch series (both Dom0 flavours)
 │   ├── meta-xt-rpi5/                # RPi5 BSP: u-boot/TFA/boot.scr, Xen 4.22 bbappend + patch series, xen dtso, kernel DT/cfg
 │   ├── meta-xt-rpi4/                # RPi4 BSP, the sibling of the above (BCM2711). Mutually exclusive with it
+│   ├── meta-agl-venus/              # the AGL guest's layer for the Vulkan lane (AGL build only):
+│   │                                #   its Mesa 24.0.7 patches and the Vulkan (Impeller) cluster
 │   ├── xt-prod-devel-rpi5-domd/     # vendored upstream DomD product layer
 │   ├── meta-rpi-sodev-devel/        # opt-in diagnostic/debug/prototype layer (NOT in the shipping build; p4-tool etc.)
 │   └── scripts/                     # helpers: guest-pin sync (sync-guest-pins)
@@ -290,6 +301,9 @@ See also:
     │                            meta-rpi-sodev/scripts/ (which is layer-scoped). No
     │                            recipe references them; they are developer/CI tools.
     ├── check-memory-map.py         # DomD static-mem + Dom0 bank[0] placement, both --ram values
+    ├── check-rpi4-memory-map.py    # the same for the RPi4, per --ram and --gpu lane: static-mem
+    │                               #   banks, boot-script overrides and domain sizes against the
+    │                               #   files that define them
     ├── check-yaml-drift.py         # the two product yamls share ~750 lines by copy; fails on
     │                                   unrecorded divergence (yaml-drift-baseline.txt records the
     │                                   differences that are there by design)

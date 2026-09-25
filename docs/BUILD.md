@@ -3,7 +3,8 @@
 > **Documentation map** — [`README.md`](../README.md) build and run |
 > [`docs/BUILD.md`](BUILD.md) build details |
 > [`docs/DESIGN.md`](DESIGN.md) why the tree looks like this |
-> [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md) when it does not work
+> [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md) when it does not work |
+> [`docs/VULKAN-VENUS.md`](VULKAN-VENUS.md) Vulkan in the guests
 
 This file carries the build detail that [`README.md`](../README.md)'s *Quick start*
 leaves out: a first build walked through end to end, the container the build runs in,
@@ -347,15 +348,15 @@ failures each have an entry in [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 `build.sh` names the image after the configuration that produced it and points
 `full.img` at the newest one:
 
-    <board>-<SKU>-Dom0<Zephyr|Linux>[-DomU][-DomA][-DomZ]-<YYYYmmdd-HHMM>.img
+    <board>-<SKU>-Dom0<Zephyr|Linux>[-DomU]-<Venus|GL>[-DomA][-DomZ]-<YYYYmmdd-HHMM>.img
 
-so `rpi4-4GB-Dom0Zephyr-DomA-20260809-1750.img` is a 4 GiB Raspberry Pi 4 image
-with a Zephyr Dom0 and DomA (no DomU -- on this SKU that pair is refused, see
-BOARD_RAM), built at 17:50 local time. A
-guest that was not built leaves its token out, so the name says what is on the
-card rather than what was asked for. The point is that a second build does not
-overwrite the first, and an image found later can still be identified — nothing
-inside a 27 GB file says which board or SKU it was assembled for.
+so `rpi4-4GB-Dom0Zephyr-Venus-DomA-20260809-1750.img` is a 4 GiB Raspberry Pi 4
+image with a Zephyr Dom0, the default Vulkan (Venus) graphics stack and DomA (no
+DomU -- on this SKU that pair is refused, see BOARD_RAM), built at 17:50 local
+time. A guest that was not built leaves its token out, so the name says what is
+on the card rather than what was asked for. The point is that a second build
+does not overwrite the first, and an image found later can still be identified —
+nothing inside a 27 GB file says which board or SKU it was assembled for.
 
 To judge a rebuild against an image that is known to boot — before spending an
 SD write and a board on it — see `tools/compare-sd-image.py`; its module
@@ -562,7 +563,7 @@ pip install git+https://github.com/xen-troops/moulin.git@83e80587c4b1348714237d3
 ```
 
 This project provides additional parameters; check them with `--help-config`. There is one
-yaml per board -- `rpi5-sodev.yaml` and `rpi4-sodev.yaml` -- and they take the same six
+yaml per board -- `rpi5-sodev.yaml` and `rpi4-sodev.yaml` -- and they take the same eight
 parameters, differing only in the SKUs `--BOARD_RAM` accepts:
 
 ```
@@ -571,7 +572,8 @@ usage: moulin rpi5-sodev.yaml [--DOM0_OS {zephyr,linux}]
                               [--BOARD_RAM {16g,8g}] [--ENABLE_DOMU {no,yes}]
                               [--ENABLE_DOMU_RESERVED {no,yes}]
                               [--ENABLE_ANDROID {no,yes}]
-                              [--ENABLE_DOMZ {no,yes}]
+                              [--ENABLE_DOMZ {no,yes}] [--GPU {gl,vulkan}]
+                              [--ENABLE_DEVEL {no,yes}]
 
 Config file description: Raspberry Pi 5 + Xen 4.22 — AGL SoDeV disaggregated
 cockpit (Zephyr or thin-Linux Dom0)
@@ -601,6 +603,18 @@ options:
                         Build DomZ (Zephyr as an unprivileged DomU) and add it
                         to the SD image (p1 zephyr-domz.bin + the DomZ xl
                         cfg). yaml default no; build.sh adds it with --domz.
+                        (default: no)
+  --GPU {gl,vulkan}     Which graphics stack the guests get. vulkan (default):
+                        Venus (guest Vulkan over virtio-gpu) for DomA and DomU
+                        -- qemu 10.0.2-xt, virglrenderer's venus backend, the
+                        DomD/DomU Vulkan runtime and venus=true device-model
+                        options. gl: the pre-Venus OpenGL stack on qemu
+                        7.0.0-xt. See docs/VULKAN-VENUS.md. (default: vulkan)
+  --ENABLE_DEVEL {no,yes}
+                        Add meta-rpi-sodev-devel to the DomD build: the Venus
+                        phase 0-3 gate, the Vulkan reproducers, the VRAM tools
+                        and the diagnostic virglrenderer/Xen patches.
+                        Diagnostics only -- never part of a shipping image.
                         (default: no)
 ```
 

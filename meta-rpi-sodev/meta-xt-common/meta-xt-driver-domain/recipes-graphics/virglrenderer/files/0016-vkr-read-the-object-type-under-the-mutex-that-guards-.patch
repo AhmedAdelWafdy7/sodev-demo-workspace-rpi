@@ -1,0 +1,64 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 13 Sep 2026 17:34:18 +0900
+Subject: [PATCH] vkr: read the object type under the mutex that guards object
+ destroy
+
+vkr_cs_decoder_lookup_object() releases dec->object_mutex and only then reads
+obj->type:
+
+    mtx_lock(dec->object_mutex);
+    const struct hash_entry *entry = _mesa_hash_table_search(..., &id);
+    obj = likely(entry) ? entry->data : NULL;
+    mtx_unlock(dec->object_mutex);
+    if (unlikely(!obj || obj->type != type)) {
+
+vkr_context_free_object() runs under that same mutex, and with more than one
+ring each ring has its own dispatch thread (vkr_ring.c:344 -> :263 -> :301), so
+the type read races a concurrent destroy of the very object just looked up. The
+type is what decides whether the command is rejected as a fatal stream error, so
+a torn read here turns a healthy command into a dead context.
+
+Move the comparison inside the critical section and keep only the logging tail
+outside it.
+
+This narrows the window rather than closing it: the caller goes on to use obj
+for the rest of the command with no lock held, which cannot be fixed without
+refcounting objects and is out of scope for a patch this size.
+
+Found while investigating DomA's SurfaceFlinger Venus context dying with
+"object 122 has type 19, not 9" on RPi4. It is NOT established that this is that
+defect's cause -- under VN_PERF=no_multi_ring there is only one dispatch thread
+and the failure still occurs, and the secondary rings that multi-ring adds carry
+only vkCreatePipelines/vkGetPipelineCacheData (Mesa's vn_pipeline.c:458-481), so
+nothing on them destroys a buffer or an image. Fixed because the code is wrong
+on its own terms, not because it closes the case.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/src/venus/vkr_cs.h
++++ b/src/venus/vkr_cs.h
+@@ -357,10 +357,20 @@
+    const struct hash_entry *entry =
+       _mesa_hash_table_search((struct hash_table *)dec->object_table, &id);
+    obj = likely(entry) ? entry->data : NULL;
++   /* obj->type has to be read under the same lock vkr_context_free_object() is
++    * called under; releasing first leaves both the type read and the pointer
++    * handed back to the caller racing an object destroy on another ring
++    * thread. Only the logging tail is kept outside the critical section.
++    *
++    * This narrows the window rather than closing it: the caller still uses obj
++    * after the unlock, which cannot be fixed without refcounting objects.
++    */
++   const bool bad = unlikely(!obj || obj->type != type);
++   const VkObjectType got = obj ? obj->type : VK_OBJECT_TYPE_UNKNOWN;
+    mtx_unlock(dec->object_mutex);
+-   if (unlikely(!obj || obj->type != type)) {
++   if (bad) {
+       if (obj)
+-         vkr_log("object %" PRIu64 " has type %d, not %d", id, obj->type, type);
++         vkr_log("object %" PRIu64 " has type %d, not %d", id, got, type);
+       else
+          vkr_log("failed to look up object %" PRIu64 " of type %d", id, type);
+       vkr_cs_decoder_set_fatal(dec);

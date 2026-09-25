@@ -1,0 +1,81 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 06 Sep 2026 01:11:44 +0900
+Subject: [PATCH] vrend: initialise GBM for an external EGLDisplay only on request
+
+virgl_gbm_init(-1) opens the first usable /dev/dri/renderD* and makes it the
+global gbm device. Whether that helps or hurts depends on the guest, so it
+cannot be decided at build time:
+
+ - An AAOS guest compositing with SkiaVk needs it. Without a gbm device
+   vrend_pipe_resource_export_fd() returns VIRGL_RESOURCE_FD_INVALID, the
+   render-server proxy aborts the attach silently, and the venus context never
+   learns the resource -- vkGetMemoryResourcePropertiesMESA fails with
+   "invalid res_id" and the compositor dies a few seconds after reporting that
+   its Vulkan renderer came up.
+ - An AGL/weston guest on the same host does not, and the extra device costs a
+   second open of the render node per device model.
+
+So gate it on VIRGL_EXTERNAL_GBM in the environment, which the device model
+sets per guest through the libxl qemu_envs list. Default off keeps the
+behaviour of an unpatched build for anyone who does not set it, and the test is
+"set and not 0" rather than "set", so VIRGL_EXTERNAL_GBM=0 disables it as a
+reader would expect.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [the switch is a private environment variable;
+ upstream would want it expressed in the renderer API or the context flags]
+---
+--- a/src/vrend/vrend_winsys_egl.c
++++ b/src/vrend/vrend_winsys_egl.c
+@@ -605,8 +605,48 @@ struct virgl_egl *virgl_egl_init_external(EGLDisplay egl_display)
+       goto fail;
+ 
+ #ifdef ENABLE_GBM
+-   gbm = virgl_gbm_init(-1);
+-   egl->gbm = gbm;
++   /* Initialise the global gbm only when the device model asks for it.
++    *
++    * This assignment is load-bearing in two opposite directions, and which one matters
++    * depends on the guest, so it cannot be decided at build time:
++    *
++    *  * A non-NULL global gbm removes the early return in vrend_resource_gbm_init()
++    *    (vrend_renderer.c), so every VIRGL_BIND_SHARED guest resource is backed by a GBM
++    *    buffer object. Only such a resource can be exported as a dma-buf by
++    *    vrend_pipe_resource_export_fd(), and that export is what lets a venus context
++    *    import a guest gralloc buffer. An Android guest compositing with Vulkan needs it:
++    *    without it every vkGetMemoryResourcePropertiesMESA fails with a CS error and the
++    *    guest's Venus aborts in vn_relax waiting for the reply.
++    *
++    *  * On V3D, GBM allocation is forced linear, which loses UIF tiling. Measured on this
++    *    board with the AGL instrument cluster on GL: 60.0 fps / 0.32 host cores / 81.2 %
++    *    GPU with gbm NULL, against 29.0 / 0.52 / 42.9 % with gbm initialised. A GL guest
++    *    pays half its frame rate for a feature it never uses.
++    *
++    * The device models are separate processes, so an environment variable lets each guest
++    * choose: DomA's qemu_envs sets VIRGL_EXTERNAL_GBM=1 and gets Vulkan compositing, DomU
++    * leaves it unset and keeps 60 fps. Default off = the behaviour a GL guest wants.
++    *
++    * The permanent fix is upstream -- virglrenderer MR 1654 allocates GBM buffers with
++    * a tiled modifier chosen through Vulkan, which removes the linear penalty and with
++    * it the reason for this switch -- but it is NOT carried here (MR 1654, 652e8d8b,
++    * is in no release tag, and it needs a paired guest change to be correct; see the
++    * recipe's tiled-GBM section). Until then the guest that pays the penalty, DomU, is
++    * deliberately run with gbm unset: that is the configuration whose 60 fps was
++    * measured.
++    *
++    * "Set and not 0", not merely "set": the obvious getenv() != NULL test would make
++    * VIRGL_EXTERNAL_GBM=0 turn the feature ON, which is the opposite of what anyone
++    * writing that would mean.
++    */
++   {
++      const char *want_gbm = getenv("VIRGL_EXTERNAL_GBM");
++
++      if (want_gbm && want_gbm[0] && strcmp(want_gbm, "0")) {
++         gbm = virgl_gbm_init(-1);
++         egl->gbm = gbm;
++      }
++   }
+ #endif
+ 
+    virgl_egl_win32_init(egl);

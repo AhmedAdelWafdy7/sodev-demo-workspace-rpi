@@ -1,0 +1,125 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 12 Sep 2026 20:28:20 +0900
+Subject: [PATCH] vkr: let VKR_DEVICE_HEAP_MIB force the advertised device-local
+ heap size
+
+On a shared-memory guest the device-local heap vkr advertises is a fiction that
+the guest's allocator nevertheless sizes itself from, and on the Xen RPi4 board
+that killed the driver domain.
+
+v3dv's compute_heap_size() reports a percentage of the host's *system* RAM as
+device-local VRAM (645 MiB on a 1408 MiB DomD) and vkr forwards it verbatim.
+The AAOS guest's Skia VMA then takes heapSize/8 as its block size, because any
+heap of 1 GiB or less is a "small heap" to it (VMA_SMALL_HEAP_MAX_SIZE), and
+only above that does it use the 4 MiB preferredLargeHeapBlockSize Skia
+configures (external/skia VulkanAMDMemoryAllocator.cpp). Every one of those
+blocks is a fully populated v3d BO in DomD, so DomD pays for the block and not
+for what the guest uses of it: HWUI RenderThreads took such blocks by the
+handful -- 96 MiB each, ~600 MiB per app, with DomD at 1664 MiB (named by a
+diagnostic log of allocations >= 64 MiB) --
+DomD went into a memory-reclaim livelock with both vCPUs in shrink_node /
+__buffer_migrate_folio, qemu could no longer service the guest's ioreqs, and
+the guest soft-locked on its virtio-gpu doorbell write until its watchdog killed
+system_server. Raising DomD from 1408 to 1664 MiB grew the per-app burst from
+~400 to ~600 MiB, which is what tied the burst to the advertised heap.
+
+Clamping the advertised heap does not fix this, and that was measured too: at
+512 MiB the guest is still below VMA_SMALL_HEAP_MAX_SIZE and simply used 64 MiB
+blocks instead -- one RenderThread context took five in a row and DomD
+livelocked again on the screen-transition benchmark. What bounds the guest is
+advertising a heap ABOVE the threshold, which puts it on the path a desktop GPU
+gets: 4 MiB blocks for small things and dedicated allocations of the real size
+for images.
+
+VKR_DEVICE_HEAP_MIB therefore forces the advertised device-local heap size to
+exactly the given value (the Xen device model sets 1088 through doma.cfg
+qemu_envs, the smallest round value above 1 GiB). It is inert when the env is
+unset, so upstream and non-Xen users are unaffected, and it is ignored with a log
+line for anything outside 1..65536. The size is a hint to the guest's allocator;
+v3dv never enforces heap sizes. The override rewrites the cached properties, so a
+vkGetPhysicalDeviceMemoryProperties2 query that chains
+VkPhysicalDeviceMemoryBudgetPropertiesEXT still sees v3dv's own numbers.
+
+With it, the cold-start stress, the screen-transition benchmarks and a ten-cycle
+soak all pass with no guest allocation of 64 MiB or more and DomD MemAvailable
+never below ~460 MiB.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -3,6 +3,9 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <errno.h>
++#include <inttypes.h>
++#include <stdlib.h>
+ #include "vkr_physical_device.h"
+ 
+ #include "venus-protocol/vn_protocol_renderer_device.h"
+@@ -171,6 +174,62 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
+    VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
+    vk->GetPhysicalDeviceMemoryProperties(handle, &physical_dev->memory_properties);
+ 
++   /*
++    * On a shared-memory guest (Xen DomA on RPi4) v3dv reports a device-local heap
++    * sized as a percentage of DomD's system RAM (v3dv compute_heap_size(): 645 MiB
++    * on a 1408 MiB DomD) and vkr forwards that number to the guest. None of that
++    * "VRAM" is real -- it is DomD's memory -- and the guest's allocator sizes itself
++    * from the number: Skia's VMA (HWUI and SurfaceFlinger) takes heapSize/8 as its
++    * block size for any heap of 1 GiB or less (VMA_SMALL_HEAP_MAX_SIZE), and every
++    * block here is a fully populated v3d BO in DomD. Measured on RPi4 2026-09-12:
++    * HWUI RenderThreads took 96 MiB blocks by the handful (~600 MiB per app), DomD
++    * went into a memory-reclaim livelock with both vCPUs in shrink_node, the device
++    * model could then no longer service ioreqs and the guest soft-locked.
++    *
++    * Clamping the heap does not fix that: at 512 MiB the guest is still below
++    * VMA_SMALL_HEAP_MAX_SIZE and simply used 64 MiB blocks instead (DomD livelocked
++    * again on the screen-transition benchmark). What bounds the guest is advertising
++    * a heap ABOVE the threshold, which makes VMA switch to the 4 MiB
++    * preferredLargeHeapBlockSize Skia configures and turn large images into
++    * dedicated allocations of their real size.
++    *
++    * VKR_DEVICE_HEAP_MIB forces the advertised device-local heap to exactly its
++    * value, whatever the driver reports; the Xen device model sets 1088 through
++    * doma.cfg qemu_envs, the smallest round value above 1 GiB. Inert when the env is
++    * unset, so upstream and non-Xen users are unaffected. The size is a hint to the
++    * guest's allocator; v3dv never enforces heap sizes.
++    *
++    * Scope: EVERY heap with VK_MEMORY_HEAP_DEVICE_LOCAL_BIT is forced to the same
++    * value (v3dv advertises one). The write lands in the cached properties, which is
++    * what vkGetPhysicalDeviceMemoryProperties and a pNext-less
++    * vkGetPhysicalDeviceMemoryProperties2 return; a query that chains
++    * VkPhysicalDeviceMemoryBudgetPropertiesEXT is forwarded straight to the driver and
++    * therefore still sees v3dv's own heap size and budget.
++    */
++   {
++      const char *heap_env = getenv("VKR_DEVICE_HEAP_MIB");
++      if (heap_env && heap_env[0]) {
++         char *end = NULL;
++         errno = 0;
++         unsigned long long mib = strtoull(heap_env, &end, 10);
++         if (errno || *end || mib == 0 || mib > 65536) {
++            vkr_log("ignoring VKR_DEVICE_HEAP_MIB=%s (expected 1..65536)", heap_env);
++         } else {
++            const uint64_t forced = (uint64_t)mib << 20;
++            VkPhysicalDeviceMemoryProperties *mp = &physical_dev->memory_properties;
++            for (uint32_t i = 0; i < mp->memoryHeapCount; i++) {
++               if ((mp->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
++                   mp->memoryHeaps[i].size != forced) {
++                  vkr_log("overriding device-local heap %u from %" PRIu64 " MiB to %" PRIu64 " MiB",
++                          i, (uint64_t)(mp->memoryHeaps[i].size >> 20),
++                          (uint64_t)(forced >> 20));
++                  mp->memoryHeaps[i].size = forced;
++               }
++            }
++         }
++      }
++   }
++
+    /* XXX When a VkMemoryType has VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, we
+     * assume any VkDeviceMemory with the memory type can be made external and
+     * be exportable.  That is incorrect but is what we have to live with with

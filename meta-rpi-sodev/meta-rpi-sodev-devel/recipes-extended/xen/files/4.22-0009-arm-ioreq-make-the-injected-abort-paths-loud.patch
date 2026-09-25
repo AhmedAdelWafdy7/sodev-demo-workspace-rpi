@@ -1,0 +1,96 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 13 Sep 2026 17:36:40 +0900
+Subject: [PATCH] arm/ioreq: make the paths that inject a guest abort loud on a
+ release hypervisor
+
+DomA (AAOS) on RPi4 dies repeatedly with ESR 0x96000000 (ISS=0) on a
+virtio-pci ISR/notify page whose ioreq range qemu provably registered and
+never unregistered (qemu -trace xen_*_mmio_range). That ESR is exactly what
+inject_abt64_exception synthesises, and every diagnostic on the way there --
+try_fwd_ioserv's "wrong state", the inject_abt "HSR=... gpa=..." line -- is a
+gdprintk, which is an empty inline under NDEBUG. Hours of lossless
+`xl dmesg -c` capture with loglvl=all guest_loglvl=all therefore contained
+nothing, and the guest itself only ever sees ISS=0.
+
+Promote those two prints to gprintk(XENLOG_ERR), and add two more: when
+ioreq_server_select() finds no server for the access, and when it skips a
+server because the device model has disabled it (qemu does that on every
+vm_stop). The disabled-server print comes before the range check, so it
+fires on every access that reaches ioreq_server_select() while a server
+is disabled: once per fatal access with a single server, and also for
+accesses another server handles when there are several. The other three
+fire at most once per fatal guest access. Diagnostic only; drop once the
+cause is fixed.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [debugging aid]
+---
+--- a/xen/arch/arm/ioreq.c
++++ b/xen/arch/arm/ioreq.c
+@@ -68,7 +68,14 @@
+ 
+     if ( vio->req.state != STATE_IOREQ_NONE )
+     {
+-        gdprintk(XENLOG_ERR, "wrong state %u\n", vio->req.state);
++        /*
++         * Loud on purpose: this and the two prints below are the only
++         * evidence a release (debug=n) hypervisor can give for WHY a guest
++         * MMIO access ended as an injected abort. gdprintk compiles to
++         * nothing under NDEBUG, and the guest only ever sees ESR ISS=0.
++         */
++        gprintk(XENLOG_ERR, "ioreq: wrong state %u for gpa %#"PRIpaddr"\n",
++                vio->req.state, info->gpa);
+         return IO_ABORT;
+     }
+ 
+@@ -79,7 +86,12 @@
+ 
+     s = ioreq_server_select(v->domain, &p);
+     if ( !s )
++    {
++        gprintk(XENLOG_ERR,
++                "ioreq: no server claims gpa %#"PRIpaddr" size %u (%s)\n",
++                info->gpa, p.size, info->dabt.write ? "write" : "read");
+         return IO_UNHANDLED;
++    }
+ 
+     /*
+      * When the data abort is caused due to cache maintenance and the address
+--- a/xen/arch/arm/traps.c
++++ b/xen/arch/arm/traps.c
+@@ -1958,9 +1958,10 @@
+     }
+ 
+ inject_abt:
+-    gdprintk(XENLOG_DEBUG,
+-             "HSR=%#"PRIregister" pc=%#"PRIregister" gva=%#"PRIvaddr" gpa=%#"PRIpaddr"\n",
+-             hsr.bits, regs->pc, gva, gpa);
++    /* Loud on purpose, see try_fwd_ioserv(): the guest cannot tell us why. */
++    gprintk(XENLOG_ERR,
++            "injecting abort: HSR=%#"PRIregister" pc=%#"PRIregister" gva=%#"PRIvaddr" gpa=%#"PRIpaddr" fsc=%#x\n",
++            hsr.bits, regs->pc, gva, gpa, xabt.fsc);
+     if ( is_data )
+         inject_dabt_exception(regs, gva);
+     else
+--- a/xen/common/ioreq.c
++++ b/xen/common/ioreq.c
+@@ -1110,7 +1110,18 @@
+         struct rangeset *r;
+ 
+         if ( !s->enabled )
++        {
++            /*
++             * A device model disables its server on every vm_stop (qemu:
++             * xen_hvm_change_state_handler). While it is disabled every
++             * emulated MMIO access of the guest becomes an injected abort,
++             * so say so -- once per access is fine, the guest dies on the
++             * first one anyway.
++             */
++            gprintk(XENLOG_ERR, "ioreq: server %u is disabled (addr %#lx)\n",
++                    id, (unsigned long)addr);
+             continue;
++        }
+ 
+         r = s->range[type];
+ 

@@ -10,3 +10,62 @@
 # libOpenGL.so.0 (libGL.so.1 needs glx/x11, not built here) which satisfies the probe,
 # and libegl-mesa ships the egl_vendor.d JSON so weston's EGL still routes to mesa V3D.
 PACKAGECONFIG:append = " glvnd"
+
+# ---------------------------------------------------------------------------
+# TEMPORARY VERSION PIN AHEAD OF POKY: mesa 26.0.5 -> 26.2.2
+#
+# Why: v3dv in 26.0.5 submits a real, fully-serialised V3D control-list job for
+# every vkQueueSubmit that signals a semaphore, purely to satisfy Vulkan's
+# signal-operation-order rules ("Finish by submitting a no-op job that
+# synchronizes across all queues"). Measured on this board, the AGL cluster on
+# Venus/Vulkan issues ONE render pass per frame but the host runs 11.1 bin jobs
+# per frame; those extra ~10 are those empty jobs. They cost almost no GPU time
+# but they cost a submit ioctl, kernel scheduling and a cross-queue barrier each.
+# See docs/VULKAN-VENUS.md section 7e.
+#
+# mesa MR !42407 ("v3dv: Re-implement noop jobs as cpu jobs", Igalia, merged
+# 2026-06-29) replaces them with CPU-side syncobj merging
+# (drmSyncobjExportSyncFile -> sync_merge -> drmSyncobjImportSyncFile) and
+# deletes queue_submit_noop_job/job_emit_noop outright. It first ships in
+# 26.2.0; it is NOT backported to 26.0.x or 26.1.x, and the MR's commits do not
+# apply to 26.0.5 (they sit on top of that cycle's v3dv queue rework), so a
+# version bump is the only way to get it. 26.2.0 also carries the required
+# follow-up d4ee4a62885 ("honor wait dependencies for job-less submissions"),
+# whose own description is this exact workload -- semaphore chaining with an
+# empty command buffer.
+#
+# Verified by hand on the 26.2.2 tarball before writing this:
+#   queue_submit_noop_job / job_emit_noop / noop_job   -> 0 hits
+#   drmSyncobjExportSyncFile / ...Import / sync_merge  -> present
+#   v3dv_queue.c:1033                                  -> the src_count == 0 fix
+#   sha256 matches docs.mesa3d.org/relnotes/26.2.2
+#
+# Revisit at the next poky upgrade: once poky's mesa is >= 26.2.0 this whole
+# block goes away. Nothing else here is version-specific -- this recipe carries
+# no source patches of its own, and the guest-side venus/virgl patches live in
+# meta-agl-venus (DomU's mesa 24.0.7) and are untouched by this pin.
+# DELIBERATELY NOT gated on the venus DISTRO_FEATURE, unlike everything else
+# this series adds. The reason is that both lanes run weston on the same V3DV,
+# and the MR this pin is for (!42407) is a v3dv submit-path fix, not a Venus
+# one -- so splitting the host GL/Vulkan driver by lane would mean shipping and
+# testing two of them for no benefit. Consequence to state plainly: `--gpu=gl`
+# is the pre-Venus device model and the pre-Venus memory map, but NOT the
+# pre-Venus mesa. The gl lane was build-verified in this configuration.
+PV = "26.2.2"
+SRC_URI[sha256sum] = "eeb29ca7e56cfaa8e8a79538dcf834e3b18e501c31bef5145e959ea437cc4216"
+
+# poky's own patches, checked against 26.2.2:
+#   0001-meson-misdetects-64bit-atomics-on-mips-clang.patch  -> still applies, kept
+#   0001-gallivm-Fix-armhf-build-against-LLVM-22.patch       -> merged upstream (reverse-applies)
+#   0001-freedreno-...-build-path-into-binaries.patch        -> context moved; it is a
+#       build-reproducibility patch for freedreno, and this target builds
+#       vulkan-drivers=broadcom,gfxstream,virtio with no freedreno/turnip, so nothing
+#       of it can end up in our binaries. Rebasing it for a driver we do not build is
+#       not worth carrying.
+#
+# The two names in the :remove below are poky's exact filenames at mesa 26.0.5. If a
+# poky upgrade renames or drops either, the :remove stops matching -- and that failure
+# is LOUD, not silent: do_patch then tries to apply a patch written for a different
+# tree and stops. So a do_patch failure in this recipe after a poky bump means "re-check
+# this block", not "the pin is broken".
+SRC_URI:remove = "file://0001-gallivm-Fix-armhf-build-against-LLVM-22.patch file://0001-freedreno-don-t-encode-build-path-into-binaries.patch"

@@ -54,6 +54,24 @@ SRC_URI:append = " \
     file://0013-irqchip-brcmstb-l2-set-up-the-generic-chip-before-ch.patch \
 "
 
+# [Venus] 0014 + venus-gntdev-dmabuf.cfg give the device model a way to learn the
+# frame numbers of a dma-buf, which is the only thing standing between a guest and
+# Vulkan through virtio-gpu/Venus: Mesa's venus backs its large mappable
+# allocations with dma-bufs, a dma-buf mapping is VM_PFNMAP so /proc/self/pagemap
+# reports nothing for it, and a window the device model cannot share into the
+# guest's physmap is withdrawn by qemu's 0116 (left emulated, the guest's client
+# would die at its first SIMD store to it on arm64), so the guest's vkMapMemory on
+# it fails. gntdev-dmabuf already builds exactly that frame-number
+# array on its import path; 0014 adds the ioctl that returns it.
+#
+# Numbered 0014, not 0013: 0013 is this bbappend's own brcmstb-l2 patch above.
+#
+# Gated on the venus DISTRO_FEATURE, so the --gpu=gl lane's kernel is untouched
+# (same idiom as the rest of the Venus lane, see docs/VULKAN-VENUS.md).
+SRC_URI:append = " ${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
+    'file://0014-xen-gntdev-return-a-dma-buf-s-frame-numbers-to-users.patch \
+     file://venus-gntdev-dmabuf.cfg', '', d)}"
+
 # rpi5-0004: V4H Xen patchset for the Dom0/DomD kernel. The base meta-xt-rpi5
 # linux-raspberrypi_6.12.bbappend (pristine) does NOT carry these; they were
 # being applied by editing the base bbappend directly. Moved here so meta-xt-rpi5

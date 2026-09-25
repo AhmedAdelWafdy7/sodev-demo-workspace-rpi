@@ -5,9 +5,16 @@ cockpit, kept **out of the shipping PR image** on a maintainer recommendation
 (same rationale as `meta-agl-devel`: development-only material is isolated so
 the delivered image tree contains only what it ships).
 
-This layer is **opt-in**. The default build (`rpi5-sodev.yaml` / `build.sh`) does
-**not** reference it, so none of the recipes below are parsed or installed unless
-you explicitly add the layer.
+This layer is **opt-in**. The default build does **not** reference it, so none of the
+recipes below are parsed or installed unless you ask for them. The supported way to ask
+is `./build.sh --devel` (moulin `--ENABLE_DEVEL yes`), which adds this layer to the
+**DomD** component's layer list.
+
+Going back is **not** automatic: moulin adds a component's layers with
+`bitbake-layers add-layer`, which only ever adds, so re-running with
+`--ENABLE_DEVEL no` leaves this layer in an existing `yocto/build-domd/conf/bblayers.conf`.
+Drop it explicitly (`bitbake-layers remove-layer .../meta-rpi-sodev-devel`) or build the
+default lane in a fresh build directory.
 
 ## Opt-in
 
@@ -63,17 +70,39 @@ configured build) is preferred over assembling it by hand.
 
 ## Contents (diagnostic / debug / prototype)
 
+Vulkan / Venus (DomD):
+- `recipes-extended/xt-venus-check` — `sodev-venus-gate.sh`, the phase 0-3 gate
+  a board bring-up is meant to run first (the 2026-09 verifications went through
+  the individual checks by hand, so it has not itself been run end to end on
+  hardware): it checks a baseline, the host V3DV requirements
+  (`VK_EXT_image_drm_format_modifier`, `/dev/udmabuf`), whether qemu's
+  `virtio-gpu-gl` has a `venus` property, and native Vulkan drawing against the
+  running compositor, and says which phase failed rather than just "no Vulkan".
+- `recipes-extended/xt-venus-diag` — the three reproducers a Venus bring-up
+  needs: `vk-fence-test` (fence feedback and a GPU fill of host-visible memory),
+  `vk-gl-import-test` (a Venus image imported into GL through a dma-buf, defect
+  B) and `vk-suballoc-probe` (where the fence write lands among suballocated
+  buffers, defect A).
+- `recipes-graphics/virglrenderer/virglrenderer_%.bbappend` — two **diagnostic**
+  virglrenderer patches: the command-stream dump with a live sanity assert (which makes
+  the render server abort on a desync instead of limping on), and a log line per guest
+  `vkAllocateMemory` of 64 MiB or more. The product layer carries neither.
+- `recipes-extended/xen/xen_4.22.bbappend` — a **diagnostic** hypervisor patch that
+  turns Xen's guest-abort injection prints from `gdprintk` into `gprintk` and adds two
+  more, so a guest dying on ESR 0x96000000 names the path it took in `xl dmesg`. A
+  shipping hypervisor is a release build, which is exactly why this lives here.
+
 Driver-domain (DomD) tools:
 - `recipes-extended/xt-vram-tools` — CMA/VRAM dump and analysis scripts, plus the
   GPU first-check and stripe-noise reproducers. Installed into the DomD rootfs by
-  this layer's `rpi5-image-xt-domd-vc4.bbappend` (see *How to use* below).
+  this layer's `rpi5-image-xt-domd-%.bbappend` (see *How to use* below).
 - `recipes-extended/xt-cluster-shm` — a cluster stand-in that renders through
   wl_shm only, for bringing a display path up without the GPU.
 - `recipes-graphics/wayland/weston-init.bbappend` — installs the alternate
   renderer weston.ini variants (`pixman`, `glrender`) and the
   `weston-simple-egl` GPU-validation service (all diagnostics-only).
-- `recipes-core/images/rpi5-image-xt-domd-vc4.bbappend` — adds `DEBUG_PACKAGES`
-  to the DomD rootfs the shipping image is built from.
+- `recipes-core/images/rpi5-image-xt-domd-%.bbappend` — adds `DEBUG_PACKAGES`
+  to every DomD image recipe, the one the shipping image is built from included.
 - `recipes-core/images/core-image-minimal.bbappend` +
   `recipes-graphics/images/core-image-weston.bbappend` — wiring for hand-built
   debug images, for bisecting a problem down to a plain poky image.

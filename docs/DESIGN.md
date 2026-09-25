@@ -3,7 +3,8 @@
 > **Documentation map** — [`README.md`](../README.md) build and run |
 > [`docs/BUILD.md`](BUILD.md) build details |
 > [`docs/DESIGN.md`](DESIGN.md) why the tree looks like this |
-> [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md) when it does not work
+> [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md) when it does not work |
+> [`docs/VULKAN-VENUS.md`](VULKAN-VENUS.md) Vulkan in the guests
 
 Why the tree is arranged the way it is: which domain owns what, how the memory map
 is derived, how the display and console paths are wired, and where this port departs
@@ -205,14 +206,15 @@ DCO sign-off is never machine-generated. Where a change was produced with AI
 assistance, an `Assisted-by:` trailer sits immediately above that sign-off, so
 the assistance is declared without being confused for authorship.
 
-The agent name in that trailer is spelled **`ClaudeCode`** in the Linux-kernel
-patches and **`Claude Code`** everywhere else. The reason is mechanical: the
-kernel's `scripts/checkpatch.pl` validates the trailer as
-`AGENT_NAME:MODEL_VERSION` and treats whitespace inside `AGENT_NAME` as
-malformed, so a kernel patch with the spaced form draws a `BAD_SIGN_OFF`
-warning. All five kernel patches pass `checkpatch.pl --strict` clean; the Xen,
-Zephyr, QEMU and U-Boot patches are not checked by that script and keep the
-readable spelling.
+Where the trailer is present it reads `Assisted-by: Claude Code:<model>`, in
+the Linux-kernel patches as well. The kernel's `scripts/checkpatch.pl` validates
+it as `AGENT_NAME:MODEL_VERSION` and treats the space inside `Claude Code` as
+malformed, so each kernel patch that carries it draws a `BAD_SIGN_OFF` warning
+from it; that warning is expected. Not every patch carries it: among those that
+do not are the xen-troops fork series in `recipes-extended/xen-common` and
+third-party backports such as Zephyr's `0022`-`0024` and the qemu 7.0 `0113`. A
+patch sent to an upstream project is given the trailer form that project asks
+for when it is sent.
 
 ## Zephyr Dom0 (DOM0_OS=zephyr, the default)
 
@@ -328,10 +330,13 @@ identical and what this port changes:
   wrynose port (`LAYERSERIES_COMPAT`, `WORKDIR`→`UNPACKDIR`) is vendored under
   `meta-rpi-sodev/` — the only yaml-reproducible way to carry non-appendable
   `layer.conf` changes. The `external/` submodule stays pristine.
-- The self-built Mesa 24.2.7 / libdrm / wayland-protocols pins were dropped
-  (not disabled): stock wrynose Mesa 26.0.5 already covers the BCM2712-D0 V3D
-  support they were pinned for, so only a `mesa.bbappend` (glvnd) is carried. A
-  V3D-D0 regression fallback would mean re-vendoring the 24.2.7 recipes.
+- The self-built Mesa 24.2.7 / libdrm / wayland-protocols pins were dropped (not
+  disabled): wrynose's Mesa 26.0.5 already covers the BCM2712-D0 V3D support
+  they were pinned for, and a V3D-D0 regression fallback would mean re-vendoring
+  the 24.2.7 recipes. DomD's Mesa is pinned again now, ahead of wrynose, to
+  26.2.2: a v3dv submit-path fix (mesa MR !42407) first ships in 26.2.0.
+  `meta-xt-driver-domain`'s `mesa.bbappend` carries the pin (in both `--gpu`
+  lanes) and glvnd.
 
 ## DomD compositor startup and rootfs (V4H-aligned)
 

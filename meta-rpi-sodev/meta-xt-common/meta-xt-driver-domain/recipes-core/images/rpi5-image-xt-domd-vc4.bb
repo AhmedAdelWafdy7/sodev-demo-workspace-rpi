@@ -46,6 +46,42 @@ DOMU_GFX_PACKAGES = " \
 "
 
 #
+# [Venus] Host-side Vulkan runtime, installed only in the Vulkan lane
+# (GPU=vulkan -> 'venus' in DISTRO_FEATURES). See docs/VULKAN-VENUS.md.
+# Measured against the `--gpu=gl` lane's built image first, which changed what this
+# list is for: two of the three packages are already in the shipping DomD rootfs
+# without any of this. weston 15 is built with -Drenderer-vulkan=true (its
+# PACKAGECONFIG filters 'vulkan' from DISTRO_FEATURES), so
+# /usr/lib/libweston-15/vulkan-renderer.so links libvulkan.so.1; weston therefore
+# RDEPENDS on vulkan-loader, whose RRECOMMENDS on virtual-vulkan-icd resolves to
+# mesa-vulkan-drivers. Confirmed in that lane's manifest: libvulkan1
+# 1.4.341.0 and mesa-vulkan-drivers are installed, and
+# /usr/lib/libvulkan_broadcom.so is in the rootfs. (That measurement was taken at
+# mesa 26.0.5, before this series' ungated `PV = "26.2.2"` in
+# meta-xt-driver-domain's mesa.bbappend; both lanes now resolve PV=26.2.2, and the
+# transitive-install argument above does not depend on the version.)
+#
+#   - mesa-vulkan-drivers : the V3DV ICD (libvulkan_broadcom.so) plus its ICD
+#     manifest. Arrives transitively today, as above. Listed explicitly because a
+#     RRECOMMENDS is not a requirement: BAD_RECOMMENDATIONS, or a weston built
+#     without its Vulkan renderer, would drop the ICD silently -- and Venus cannot
+#     work without it.
+#   - vulkan-loader : same reasoning; the loader Venus and weston's Vulkan
+#     renderer both go through.
+#   - vulkan-tools : vulkaninfo -- the only package here that is genuinely NEW
+#     (verified absent from the `--gpu=gl` rootfs), and the one the phase-1 gate
+#     reads. Note that oe-core configures this recipe with -DBUILD_CUBE=OFF, so
+#     there is no vkcube; the drawing check uses `weston --renderer=vulkan`.
+# virglrenderer needs no NEW package here -- it is installed above either way --
+# but it does need to be BUILT with venus, which the --gpu=gl lane does not do:
+# there the domd conf cancels the venus that oe-core's PACKAGECONFIG default
+# would enable ("PACKAGECONFIG:remove:pn-virglrenderer" with
+# XT_VIRGL_VENUS_REMOVE set to "venus"), and GPU=vulkan leaves
+# XT_VIRGL_VENUS_REMOVE empty. A bitbake :remove cannot be undone by an :append,
+# which is why it is gated at the removal rather than here.
+VENUS_PACKAGES = "${@bb.utils.contains('DISTRO_FEATURES', 'venus', 'mesa-vulkan-drivers vulkan-loader vulkan-tools', '', d)}"
+
+#
 # Kernel modules required for vc4-drm aggregate bind.
 # CONFIG_DRM_VC4 is =m (so Dom0 can blacklist it), which means DomD must
 # explicitly install kernel-module-vc4.
@@ -140,6 +176,7 @@ IMAGE_INSTALL:append = " \
     ${DOMD_RUNTIME_PACKAGES} \
     ${XT_DOMU_CFG_INSTALL} \
     ${XT_DOMZ_CFG_INSTALL} \
+    ${VENUS_PACKAGES} \
 "
 
 BAD_RECOMMENDATIONS += "busybox-syslog"

@@ -1,0 +1,138 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 06 Sep 2026 01:08:01 +0900
+Subject: [PATCH] xen/arm: let a device model share its own memory into its guest
+
+A device model sharing its own memory into the guest it serves is refused on
+Arm twice over, and both refusals have to go.
+
+First, since Xen 4.22 the XENMAPSPACE_gmfn_foreign owner lookup on Arm is
+rcu_lock_remote_domain_by_id(), which by construction cannot name the caller:
+DOMID_SELF (0x7FF0) matches no domain's id, so it returns -ESRCH, and the
+caller's real domid hits its own "*d == current->domain" test and returns
+-EPERM. Until 4.22 this code called get_pg_owner(), which resolves DOMID_SELF
+to current->domain -- that is how a device model names its own pages. (x86 is
+not a precedent either way: its own p2m_add_foreign() uses
+rcu_lock_remote_domain_by_id() and rejects tdom == fdom, and get_pg_owner()
+survives there only for the MMU-update hypercalls.) Resolve DOMID_SELF here so
+the caller can be the owner
+again, and move the pre-existing "od == d" refusal out of the remote branch so
+that it still covers the new one: a domain must not map its own page into its
+own physmap this way.
+
+Second, the remaining check is xsm_map_gmfn_foreign(XSM_TARGET, d, od), which
+under the dummy policy asks whether the domain *receiving* the mapping (d) is
+privileged over the page owner (od). That is the right question for the usual
+direction -- a control domain mapping a guest's page into its own physmap --
+and it denies the mirror image of it: here d is the guest and od is the driver
+domain, so it fails with -EPERM.
+
+The mirror direction is what a virtio-gpu host-visible blob needs on Arm.
+Without it the blob window stays device-model MMIO and every guest access to it
+traps out to the device model for emulation, which on arm64 is not merely slow
+but fatal: a data abort from a SIMD/FP access carries no valid syndrome, so Xen
+has to decode the instruction itself, and decode_arm64() covers only the
+general-purpose load/store forms. Mesa's venus writes its command ring with
+memcpy(), which is SIMD on aarch64, so the guest's Vulkan client dies at its
+first ring write with
+
+  (XEN) dNvM unhandled Arm instruction 0x3d800000
+  (XEN) dNvM Unable to decode instruction
+
+measured on a Raspberry Pi 5 with the qemu device model in a driver domain, and
+the matching device-model side logging
+
+  xen-arm: 33 of 33 pages of device RAM at 0x3a000000 were not shared into dom25
+           (first error -1)
+
+So allow the case where the caller owns the pages it is sharing. The caller is
+already required to be privileged over the target domain by
+xsm_add_to_physmap(XSM_TARGET, current->domain, d) in the common code above, so
+the effective rule becomes "a domain privileged over the target may share its
+own memory into that target". This grants the guest nothing: the owner is
+resolved from the caller rather than named by the guest, and naming the target
+itself is refused. The xsm_map_gmfn_foreign() check is left in place for every
+other owner, so a Flask policy still governs third-party sharing.
+
+A Flask rule was considered first and does not reach this case. The check that
+fires is xsm_map_gmfn_foreign(XSM_TARGET, d, od), whose Flask implementation
+asks for mmu:map_read/map_write on the OWNER's object in the RECEIVER's
+context -- so granting it means granting the guest that permission over the
+driver domain, which is strictly worse than what this patch does (the guest
+gains nothing; only a caller sharing its OWN pages is newly allowed). And it
+would not be reached in this product's default configuration anyway: the build
+has CONFIG_XSM_FLASK=y but CONFIG_XSM_SILO_DEFAULT=y and no policy blob, and
+xsm/silo.c overrides only the evtchn and grant hooks -- so this hook falls
+through to the dummy implementation described above. Hence the structural fix
+here and the upstream note below.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [needs discussion: upstream would likely want a
+ new XSM hook, e.g. xsm_share_own_gmfn(), and the same relaxation on x86]
+---
+ xen/arch/arm/mm.c | 45 ++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 36 insertions(+), 9 deletions(-)
+
+--- a/xen/arch/arm/mm.c
++++ b/xen/arch/arm/mm.c
+@@ -193,24 +193,51 @@ int xenmem_add_to_physmap_one(
+ 
+         if ( extra.foreign_domid == DOMID_XEN )
+             od = rcu_lock_domain(dom_xen);
++        else if ( extra.foreign_domid == DOMID_SELF )
++            /*
++             * rcu_lock_remote_domain_by_id() refuses DOMID_SELF (no domain has
++             * that id, so it is -ESRCH) and refuses the caller's own id
++             * (-EPERM), so resolve DOMID_SELF here. This is what get_pg_owner()
++             * did -- the lookup this code used until Xen 4.22 -- and it is how
++             * a device model names its own pages.
++             */
++            od = rcu_lock_current_domain();
+         else
+         {
+             rc = rcu_lock_remote_domain_by_id(extra.foreign_domid, &od);
+             if ( rc )
+                 return rc;
+-
+-            if ( od == d )
+-            {
+-                rcu_unlock_domain(od);
+-                return -EINVAL;
+-            }
+         }
+ 
+-        rc = xsm_map_gmfn_foreign(XSM_TARGET, d, od);
+-        if ( rc )
++        /*
++         * Moved out of the branch above so that it also covers DOMID_SELF: a
++         * domain must not map its own page into its own physmap this way.
++         */
++        if ( od == d )
+         {
+             rcu_unlock_domain(od);
+-            return rc;
++            return -EINVAL;
++        }
++
++        /*
++         * xsm_map_gmfn_foreign() asks whether the domain receiving the mapping
++         * is privileged over the page owner, which is the right question when a
++         * control domain maps a guest's page into its own physmap. A device
++         * model sharing its own memory into the guest it serves is the opposite
++         * direction, so ask the question that fits it instead: the caller owns
++         * the pages, and the common code has already required the caller to be
++         * privileged over the target domain (xsm_add_to_physmap()). The guest
++         * cannot initiate this -- the owner is resolved from the caller, not
++         * named by the guest, and the od == d case is refused above.
++         */
++        if ( od != current->domain )
++        {
++            rc = xsm_map_gmfn_foreign(XSM_TARGET, d, od);
++            if ( rc )
++            {
++                rcu_unlock_domain(od);
++                return rc;
++            }
+         }
+ 
+         /* Take reference to the foreign domain page.

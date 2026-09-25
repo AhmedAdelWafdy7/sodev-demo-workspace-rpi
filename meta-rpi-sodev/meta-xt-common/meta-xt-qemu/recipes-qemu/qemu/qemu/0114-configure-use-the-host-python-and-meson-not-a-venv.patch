@@ -1,0 +1,62 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 6 Sep 2026 01:09:22 +0900
+Subject: [PATCH] configure: use the host python and meson instead of a venv
+
+qemu's configure builds a Python virtualenv with python/scripts/mkvenv.py and
+then insists on the meson *inside* that venv ("We ignore PATH completely here").
+In a Yocto build both halves are wrong: the venv creation needs distlib in the
+native python (do_configure dies with "found no usable distlib, please install
+it"), and the meson that must be used is meson-native from the recipe sysroot,
+which is on PATH and is the version OE has already validated.
+
+oe-core solves this for its own qemu recipe with two patches --
+0011-qemu-Ensure-pip-and-the-python-venv-aren-t-used-for-.patch and
+0010-configure-lookup-meson-exutable-from-PATH.patch. This is those two folded
+into one and rebased onto 10.0.2. Two deltas from the originals, so a reviewer
+diffing against oe-core is not surprised:
+
+ * the venv hunk is byte-identical to oe-core's 0011, dead `if test "$?"` and
+   all -- that check is oe-core's, and it is dead there too because a plain
+   assignment always succeeds;
+ * the meson hunk is NOT identical. oe-core's 0010 targets 10.2.0, which
+   factored the pwd call into a get_pwd() helper and added an `if [ -f
+   "$meson$EXESUF" ]` fixup; 10.0.2 has neither -- it still calls `pwd` inline
+   and has a single `meson=` line -- so the removed side is one line, not four.
+   The replacement is `command -v meson` rather than oe-core's `which meson`
+   (same result, POSIX rather than a PATH-dependent external).
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [oe specific; see the oe-core originals]
+---
+ configure | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+--- a/configure
++++ b/configure
+@@ -969,14 +969,14 @@
+ echo "python determined to be '$python'"
+ echo "python version: $($python --version)"
+ 
+-python="$($python -B "${source_path}/python/scripts/mkvenv.py" create pyvenv)"
++python=python3
+ if test "$?" -ne 0 ; then
+     error_exit "python venv creation failed"
+ fi
+ 
+ # Suppress writing compiled files
+ python="$python -B"
+-mkvenv="$python ${source_path}/python/scripts/mkvenv.py"
++mkvenv=true
+ 
+ # Finish preparing the virtual environment using vendored .whl files
+ 
+@@ -988,7 +988,7 @@
+ # We ignore PATH completely here: we want to use the venv's Meson
+ # *exclusively*.
+ 
+-meson="$(cd pyvenv/bin; pwd)/meson"
++meson=$(command -v meson)
+ 
+ # Conditionally ensure Sphinx is installed.
+ 

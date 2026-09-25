@@ -62,3 +62,7 @@ __pycache__/
 # to the tree is still noticed.
 /rpi[45]-*GB-Dom0*.img
 full*.img
+
+# --gpu=vulkan writes the four AGL Venus conf lines through this file (build.sh hands it
+# to the container as a file, not a shell variable, so the quoting survives).
+/.agl-venus.conf

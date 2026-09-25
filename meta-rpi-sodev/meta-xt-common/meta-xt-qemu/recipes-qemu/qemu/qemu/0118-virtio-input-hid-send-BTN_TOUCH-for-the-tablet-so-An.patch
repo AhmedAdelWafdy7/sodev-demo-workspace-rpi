@@ -1,0 +1,106 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 06 Sep 2026 23:16:13 +0900
+Subject: [PATCH] virtio-input-hid: send BTN_TOUCH for the tablet, so Android
+ sees a touchscreen
+
+DomA (AAOS) gets no touch input from virtio-tablet-pci. Android classifies an
+ABS_X/ABS_Y device as a touchscreen only when it also reports BTN_TOUCH; a
+device that reports BTN_LEFT instead is an absolute pointer, and the guest's
+input stack then routes nothing to the UI -- no clicks from a mouse, nothing
+from a real touch panel.
+
+This is the qemu 10.0.2 form of the fix meta-xt-driver-domain carries for the
+7.0.0-xt device model as 0111 (Leonid Komarianskyi). That patch needed three
+pieces; on 10.0.2 upstream already has two of them:
+
+  * qapi/ui.json's InputButton enum already includes 'touch';
+  * keymap_button already has [INPUT_BUTTON_TOUCH] = BTN_TOUCH.
+
+and the second of those is what makes the tablet ADVERTISE BTN_TOUCH already:
+its EV_KEY bitmap is not a literal in virtio_tablet_config_v1/v2 -- neither
+declares EV_KEY at all -- it is synthesised from the whole keymap_button array by
+virtio_input_extend_config(vinput, keymap_button, ..., EV_BITS, EV_KEY) in
+virtio_tablet_init(). So the guest's evdev device already has BTN_TOUCH in its
+key bitmap and would not filter the event out.
+
+What is missing on 10.0.2 is only the send side: a left press arrives as
+INPUT_BUTTON_LEFT and goes out as BTN_LEFT. Hence this patch is the remap alone,
+with no capability or config-space change -- three lines of logic where 0111
+needed a QAPI enum extension and a keymap entry as well.
+
+Two notes on the shape:
+
+  * `vhid->handler` is `const QemuInputHandler *` in 10.0.2, so the cast 0111
+    used is gone rather than casting const away. The handler is matched by name
+    because virtio_tablet_handler is defined below this function; comparing the
+    pointer would need a forward declaration for no gain.
+
+  * The remap is unconditional for the tablet, not behind a property. That is
+    what the device is for on this platform, and the same unconditional remap
+    has shipped in the 7.0.0 lane with BOTH guests on virtio-tablet-pci --
+    including the AGL DomU, whose compositor keeps working: libinput then treats
+    the device as a touchscreen rather than an absolute pointer, which is what a
+    kiosk UI wants. Making it conditional would add a knob whose only correct
+    setting is "on".
+
+Why it is needed here at all: the Venus lane moves the device model from
+7.0.0-xt to 10.0.2, which version-gates the six 7.0.0-only patches off, 0111
+among them -- so without this patch a Venus DomA gets no touch input.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [same downstream policy as the 7.0.0 original;
+ upstream's answer is for the front end to emit INPUT_BUTTON_TOUCH, which SDL's
+ mouse path does not]
+---
+ hw/input/virtio-input-hid.c | 30 +++++++++++++++++++++++++++++-
+ 1 file changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/hw/input/virtio-input-hid.c b/hw/input/virtio-input-hid.c
+index 812faae..c5f35e1 100644
+--- a/hw/input/virtio-input-hid.c
++++ b/hw/input/virtio-input-hid.c
+@@ -89,6 +89,30 @@ static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,
+     InputMoveEvent *move;
+     InputBtnEvent *btn;
+     InputMultiTouchEvent *mtt;
++    /*
++     * Android classifies an ABS_X/ABS_Y device as a touchscreen only when it
++     * also reports BTN_TOUCH; with BTN_LEFT it is an absolute pointer and the
++     * guest's input stack routes nothing to the UI. See
++     * source.android.com/docs/core/interaction/input/touch-devices
++     * (section "Touch device classification").
++     *
++     * The tablet already ADVERTISES BTN_TOUCH: its EV_KEY bitmap is synthesised
++     * from keymap_button by virtio_input_extend_config() below, and that map
++     * has carried [INPUT_BUTTON_TOUCH] = BTN_TOUCH since the enum gained
++     * 'touch'. What it does not do is send it -- a left press arrives as
++     * INPUT_BUTTON_LEFT and goes out as BTN_LEFT. So this is a send-side remap
++     * only; no capability changes and no config-space change, which is why it
++     * is three lines here.
++     *
++     * Deliberately not conditional on a device property: it is what the tablet
++     * is for on this platform, and the same remap has shipped in the 7.0.0 fork
++     * with both guests using virtio-tablet-pci, including the AGL DomU whose
++     * compositor keeps working (libinput then treats the device as a
++     * touchscreen rather than an absolute pointer, which is what a kiosk UI
++     * wants anyway).
++     */
++    bool is_tablet = vhid->handler && vhid->handler->name &&
++                     !strcmp(vhid->handler->name, VIRTIO_ID_NAME_TABLET);
+ 
+     switch (evt->type) {
+     case INPUT_EVENT_KIND_KEY:
+@@ -120,7 +144,11 @@ static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,
+             virtio_input_send(vinput, &event);
+         } else if (keymap_button[btn->button]) {
+             event.type  = cpu_to_le16(EV_KEY);
+-            event.code  = cpu_to_le16(keymap_button[btn->button]);
++            if (btn->button == INPUT_BUTTON_LEFT && is_tablet) {
++                event.code = cpu_to_le16(BTN_TOUCH);
++            } else {
++                event.code = cpu_to_le16(keymap_button[btn->button]);
++            }
+             event.value = cpu_to_le32(btn->down ? 1 : 0);
+             virtio_input_send(vinput, &event);
+         } else {

@@ -1,0 +1,60 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 06 Sep 2026 01:20:01 +0900
+Subject: [PATCH] impeller: do not request 4x MSAA for the onscreen swapchain
+
+ADOPTED 2026-09-04 for this product, after the visual check described below and a
+second measurement under DomA compositing load. It began as a measurement patch;
+the visual cost is real and was accepted, so read the visual paragraph before
+reusing this anywhere else.
+
+GPUSurfaceVulkanImpeller builds the onscreen SwapchainTransientsVK with enable_msaa=true,
+which allocates a 4x multisampled colour target plus a 4x depth/stencil target and makes the
+onscreen pass resolve into the swapchain image. On a tile-based GPU that is not mainly a
+resolve-bandwidth cost -- the store action is already kDontCare -- it is a tile cost: 4x
+multisampling quarters the usable tile size, so the same frame is binned and rendered over
+about four times as many tiles, with the per-tile setup paid each time.
+
+Two platform facts make this worth measuring here rather than assuming:
+
+ * V3DV exposes exactly one Vulkan memory type (DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT and
+   no LAZILY_ALLOCATED), so Impeller's transient-attachment optimisation
+   (CapabilitiesVK::supports_device_transient_textures_) stays off and both MSAA targets are
+   backed by real memory, about 33 MiB each at 1920x1080.
+ * The Skia/OpenGL lane this project has been comparing against is ALSO 4x multisampled --
+   meta-flutter's flutter-auto recipe enables the egl-multisample PACKAGECONFIG, which sets
+   EGL_SAMPLES=4. So the "Impeller 13.1 ms/frame against Skia/GL 13.8" figure in
+   docs/VULKAN-VENUS.md section 7c was 4x against 4x, and 1x was never measured on either.
+
+The 1x path is fully implemented already and needs no other change:
+SwapchainTransientsVK::CreateMSAATexture() returns nullptr, the depth/stencil target becomes
+kTexture2D/kCount1, and SurfaceVK::WrapSwapchainImage points colour attachment 0 straight at
+the swapchain image with StoreAction::kStore -- so there is no substitute blit, the onscreen
+pass simply renders into the swapchain image.
+
+WHAT THIS COSTS VISUALLY: Impeller relies on MSAA for geometric edge antialiasing. Text is
+unaffected (it is sampled from the glyph atlas), but curved and diagonal geometry -- which on
+an instrument cluster means the gauge arcs, tick marks and needles -- will show aliasing.
+flutter/flutter#191171 is that report and #191379 fixed it by ADDING MSAA to the Linux
+embedder. The analytic-AA alternative, --impeller-use-sdfs, does not exist before engine 3.44,
+so at 3.32.5 there is no engine-side mitigation. For this dashboard the saving was judged
+worth it from a screenshot comparison (see ADOPTED above); anyone reusing this elsewhere
+should make the same visual check rather than inherit the decision.
+
+Upstream: not submitted (this is a platform trade-off, not a bug).
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [product policy: the MSAA level is a per-product
+ visual and performance trade-off, and 4x is the right upstream default]
+---
+diff --git a/engine/src/flutter/shell/gpu/gpu_surface_vulkan_impeller.cc b/engine/src/flutter/shell/gpu/gpu_surface_vulkan_impeller.cc
+--- a/engine/src/flutter/shell/gpu/gpu_surface_vulkan_impeller.cc
++++ b/engine/src/flutter/shell/gpu/gpu_surface_vulkan_impeller.cc
+@@ -187,7 +187,7 @@
+     if (transients_ == nullptr) {
+       transients_ = std::make_shared<impeller::SwapchainTransientsVK>(
+           impeller_context_, desc,
+-          /*enable_msaa=*/true);
++          /*enable_msaa=*/false);
+     }
+ 
+     auto wrapped_onscreen =

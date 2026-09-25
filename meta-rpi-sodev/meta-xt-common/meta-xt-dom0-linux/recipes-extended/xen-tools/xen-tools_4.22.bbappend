@@ -1,5 +1,7 @@
 # ============================================================================
-# Xen 4.22 + 28-patch shared series + 5 toolstack-only patches = 33 fetched
+# Xen 4.22 + 28-patch shared series + 5 toolstack-only patches = 33 fetched,
+# plus the two the Vulkan lane adds (4.22-0008 shared, 4.22-0009 toolstack-only)
+# = 35 in the default lane, 33 with --gpu=gl
 # ============================================================================
 # Attaches to xen-tools_4.22.bb (PV "4.22+stable", SRCREV d45d5687f1, branch
 # stable-4.22) instead of the xen-troops fork _git recipe. Selected by
@@ -34,13 +36,38 @@
 # "SRC_URI = ${XEN_URL}" reset that used to wipe them never runs; upstream
 # xen-tools.inc supplies them from meta-virtualization's files/.
 
+# --- [Venus] the two toolstack patches the Vulkan lane adds ---
+#
+# Gated on the venus DISTRO_FEATURE, like the hypervisor pair, so the `--gpu=gl`
+# lane's libxl is the pre-Venus series, with none of these. Vulkan is the
+# default, so a plain build DOES get these two.
+#
+# 4.22-0009 is toolstack-only (libxl) and therefore lives in ./files rather than
+# the shared dir: it hands the guest's prefetchable virtio-PCI region out in
+# 256 MiB slices instead of 8 MiB, which is the window a virtio-gpu host-visible
+# blob (Venus) has to fit in -- 8 MiB left Vulkan clients failing vkAllocateMemory
+# on the board, 32 MiB was measured and is too small in turn, and 128 MiB ran out
+# once a full-Vulkan AAOS had its resident apps up (a WebView then could not
+# allocate). See docs/VULKAN-VENUS.md section 7a.
+#
+# It must come AFTER 4.22-0008, which grows the
+# GUEST_VIRTIO_PCI_PREFETCH_MEM_ADDR/SIZE constants it reads; 4.22-0008 is the
+# same file both hypervisor bbappends list, from the shared xen-common dir, so
+# all three move together. The ordering is not left to prose: libxl asserts at
+# compile time that its slice size divides the window and leaves at least one
+# slice, so a toolstack tree that gets 4.22-0009 without 4.22-0008 fails to build
+# instead of refusing every virtio-pci guest at run time.
+
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # The 28 shared patches (0002-0024 + 4.22-000{1..5}) are single copies living in
 # meta-xt-common/recipes-extended/xen-common/files, which both this bbappend and
-# the hypervisor xen_4.22.bbappend point at -- the two SRC_URI lists name the same
-# 28 files. Only the toolstack-only project patches (0001-qemu_envs / 0059 / 0061
-# / 0062 / 0063), the systemd unit, and the interim recipe's own stock
-# pre-patches remain in ./files here.
+# the hypervisor xen_4.22.bbappend point at -- the two SRC_URI lists name the
+# same 28 files, plus 4.22-0008 which the Venus lane adds to both. Only the
+# toolstack-only patches -- the project's 0001-qemu_envs / 0059 / 0061 / 0062 /
+# 0063 and the Venus lane's 4.22-0009 -- and the systemd unit are in
+# ./files here. The interim recipe's pre-patches are not: meta-xt-domx's
+# xen-tools_4.22.bb takes two from meta-virtualization's files/ and its refreshed
+# tests-vpci one from its own files/.
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../../recipes-extended/xen-common/files:"
 
 # --- the same patch series as the hypervisor, minus the two hypervisor-only
@@ -80,6 +107,12 @@ SRC_URI:append = " \
     file://4.22-0004-vgic-pci-irq-level-race-fix.patch \
     file://4.22-0005-build-honour-external-toolchain-vars.patch \
 "
+
+# [Venus] gated so a --gpu=gl build's toolstack carries no additions from us.
+# 4.22-0008 first: 4.22-0009 reads the constants it moves.
+SRC_URI:append = " ${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
+    'file://4.22-0008-arm-move-the-guest-virtio-pci-prefetch-window.patch \
+     file://4.22-0009-libxl-arm-give-a-virtio-pci-host-a-256M-prefetchable-.patch', '', d)}"
 
 # --- project toolstack feature patches (verified: all 5 apply CLEAN on 4.22) ---
 # qemu_envs   : pass WAYLAND_DISPLAY/XDG_RUNTIME_DIR/SDL_VIDEODRIVER/WMCLASS to

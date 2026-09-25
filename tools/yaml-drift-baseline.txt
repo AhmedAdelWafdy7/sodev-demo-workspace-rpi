@@ -38,14 +38,13 @@
 +    "8g":
 +    desc: "DomD rootfs only (RPi5)"
 +    desc: "Full RPi5(BCM2711)+Xen SD image (thin Linux or Zephyr Dom0 + dom0less DomD + DomU AGL + DomA AAOS)"
-+    desc: "Target Raspberry Pi 5 SKU: 8g (default; all four domains up together) or 4g (DomD 1024 MiB; DomU or DomA, one at a time)"
++    desc: "Target Raspberry Pi 5 SKU: 8g (default; all four domains up together) or 4g (DomD 1408 MiB with GPU=vulkan, the default, or 1024 with gl; DomU or DomA, one at a time)"
 +  ANDROID_KERNEL_DIR: "android_kernel-rpi5"
 +  BOARD_RAM:
 +  DOM0_OS: "zephyr"          # default zephyr; overridable: --DOM0_OS {zephyr|linux}. On a new board bring the thin-Linux Dom0 up first: it is a relocatable arm64 Image, so it does not depend on the Zephyr SRAM relink being right.
 +  DOMA_DIR: "android-rpi5"
 +  MACHINE: "raspberrypi5"   # meta-raspberrypi machine (SOC_FAMILY=rpi, MACHINEOVERRIDES raspberrypi5, DEFAULTTUNE cortexa76-nocrypto)
 +  XT_DOMA_SOURCE_GROUP: "default,rpi5"
--                - [BOARD_RAM, "%{BOARD_RAM}"]
 -                - [XEN_DT_SCMI, "%{XEN_DT_SCMI_NAME}"]
 -          "%{XT_SCMI_HOST_DTBO_NAME}": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/%{XT_SCMI_HOST_DTBO_NAME}"
 -          "armstub8-2712.bin": "%{YOCTOS_WORK_DIR}/%{DOMD_BUILD_DIR}/tmp/deploy/images/%{MACHINE}/armstub8-2712.bin"

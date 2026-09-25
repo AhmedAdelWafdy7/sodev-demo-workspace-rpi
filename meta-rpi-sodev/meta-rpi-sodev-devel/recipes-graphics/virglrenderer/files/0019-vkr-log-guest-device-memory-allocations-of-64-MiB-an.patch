@@ -1,0 +1,36 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 13 Sep 2026 17:36:40 +0900
+Subject: [PATCH] vkr: log guest device-memory allocations of 64 MiB and more
+ (diagnostic)
+
+On the RPi4 AAOS guest with HWUI on Venus, a single render-server context was
+seen to hold ~600 MiB of v3d GEM the second it appeared (host memory attribution
+at 1 Hz), and that burst is what pushes DomD into its reclaim livelock. This
+names the request: context id and debug name, size, memoryTypeIndex and the
+first pNext sType (import/export/AHB), for any vkAllocateMemory of 64 MiB or
+more. Diagnostic; drop once the allocator is known.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [diagnostic]
+---
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -234,6 +234,17 @@
+    TRACE_FUNC();
+    struct vkr_context *ctx = dispatch->data;
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
++   /* diagnostic (0019): name the big ones. On the RPi4 AAOS guest a single context
++    * was seen to take ~600 MiB of v3d GEM the moment it appeared; this says which
++    * context asked for how much, and from which memory type. */
++   if (args->pAllocateInfo && args->pAllocateInfo->allocationSize >= (64ull << 20)) {
++      const VkBaseInStructure *pnext = args->pAllocateInfo->pNext;
++      VkStructureType first = pnext ? pnext->sType : 0;
++      vkr_log("large vkAllocateMemory: ctx %u (%s) size %llu MiB memoryTypeIndex %u pNext sType %u",
++              ctx->ctx_id, ctx->debug_name ? ctx->debug_name : "?",
++              (unsigned long long)(args->pAllocateInfo->allocationSize >> 20),
++              args->pAllocateInfo->memoryTypeIndex, (unsigned)first);
++   }
+    struct vkr_physical_device *physical_dev = dev->physical_device;
+ 
+    VkMemoryAllocateInfo *alloc_info = (VkMemoryAllocateInfo *)args->pAllocateInfo;

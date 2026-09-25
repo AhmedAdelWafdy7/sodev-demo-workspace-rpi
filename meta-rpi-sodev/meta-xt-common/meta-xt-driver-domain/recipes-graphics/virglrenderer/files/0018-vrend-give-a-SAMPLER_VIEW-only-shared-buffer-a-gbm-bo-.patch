@@ -1,0 +1,61 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sat, 12 Sep 2026 10:54:47 +0900
+Subject: [PATCH] vrend: give a SAMPLER_VIEW-only shared buffer a gbm bo, so Venus
+ can import it
+
+With SurfaceFlinger and HWUI both on Venus in the AAOS guest, the host logged
+
+    vrend_resource_gbm_init: res 960x600 virgl_format 67 bind 0x100008:
+        no GBM backing: no gbm device, or no usable format/flags
+    proxy: exported res 2641 to unexpected fd_type -1
+    vkr: failed to query resource props: invalid res_id 2641
+
+and system_server died importing that buffer (0017 made the death a
+VK_ERROR_INVALID_EXTERNAL_HANDLE instead; this makes the import work).
+
+bind 0x100008 is VIRGL_BIND_SHARED | VIRGL_BIND_SAMPLER_VIEW: a gralloc buffer
+with GPU_SAMPLED_IMAGE but no GPU_RENDER_TARGET, i.e. an HWUI hardware bitmap
+(here the 960x600 TaskSnapshot of a 1920x1200 task). virgl_gbm_convert_flags()
+maps SAMPLER_VIEW to GBM_BO_USE_TEXTURING, which is a minigbm extension and, once
+0009 is applied, is 0 when built against Mesa's gbm.h (vrend_winsys_gbm.h): before
+0009 the fallback gave it (1 << 5), so this patch is a no-op without it. The result is
+gbm_flags == 0, which vrend_resource_gbm_init() rejects, so the buffer is backed
+by a plain GL texture, is not exportable as a dma-buf, and the Venus side can
+never import it.
+
+A shared or scanout buffer has to be allocated through gbm regardless of its
+usage bits. When the conversion yields nothing for such a buffer, ask for a
+linear bo: the guest's minigbm reports DRM_FORMAT_MOD_LINEAR for everything and
+Mesa Venus imports with that modifier, and linear is also what the CPU upload
+of a bitmap wants. RENDER_TARGET buffers are unaffected (they already carry
+GBM_BO_USE_RENDERING), as is a minigbm build (TEXTURING is non-zero there).
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/src/vrend/vrend_winsys_gbm.c
++++ b/src/vrend/vrend_winsys_gbm.c
+@@ -462,6 +462,22 @@
+          flags |= GBM_BO_USE_SW_WRITE_RARELY;
+    }
+ 
++   /*
++    * Built against Mesa's gbm.h, GBM_BO_USE_TEXTURING and every minigbm-only
++    * usage above are 0 (vrend_winsys_gbm.h), so a SAMPLER_VIEW-only shared
++    * buffer -- gralloc GPU_SAMPLED_IMAGE without GPU_RENDER_TARGET, which is
++    * what HWUI's hardware bitmaps and the TaskSnapshots are -- converts to
++    * no usage at all, and vrend_resource_gbm_init() then declines to give it
++    * a bo ("no usable format/flags"). It stays a plain GL texture, cannot be
++    * exported as a dma-buf, the proxy never attaches it to the render-server
++    * context, and a Venus client's vkGetMemoryFdPropertiesKHR on it fails.
++    * A shared or scanout buffer has to come from gbm whatever its usage.
++    * Ask for a linear bo: that is the layout the guest assumes for these
++    * (its minigbm reports DRM_FORMAT_MOD_LINEAR) and what CPU uploads want.
++    */
++   if (!flags && virgl_gbm_external_allocation_preferred(virgl_bind_flags))
++      flags = GBM_BO_USE_LINEAR;
++
+    return flags;
+ }
+ 

@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 23 Sep 2026 00:42:03 +0900
+Subject: [PATCH] vulkan/venus: report protected memory off
+
+Venus implements no protected memory of its own. It forwards whatever the host
+driver returns from vkGetPhysicalDeviceFeatures2, which puts the guest in the
+position of advertising a capability neither layer can honour.
+
+Android takes the advertisement at face value. SkiaVkRenderEngine's dual-filter
+Kawase blur preallocates protected buffers whenever the device reports
+protectedMemory, and on a host whose driver reports it that preallocation fails
+and SurfaceFlinger restarts, over and over, with no other symptom pointing at
+the feature bit.
+
+Clear it in the same fixup block that already turns off
+accelerationStructureHostCommands and the unsupported
+ExtendedDynamicState3Features, for the same reason: the protocol cannot carry
+it.
+
+Note on where this bites. A host running V3DV reports protectedMemory = false
+itself (src/broadcom/vulkan/v3dv_device.c), so on a Raspberry Pi this change is
+defensive rather than load-bearing; the restart loop was measured on an
+Intel-hosted run, where the host driver does report it.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -439,6 +439,15 @@
+       feats->extendedDynamicState3RepresentativeFragmentTestEnable = false;
+       feats->extendedDynamicState3ShadingRateImageEnable = false;
+    }
++
++   /* Venus has no protected memory support of its own; it reports whatever the
++    * host driver reports. Android's SkiaVkRenderEngine takes that at face
++    * value: the dual-filter Kawase blur preallocates protected buffers when
++    * the device advertises protectedMemory, and on a host whose driver does
++    * advertise it that preallocation fails and takes SurfaceFlinger down in a
++    * restart loop. Report it off.
++    */
++   feats->protectedMemory = false;
+ }
+ 
+ static void

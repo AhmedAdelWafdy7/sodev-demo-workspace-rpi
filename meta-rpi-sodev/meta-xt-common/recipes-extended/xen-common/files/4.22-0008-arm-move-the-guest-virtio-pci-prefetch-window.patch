@@ -1,0 +1,121 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 06 Sep 2026 01:08:01 +0900
+Subject: [PATCH] xen/arm: move the guest virtio-pci prefetch window somewhere a
+ big BAR fits
+
+The prefetchable virtio-PCI window is where a virtio-gpu host-visible blob lives,
+which is how a guest gets Vulkan through Venus. Its old home -- 64 MiB at
+0x3a000000, wedged between the magic pages and the start of RAM at 0x40000000 --
+cannot hold a BAR bigger than 32 MiB, because a bigger BAR needs a bigger natural
+alignment and there is nowhere below 0x40000000 to put one.
+
+32 MiB is not enough. Measured on a Raspberry Pi 5 with a 32 MiB BAR: venus takes
+~25 MiB of it for its command ring, its suballocation pools and the client's own
+allocations, and the client's swapchain for a 1920x1080 surface then fails --
+
+  MESA-VIRTIO: vn_AllocateMemory: VK_ERROR_OUT_OF_DEVICE_MEMORY
+  MESA-VIRTIO: vn_CreateSwapchainKHR: VK_ERROR_OUT_OF_DEVICE_MEMORY
+
+Move it to 0xc0000000, the 1 GB hole between the top of GUEST_RAM0 and the 4 GB
+mark, and give it 768 MiB. That hole is the only one in this map big enough to hold
+the window and leave it room to grow, and nothing else in this header falls inside
+it.
+
+768 MiB is three 256 MiB per-host slices, where the old 64 MiB gave eight 8 MiB slices
+(VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE in libxl_arm.c, which the companion patch grows
+to 256 MiB). Trading slice count for slice size is deliberate: every guest in this
+product is served by exactly one virtio-pci host, and eight 8 MiB windows are eight
+windows no Vulkan client can use. The remaining 256 MiB of the hole is deliberately
+left alone -- filling it would end the window exactly at 0x100000000, which is
+where GUEST_VPCI_PREFETCH_MEM_ADDR (the passthrough-PCI prefetchable window)
+begins, and an exclusive end that lands on another window's base is not something
+this has been tested against.
+
+The obvious-looking candidate, the 256 MiB at 0x10000000, is NOT free even though
+its immediate neighbours suggest it is (the GICv3 redistributors end below
+0x04100000 and GUEST_ACPI_BASE starts at 0x20000000): GUEST_VPCI_ECAM_BASE/SIZE is
+0x10000000/0x10000000, exactly the same range. That is live code rather than a
+reservation -- xen/arch/arm/vpci.c registers an ECAM MMIO handler over it for any
+domain created with vPCI, and libxl_arm.c emits it into that guest's device tree.
+Putting the blob window there is worse than an overlap, because the blob pages are
+inserted into the guest p2m as real memory: an access to them never takes a stage-2
+fault, so do_trap_stage2_abort_guest() -- the only path to try_handle_mmio() --
+never runs and the ECAM handler never sees it. A guest with a passthrough PCI
+device would read blob contents instead of PCI config space, and only for the pages
+a blob happens to be mapped into, so intermittently. Hence 0xc0000000.
+
+Why 0xc0000000 works:
+
+ - it starts exactly where GUEST_RAM0 ends (0x40000000 + 2 GB), and a guest with
+   more RAM than RAM0 holds gets the remainder at GUEST_RAM1 = 0x200000000, so no
+   guest's RAM can ever reach it;
+ - it is below the 4 GB mark, so a 32-bit BAR can still address it -- which is why
+   the window was kept low in the first place;
+ - it is 1 GB-aligned, so a BAR of any size up to the window can use it.
+
+The window is already declared prefetchable (GUEST_VIRTIO_PCI_ADDR_TYPE_PREFETCH_MEM
+is 0x42000000), and the guest device tree, libxl and the device model all derive
+their view from these two values, so everything moves together. Guests without a
+host-visible blob are unaffected: their virtio BARs are 16 KB each and fit anywhere.
+
+The "64 MiB is reserved" comment above the definitions is updated with them, so the
+header does not describe a size it no longer defines.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [the guest memory map is ABI; upstream would want
+ this discussed, and probably a way for the toolstack to size the window]
+---
+ xen/include/public/arch-arm.h | 40 +++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 37 insertions(+), 3 deletions(-)
+
+--- a/xen/include/public/arch-arm.h
++++ b/xen/include/public/arch-arm.h
+@@ -501,10 +501,44 @@ typedef uint64_t xen_callback_t;
+ #define GUEST_MAGIC_BASE  xen_mk_ullong(0x39000000)
+ #define GUEST_MAGIC_SIZE  xen_mk_ullong(0x01000000)
+ 
+-/* 64 MB is reserved for virtio-pci Prefetch memory */
++/* 768 MiB is reserved for virtio-pci Prefetch memory */
+ #define GUEST_VIRTIO_PCI_ADDR_TYPE_PREFETCH_MEM    xen_mk_ullong(0x42000000)
+-#define GUEST_VIRTIO_PCI_PREFETCH_MEM_ADDR         xen_mk_ullong(0x3a000000)
+-#define GUEST_VIRTIO_PCI_PREFETCH_MEM_SIZE         xen_mk_ullong(0x04000000)
++/*
++ * The prefetchable window is where a virtio-gpu host-visible blob (Venus) lives,
++ * and its old home -- 64 MiB at 0x3a000000, wedged between the magic pages and the
++ * start of RAM -- cannot hold a BAR larger than 32 MiB: a bigger BAR needs a bigger
++ * natural alignment, and there is no room for one below 0x40000000. Measured on
++ * RPi5 with a 32 MiB BAR: venus takes ~25 MiB of it for its ring, pools and the
++ * client's own allocations, and the client's swapchain then fails with
++ * VK_ERROR_OUT_OF_DEVICE_MEMORY for a 1920x1080 surface.
++ *
++ * 0xc0000000 is the 1 GB hole between the top of GUEST_RAM0 and the 4 GB mark: the
++ * window starts exactly where GUEST_RAM0 ends (0x40000000 + 0x80000000), and a
++ * guest with more RAM than RAM0 holds gets the remainder at GUEST_RAM1
++ * (0x200000000), so no guest's RAM can reach it. It is the only hole big enough to
++ * hold this window and let it grow, and nothing else in this header falls inside
++ * it. Being below 4 GB, a 32-bit BAR can still address it.
++ *
++ * Do NOT use 0x10000000: its neighbours make it look like a free 256 MiB hole (the
++ * GICv3 redistributors end below 0x04100000, GUEST_ACPI_BASE starts at
++ * 0x20000000), but GUEST_VPCI_ECAM_BASE/SIZE is exactly that range, and it is live
++ * -- vpci.c registers an ECAM MMIO handler over it and libxl emits it into the DT.
++ * Blob pages go into the guest p2m as real memory, so they never fault and the
++ * handler never sees the access: a guest with a passthrough PCI device would read
++ * blob contents instead of config space.
++ *
++ * 768 MiB is three 256 MiB per-host slices (VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE in
++ * libxl_arm.c). The last 256 MiB of the hole is left alone so the window does not
++ * end exactly at 0x100000000, which is where GUEST_VPCI_PREFETCH_MEM_ADDR (the
++ * passthrough-PCI window) begins.
++ *
++ * The guest device tree, libxl and the device model all derive their view from
++ * these two values, so they move together. libxl_arm.c asserts that its slice size
++ * divides this size and leaves at least one slice, so a tree that has the libxl
++ * half of this change without this header fails to build rather than at run time.
++ */
++#define GUEST_VIRTIO_PCI_PREFETCH_MEM_ADDR         xen_mk_ullong(0xc0000000)
++#define GUEST_VIRTIO_PCI_PREFETCH_MEM_SIZE         xen_mk_ullong(0x30000000)
+ 
+ #define GUEST_RAM_BANKS   2
+ 

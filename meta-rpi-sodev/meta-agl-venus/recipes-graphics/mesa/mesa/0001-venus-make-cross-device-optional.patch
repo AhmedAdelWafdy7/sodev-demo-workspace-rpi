@@ -1,0 +1,118 @@
+From 087e9a96d13155e26987befae78b6ccbb7ae242b Mon Sep 17 00:00:00 2001
+From: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Date: Fri, 3 May 2024 16:39:37 +0300
+Subject: [PATCH] venus: make cross-device optional
+
+Cross-device is a virtio-gpu feature that enables sharing host blob
+dma-bufs with other virtio devices, like virtio-wl or virtio-video.
+This feature is mainly used by ChromeOS and not required if there is
+no dma-buf sharing. Venus has a hard requirement for the cross-device
+feature.
+
+Qemu doesn't support cross-device. Relax cross-device feature requirement
+by making it optional, allowing Venus to work on Qemu.
+
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/29040>
+
+[Backport note] mesa 24.0.7 lists VIRTGPU_PARAM_CROSS_DEVICE among the
+virtio-gpu kernel params Venus hard-requires, so on qemu's virtio-gpu,
+which does not advertise VIRTIO_GPU_F_RESOURCE_UUID, vkCreateInstance
+fails outright:
+
+    MESA-VIRTIO: debug: required kernel param 5 is missing
+    MESA-VIRTIO: debug: vn_CreateInstance: VK_ERROR_INITIALIZATION_FAILED
+
+The change is upstream's, hunk for hunk: the same bool, the same
+optional query and comment, the same gate on the blob flag and the same
+extra argument to virtgpu_bo_blob_flags(). Three things differ in form
+only: supports_cross_device sits after max_timeline_count instead of at
+the end of struct virtgpu, required_params[] lists one param per line,
+and the call in virtgpu_bo_create_from_device_memory() is wrapped.
+wrynose's mesa 26.0.5 already has the commit.
+
+(cherry picked from commit 087e9a96d13155e26987befae78b6ccbb7ae242b)
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Backport [https://gitlab.freedesktop.org/mesa/mesa/-/commit/087e9a96d13155e26987befae78b6ccbb7ae242b]
+---
+--- a/src/virtio/vulkan/vn_renderer_virtgpu.c
++++ b/src/virtio/vulkan/vn_renderer_virtgpu.c
+@@ -95,6 +95,8 @@
+ 
+    uint32_t max_timeline_count;
+ 
++   bool supports_cross_device;
++
+    struct {
+       enum virgl_renderer_capset id;
+       uint32_t version;
+@@ -1125,7 +1127,8 @@
+ }
+ 
+ static uint32_t
+-virtgpu_bo_blob_flags(VkMemoryPropertyFlags flags,
++virtgpu_bo_blob_flags(struct virtgpu *gpu,
++                      VkMemoryPropertyFlags flags,
+                       VkExternalMemoryHandleTypeFlags external_handles)
+ {
+    uint32_t blob_flags = 0;
+@@ -1133,8 +1136,10 @@
+       blob_flags |= VIRTGPU_BLOB_FLAG_USE_MAPPABLE;
+    if (external_handles)
+       blob_flags |= VIRTGPU_BLOB_FLAG_USE_SHAREABLE;
+-   if (external_handles & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+-      blob_flags |= VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE;
++   if (external_handles & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
++      if (gpu->supports_cross_device)
++         blob_flags |= VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE;
++   }
+ 
+    return blob_flags;
+ }
+@@ -1173,7 +1178,7 @@
+       if (info.blob_mem != gpu->bo_blob_mem)
+          goto fail;
+ 
+-      blob_flags |= virtgpu_bo_blob_flags(flags, 0);
++      blob_flags |= virtgpu_bo_blob_flags(gpu, flags, 0);
+ 
+       /* mmap_size is only used when mappable */
+       mmap_size = 0;
+@@ -1233,7 +1238,8 @@
+    struct vn_renderer_bo **out_bo)
+ {
+    struct virtgpu *gpu = (struct virtgpu *)renderer;
+-   const uint32_t blob_flags = virtgpu_bo_blob_flags(flags, external_handles);
++   const uint32_t blob_flags =
++      virtgpu_bo_blob_flags(gpu, flags, external_handles);
+ 
+    uint32_t res_id;
+    uint32_t gem_handle = virtgpu_ioctl_resource_create_blob(
+@@ -1487,8 +1493,9 @@
+ virtgpu_init_params(struct virtgpu *gpu)
+ {
+    const uint64_t required_params[] = {
+-      VIRTGPU_PARAM_3D_FEATURES,   VIRTGPU_PARAM_CAPSET_QUERY_FIX,
+-      VIRTGPU_PARAM_RESOURCE_BLOB, VIRTGPU_PARAM_CROSS_DEVICE,
++      VIRTGPU_PARAM_3D_FEATURES,
++      VIRTGPU_PARAM_CAPSET_QUERY_FIX,
++      VIRTGPU_PARAM_RESOURCE_BLOB,
+       VIRTGPU_PARAM_CONTEXT_INIT,
+    };
+    uint64_t val;
+@@ -1520,6 +1527,14 @@
+       return VK_ERROR_INITIALIZATION_FAILED;
+    }
+ 
++   /* Cross-device feature is optional.  It enables sharing dma-bufs
++    * with other virtio devices, like virtio-wl or virtio-video used
++    * by ChromeOS VMs.  Qemu doesn't support cross-device sharing.
++    */
++   val = virtgpu_ioctl_getparam(gpu, VIRTGPU_PARAM_CROSS_DEVICE);
++   if (val)
++      gpu->supports_cross_device = true;
++
+    /* implied by CONTEXT_INIT uapi */
+    gpu->max_timeline_count = 64;
+ 

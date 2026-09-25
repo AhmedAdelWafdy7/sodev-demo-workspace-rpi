@@ -1,0 +1,65 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 06 Sep 2026 01:20:01 +0900
+Subject: [PATCH] wayland_vulkan: build against Vulkan-Headers before 1.3.296
+
+Vulkan-Headers 1.3.296 moved resultCheck and defaultDispatchLoaderDynamic from
+VULKAN_HPP_NAMESPACE into VULKAN_HPP_NAMESPACE::detail. This source is written against
+the post-move layout, so on an older header set both uses fail with
+
+  error: 'vk::detail' has not been declared
+
+AGL scarthgap ships Vulkan-Headers 1.3.275, and the copy vendored in this tree
+(third_party/Vulkan-Headers, v1.3.292) is also pre-move -- and is not on the include path
+in any case, because third_party/CMakeLists.txt adds Vulkan-Headers/include/vulkan while
+the source includes "vulkan/vulkan.hpp", one level too deep to resolve. So the sysroot's
+headers are what this actually compiles against.
+
+Rather than move the call sites backwards, alias the pre-move names into vk::detail under
+a VK_HEADER_VERSION guard. The call sites are then untouched, and the file still builds
+unchanged once the distro's headers reach 1.3.296.
+
+The alias must come after VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE, which is
+what declares the variable being aliased. VULKAN_HPP_DISPATCH_LOADER_DYNAMIC is already
+forced to 1 by wayland_vulkan.h:25, so the dynamic dispatcher exists on both header
+versions.
+
+Upstream: not submitted. Local to the flutter-auto-vulkan recipe, which exists only to
+measure the AGL instrument cluster on Vulkan against the same application on OpenGL.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [compatibility shim for Vulkan-Headers older than
+ 1.3.296; upstream builds against current headers and has no reason to carry it]
+ A backward-compatibility guard for Vulkan-Headers older than 1.3.296, which is
+ what AGL scarthgap ships (1.3.275). Upstream builds against a newer header set,
+ so it has no reason to carry this; it has not been submitted.
+---
+ shell/backend/wayland_vulkan/wayland_vulkan.cc | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/shell/backend/wayland_vulkan/wayland_vulkan.cc b/shell/backend/wayland_vulkan/wayland_vulkan.cc
+--- a/shell/backend/wayland_vulkan/wayland_vulkan.cc
++++ b/shell/backend/wayland_vulkan/wayland_vulkan.cc
+@@ -26,6 +26,22 @@
+ 
+ VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
+ 
++// Vulkan-Headers 1.3.296 moved resultCheck and defaultDispatchLoaderDynamic into
++// VULKAN_HPP_NAMESPACE::detail. The uses below are written against that layout; on the
++// 1.3.275 headers AGL scarthgap ships, both live at namespace scope and the compiler
++// reports "'vk::detail' has not been declared".
++//
++// Alias the pre-move names into vk::detail instead of rewriting the call sites, so this
++// file is correct on both header generations and needs no further change when the distro
++// catches up. This must follow the storage macro above: that is what declares
++// defaultDispatchLoaderDynamic.
++#if VK_HEADER_VERSION < 296
++namespace vk::detail {
++using VULKAN_HPP_NAMESPACE::defaultDispatchLoaderDynamic;
++using VULKAN_HPP_NAMESPACE::resultCheck;
++}  // namespace vk::detail
++#endif
++
+ const auto& d = vk::detail::defaultDispatchLoaderDynamic;
+ 
+ #define S1(x) #x

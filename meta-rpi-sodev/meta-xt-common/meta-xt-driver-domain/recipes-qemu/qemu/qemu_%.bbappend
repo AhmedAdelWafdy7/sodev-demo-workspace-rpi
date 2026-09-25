@@ -20,6 +20,16 @@
 # Mechanism: a .bbappend in this layer is parsed after the base recipe + base
 # .bbappend, so plain '=' re-assignments and :append/:remove here win. Patch
 # files live in this layer's files/; meta-xt-qemu stays pristine.
+#
+# meta-xt-qemu now provides TWO qemu recipes -- 10.0.2 (the default, Vulkan lane)
+# and 7.0.0 (the `--gpu=gl` lane) -- and a qemu_%.bbappend applies to both, as
+# well as to oe-core's own
+# qemu_10.2.0.bb which this layer's 10.0.2 recipe `require`s (bitbake-layers
+# show-appends confirms all three; qemu-system-native gets only
+# meta-virtualization's bbappend, so nothing here reaches a native build). The
+# source patches are 7.0.0-only and gated on PV accordingly, the gtk+/pixman pair
+# is Venus-only and gated on DISTRO_FEATURES, and the package split plus the vhost
+# and kvm deltas are version- and lane-independent and stay unconditional.
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
@@ -29,27 +39,85 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # the IOREQ rangeset (self-heals -EEXIST partial overlaps), fixing a spurious
 # Xen data abort and the resulting guest vp_interrupt panic. class-target only,
 # matching how the base qemu.inc appends cross.patch.
-SRC_URI:append:class-target = " file://0101-fix-qapi-event-emit-no-qmp-monitor-std.patch"
-SRC_URI:append:class-target = " file://0103-fix-defer-autostart-vmstart-to-main-loop.patch"
-SRC_URI:append:class-target = " file://0110-xen-ioreq-isr-range-fix.patch"
-# rpi5-0111: virtio-tablet emits BTN_TOUCH so Android (DomA/AAOS) treats it as a
-# touchscreen — required for the HDMI-A-2 USB touch panel to work.
-SRC_URI:append:class-target = " file://0111-virtio-input-hid-send-BTN_TOUCH-event-for-virtio-tab.patch"
+#
+# ALL SIX patches below are written against 7.0.0 sources, so they are gated on
+# PV: meta-xt-qemu also carries qemu_10.0.2.bb -- the Venus-capable build, which is
+# what the DEFAULT lane (--gpu=vulkan) selects, see docs/VULKAN-VENUS.md -- and this
+# bbappend applies to both recipes. Applying a 7.0.0 patch to qemu 10 sources would
+# fail do_patch, so the 10.0.2 lane deliberately starts with none of them and gets
+# back only what it actually needs.
+#
+# Status of all six against v10.0.2-xt (SRCREV f460a035). None is open any more,
+# which is what allowed the default to move to the Vulkan lane:
+#   0101 RESUME/QAPI guard              -- NOT NEEDED. It guards a RESUME emit that
+#                                          died before the main loop was up in 7.0.0;
+#                                          the code moved (softmmu/vl.c ->
+#                                          system/vl.c) and the death does not
+#                                          reproduce: both guests' device models came
+#                                          up on every boot of the RPi4 board
+#                                          verification, 2026-09-10..12. (No claim
+#                                          here about WHY -- libxl does give the
+#                                          device model a control monitor -- only
+#                                          that the failure this guarded is not
+#                                          observed on 10.0.2.)
+#   0103 deferred autostart vm_start    -- NOT NEEDED, same evidence as 0101; the
+#                                          autostart path in 10.0.2 still calls
+#                                          qmp_cont() from x_exit_preconfig, but
+#                                          nothing in it dies here any more. Revive
+#                                          BOTH if a device model is ever seen to exit
+#                                          during creation.
+#   0110 virtio-pci ISR IOREQ range     -- REBASED as meta-xt-qemu's 0120, against the
+#                                          fork's reworked xen ioreq code.
+#   0111 virtio-tablet BTN_TOUCH        -- REBASED as meta-xt-qemu's 0118, which is
+#                                          smaller than this one because 10.0.2 already
+#                                          has 'touch' in InputButton and BTN_TOUCH in
+#                                          keymap_button (so the tablet already
+#                                          advertises it) -- only the send-side remap
+#                                          was missing. This 7.0.0 copy stays for the
+#                                          7.0.0 lane.
+#   0112 vTPM GUEST_TPM_BASE guard      -- MOOT. 10.0.2 has no hw/arm/xen_arm.c at all
+#                                          (the Arm Xen machine is hw/arm/xen-pvh.c on
+#                                          the xen-pvh-common code), and GUEST_TPM_BASE
+#                                          appears nowhere in the tree -- checked in the
+#                                          fork at that SRCREV.
+#   0113 sched_attr redefinition guard  -- FIXED UPSTREAM. 10.0.2's own
+#                                          linux-user/syscall.c already wraps the local
+#                                          struct in #ifndef SCHED_ATTR_SIZE_VER0.
+QEMU_XT_7_0_0_PATCHES = " \
+    file://0101-fix-qapi-event-emit-no-qmp-monitor-std.patch \
+    file://0103-fix-defer-autostart-vmstart-to-main-loop.patch \
+    file://0110-xen-ioreq-isr-range-fix.patch \
+    file://0111-virtio-input-hid-send-BTN_TOUCH-event-for-virtio-tab.patch \
+    file://0112-xen-arm-guard-vtpm-on-guest-tpm-base.patch \
+    file://0113-linux-user-guard-sched-attr-redefinition.patch \
+"
+# rpi5-0111 is in the list above because Android (DomA/AAOS) treats an ABS_X/ABS_Y
+# device as a touchscreen only when it also sends BTN_TOUCH -- required for the
+# HDMI-A-2 USB touch panel. Ported verbatim from V4H meta-xen-domd (EPAM).
 # rpi5-0112 [Xen 4.21]: Xen 4.21 removed GUEST_TPM_BASE/SIZE (ARM vTPM guest
 # layout) from public/arch-arm.h, breaking qemu xen_arm.c xen_enable_tpm()
-# (referenced inside #ifdef CONFIG_TPM). vTPM is unused here; guard the wiring
-# on the define so qemu builds against both 4.19 and 4.21 headers.
-SRC_URI:append:class-target = " file://0112-xen-arm-guard-vtpm-on-guest-tpm-base.patch"
+# (referenced inside #ifdef CONFIG_TPM). vTPM is unused here; the patch guards the
+# wiring on the define so qemu builds against both 4.19 and 4.21 headers.
 # rpi5-0113 [wrynose / glibc 2.43]: qemu 7.0.0 linux-user/syscall.c defines its
 # own `struct sched_attr` ("not defined in glibc") which glibc 2.43 (wrynose)
 # now provides via <sched.h> -> "redefinition of struct sched_attr" in
-# do_compile. Guard the local definition with #ifndef SCHED_ATTR_SIZE_VER0
-# (glibc's own struct guard); the two definitions are field-identical.
-SRC_URI:append:class-target = " file://0113-linux-user-guard-sched-attr-redefinition.patch"
+# do_compile. The patch guards the local definition with #ifndef
+# SCHED_ATTR_SIZE_VER0 (glibc's own struct guard); the two definitions are
+# field-identical.
+# startswith('7.'), not contains('PV', '7.0.0'): bb.utils.contains matches the
+# whole whitespace-separated token, so the moment PV becomes 7.0.0+git<sha> (a
+# SRCREV-following recipe, an AUTOREV experiment) the exact match fails and all six
+# patches disappear SILENTLY. Two of them -- 0112 (Xen 4.21 dropped
+# GUEST_TPM_BASE) and 0113 (glibc 2.43 defines struct sched_attr) -- are what make
+# qemu 7.0.0 compile at all, so the symptom would not look like a missing patch; it
+# would look like an unrelated compile error. A prefix test keeps working across
+# 7.x, and a hypothetical qemu 8.x would fail loudly at do_patch instead, which is
+# the better failure.
+SRC_URI:append:class-target = "${@d.getVar('QEMU_XT_7_0_0_PATCHES') if d.getVar('PV').startswith('7.') else ''}"
 # NOTE: a virtio-gpu EDID 60Hz patch was investigated for the AGL cluster (DomU)
 # free-run (~104fps) but ABANDONED: the EDID refresh_rate is advisory only, and
 # the older guest virtio_gpu DRM (DomU kernel) emits an immediate (ASAP)
-# synthetic flip-done that defeats weston/Flutter frame pacing — so the reported
+# synthetic flip-done that defeats weston/Flutter frame pacing -- so the reported
 # EDID rate does not cap the frame rate. The real cap lives in the DomU guest
 # stack (guest virtio_gpu vblank timer, or agl-compositor/Flutter repaint
 # pacing), not in the qemu-side EDID. See fps investigation notes.
@@ -84,6 +152,41 @@ RPROVIDES:${PN}-aarch64:remove:class-target = "${PN}-system-aarch64"
 #     into qemu
 #   - kvm is removed: Xen does not need KVM
 PACKAGECONFIG:append = "${@bb.utils.contains('DISTRO_FEATURES', 'enable_virtio', ' vhost', '', d)}"
-# gtk+ PACKAGECONFIG is omitted (librsvg-native build failure); SDL is used
-# instead via the -display sdl,gl=on device-model option.
+# gtk+ PACKAGECONFIG, with the pixman it needs, for the Venus lane only. The
+# guests display through SDL (-display sdl,gl=es); what gtk has and SDL lacks
+# for the Venus device:
+#
+#   * upstream qemu sets `qemu_egl_display` only from the egl-headless, dbus,
+#     spice and gtk display backends (ui/egl-helpers.c, ui/gtk.c:2137), never
+#     from sdl, and without it virtio_gpu_virgl_init() does not install the v4
+#     get_egl_display callback, so vrend cannot import a guest dma-buf via EGL.
+#     meta-xt-qemu's 0117 is what makes sdl set it, from SDL's own EGLDisplay.
+#   * sdl also does not implement the dmabuf display ops (dpy_gl_scanout_dmabuf and
+#     friends); console.c, egl-headless, dbus, spice and gtk do.
+#   * upstream's documented configuration for venus is `-display gtk,gl=on`
+#     (qemu.readthedocs.io virtio-gpu, and Collabora's venus-on-qemu write-up). SDL is not
+#     a supported display for this device.
+#
+# gtk+3 pulls in librsvg-native, which builds on DomD's oe-core: the
+# pkg-config-native wrapper bug that breaks it on scarthgap
+# (EXTRA_NATIVE_PKGCONFIG_PATH not passed through) is fixed by oe-core
+# a59fa4a4bf ("pkg-config-native,librsvg-native: fix
+# EXTRA_NATIVE_PKGCONFIG_PATH"), which the oe-core revision DomD builds with
+# includes.
+#
+# GATED ON THE VENUS DISTRO_FEATURE, because every reason above is a Venus one.
+# The guests run -display sdl,gl=es in both lanes, so no guest selects the gtk
+# backend, and ungated this bbappend would add gtk+3, librsvg and pixman to the
+# gl lane's DomD rootfs and to qemu 7.0.0, that lane's device model.
+#
+# pixman comes with gtk, not on its own: qemu's meson refuses gtk without it --
+#   meson.build:1949: ERROR: Feature gtk cannot be enabled: cannot enable GTK if pixman
+#   is not available
+# The effective set was "epoxy fdt gtk+ pie sdl seccomp slirp vhost virglrenderer
+# virtfs xen" with no pixman, so enabling gtk alone fails do_configure.
+#
+# Kept because this is the configuration that was verified on hardware. Whether
+# the pair is still needed now that 0117 gives SDL an EGLDisplay has not been
+# measured.
+PACKAGECONFIG:append = "${@bb.utils.contains('DISTRO_FEATURES', 'venus', ' gtk+ pixman', '', d)}"
 PACKAGECONFIG:remove = "${@bb.utils.contains('DISTRO_FEATURES', 'enable_virtio', ' kvm', '', d)}"

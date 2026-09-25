@@ -1,0 +1,186 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 13 Sep 2026 17:36:40 +0900
+Subject: [PATCH] vkr: name the failing command when the command stream goes
+ fatal
+
+Diagnostic only -- no behaviour change on a healthy stream.
+
+DomA's SurfaceFlinger cannot composite through Venus: its context dies with a
+command-stream error, init restarts it, and the screen is corrupted. Measured on
+RPi4 hardware 2026-09-08 at 1920x1200 with the display mode matching the
+monitor's EDID (so this is not the earlier mode-mismatch defect) -- GL composites
+correctly at the same settings, Vulkan does not.
+
+Why the existing logs cannot identify the cause:
+
+  * the reported command name is not evidence past a context's FIRST fault.
+    ctx->cs_fatal_error is one non-atomic, never-cleared bool shared by every
+    decoder and encoder in the context (vkr_context.h:91, aliased at
+    vkr_cs.c:56, vkr_ring.c:135, vkr_context.c:724, sticky per the comment at
+    vkr_cs.c:140), and "%s resulted in CS error" tests that shared flag after
+    the handler returns.
+  * a desync cannot be caught where it happens. The build is -DNDEBUG
+    (confirmed in build.ninja for venus_vkr_cs.c.o), so
+    vkr_cs_decoder_sanity_check()'s assert(dec->cur <= dec->end) is inert at all
+    four of its call sites.
+  * only one of the two submit loops was ever instrumented. A capture showed
+    both "ring_submit_cmd: vn_dispatch_command failed" (vkr_ring.c) and
+    "submit_cmd: vn_dispatch_command failed" (vkr_context.c, the direct path).
+
+This adds, in that order: a shared logging helper, the pre-dispatch cursor in
+BOTH submit loops, and one live sanity condition.
+
+The helper checks its bounds before touching anything, and that is not defensive
+padding. cmd_begin is not necessarily inside [buffer, buffer + size):
+vkExecuteCommandStreamsMESA repoints the decoder at a resource via
+vkr_cs_decoder_set_resource_stream(), so the next iteration of the loop starts
+inside that resource. Computing cmd_begin - buffer without the check and reading
+through it kills the render server -- measured as "proxy: failed to send
+message: Broken pipe" with no dump line printed at all.
+
+What the capture already told us without the dump, and why it is worth having:
+the failing lookup was
+
+    vkr: failed to look up object 4294967307 of type 6
+    vkr: vkCmdDraw resulted in CS error
+
+type 6 is VK_OBJECT_TYPE_COMMAND_BUFFER and 4294967307 is 0x1_0000_000B -- the
+low dword is a plausible small object id (11) with a stray 1 in the high dword.
+A guest that encoded a handle would encode a valid id, so garbage in the upper
+half points at a shifted 64-bit read, i.e. a real cursor desync rather than the
+guest sending a wrong-but-valid handle. The dump is what turns that inference
+into a measurement: the byte offset and the leading bytes say whether the shift
+is 4 or 8 bytes and what the neighbouring word was.
+
+The live condition is dec->cur running past dec->end. It fires at the
+divergence, before any object lookup, so its presence or absence in the next
+capture separates a genuine desync from a bad handle. It is done as an explicit
+check rather than by dropping -DNDEBUG globally, because that would also re-arm
+vkr_context.h's duplicate-object-id assert and abort the render server on a
+condition the release build tolerates today.
+
+Ruled out from source before writing this, so they are not re-tried: the
+decoder, its cursor and its temp pool are per-ring, not per-context
+(vkr_ring.h:89, vkr_cs.h:81-82, vkr_ring.c:214), and one thread drives each
+ring, so two rings cannot corrupt each other's stream position; the ring wrap
+arithmetic mirrors the guest's write split (vkr_ring.c:84-101 against Mesa's
+vn_ring.c:126-140); the temp pool cap is 1 GiB; and the direct path copies the
+whole pending range into a private buffer before decoding. VN_PERF=no_multi_ring
+does not prevent the failure, and the commands seen failing (vkCmdDraw,
+vkAllocateDescriptorSets, vkCreateImageView, vkCmdCopyBufferToImage) all travel
+the primary ring, which is consistent with multi-ring not being the mechanism.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [diagnostic instrumentation]
+---
+--- a/src/venus/vkr_ring.c
++++ b/src/venus/vkr_ring.c
+@@ -220,9 +220,13 @@
+    vkr_cs_decoder_set_buffer_stream(dec, buffer, size);
+ 
+    while (vkr_cs_decoder_has_command(dec)) {
++      const uint8_t *cmd_begin = dec->cur;
+       vn_dispatch_command(&ring->dispatch);
+       if (vkr_cs_decoder_get_fatal(dec)) {
+          vkr_log("ring_submit_cmd: vn_dispatch_command failed");
++         vkr_log("ring_submit_cmd: ring %" PRIu64 " ctx %u ring_head=%u", ring->id,
++                 ((const struct vkr_context *)ring->dispatch.data)->ctx_id, ring_head);
++         vkr_cs_decoder_log_fatal_cmd(dec, "ring_submit_cmd", buffer, size, cmd_begin);
+ 
+          vkr_cs_decoder_reset(dec);
+          return false;
+--- a/src/venus/vkr_cs.c
++++ b/src/venus/vkr_cs.c
+@@ -104,6 +104,21 @@
+       assert(pool->cur <= pool->end);
+    }
+ 
++   /* Make just this one condition live. It is checked from four call sites and
++    * fires AT the divergence, before any object lookup -- which is what tells a
++    * real cursor desync apart from the guest having encoded a bad handle while
++    * the cursor was still correct.
++    *
++    * Deliberately NOT done by dropping -DNDEBUG globally: that would also
++    * re-arm vkr_context.h's duplicate-object-id assert and abort the render
++    * server on a condition the release build tolerates today.
++    */
++   if (unlikely(dec->cur > dec->end)) {
++      vkr_log("cs sanity: cur %p is %zu bytes past end %p", (const void *)dec->cur,
++              (size_t)(dec->cur - dec->end), (const void *)dec->end);
++      vkr_cs_decoder_set_fatal(dec);
++   }
++
+    assert(dec->cur <= dec->end);
+ }
+ 
+--- a/src/venus/vkr_cs.h
++++ b/src/venus/vkr_cs.h
+@@ -227,6 +227,51 @@
+    dec->end = dec->cur + size;
+ }
+ 
++/* Diagnostic for the two submit loops. The shipped build is -DNDEBUG, so
++ * vkr_cs_decoder_sanity_check()'s assert(dec->cur <= dec->end) is inert and a
++ * stream desync is only noticed later, as a garbage object lookup naming a
++ * command that was never at fault. Print where the offending command actually
++ * started and what its bytes were.
++ *
++ * cmd_begin is NOT necessarily inside [buffer, buffer + size): a command such
++ * as vkExecuteCommandStreamsMESA repoints the decoder at a resource through
++ * vkr_cs_decoder_set_resource_stream(), and the next iteration of the submit
++ * loop then starts inside that resource instead. Dereferencing it against the
++ * buffer without a bounds check kills the render server (measured: "proxy:
++ * failed to send message: Broken pipe" with no dump line), so the bounds are
++ * checked before any pointer arithmetic or read.
++ */
++static inline void
++vkr_cs_decoder_log_fatal_cmd(const struct vkr_cs_decoder *dec,
++                             const char *tag,
++                             const uint8_t *buffer,
++                             size_t size,
++                             const uint8_t *cmd_begin)
++{
++   if (!cmd_begin || cmd_begin < buffer || cmd_begin >= buffer + size) {
++      vkr_log("%s: fatal on a non-buffer stream (cmd_begin %p outside [%p,%p)); "
++              "the decoder had been repointed at a resource",
++              tag, (const void *)cmd_begin, (const void *)buffer,
++              (const void *)(buffer + size));
++      return;
++   }
++
++   const size_t off = (size_t)(cmd_begin - buffer);
++   size_t n = size - off;
++   if (n > 32)
++      n = 32;
++   char hex[32 * 3 + 1];
++   for (size_t i = 0; i < n; i++)
++      snprintf(hex + i * 3, 4, "%02x ", cmd_begin[i]);
++   hex[n ? n * 3 - 1 : 0] = 0;
++
++   const uint8_t *cur = dec->cur;
++   const size_t consumed =
++      (cur >= cmd_begin && cur <= buffer + size) ? (size_t)(cur - cmd_begin) : 0;
++   vkr_log("%s: chunk=%zu cmd_off=%zu consumed=%zu bytes=[%s]", tag, size, off,
++           consumed, hex);
++}
++
+ bool
+ vkr_cs_decoder_set_resource_stream(struct vkr_cs_decoder *dec,
+                                    struct vkr_context *ctx,
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -170,9 +170,13 @@
+    vkr_cs_decoder_set_buffer_stream(&ctx->decoder, buffer, size);
+ 
+    while (vkr_cs_decoder_has_command(&ctx->decoder)) {
++      const uint8_t *cmd_begin = ctx->decoder.cur;
+       vn_dispatch_command(&ctx->dispatch);
+       if (vkr_context_get_fatal(ctx)) {
+          vkr_log("submit_cmd: vn_dispatch_command failed");
++         vkr_log("submit_cmd: ctx %u (direct path, no ring)", ctx->ctx_id);
++         vkr_cs_decoder_log_fatal_cmd(&ctx->decoder, "submit_cmd", buffer, size,
++                                      cmd_begin);
+ 
+          vkr_cs_decoder_reset(&ctx->decoder);
+          return false;

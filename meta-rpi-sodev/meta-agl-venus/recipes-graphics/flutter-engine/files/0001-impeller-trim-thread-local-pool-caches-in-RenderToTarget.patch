@@ -1,0 +1,62 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 06 Sep 2026 01:20:01 +0900
+Subject: [PATCH] impeller: trim the thread-local pool caches in RenderToTarget
+
+Upstream fixed this leak in flutter/flutter PR #182265, in
+GPUSurfaceVulkanImpeller::AcquireFrame, which engine 3.32.5 predates. This is
+not that change: it makes the same call from RenderToTarget()'s cleanup closure,
+which both of that surface's encode callbacks go through.
+
+Impeller's Vulkan backend keeps its command pools and descriptor pools in thread-local
+caches, which are only trimmed when Context::DisposeThreadLocalCachedResources() is called.
+In 3.32.5 DisplayListToTexture() does that in its cleanup closure;
+RenderToTarget() -- what the embedder API's Vulkan surface calls from
+GPUSurfaceVulkanImpeller's encode callback -- does not, and on the embedder path
+(a GPUSurfaceVulkanImpeller with a delegate) nothing else does either. So on
+that path those caches grow for as long as the frame loop runs.
+
+Measured on a Raspberry Pi 5 with an AGL Flutter instrument cluster in a Xen DomU, drawing
+through Venus (virtio-gpu Vulkan). A census of the host renderer's live Vulkan objects over
+30 s of rendering:
+
+    VK_OBJECT_TYPE_DESCRIPTOR_POOL   0 -> 1540    (~2 per frame, no plateau)
+    VK_OBJECT_TYPE_IMAGE_VIEW        2 ->  857
+    DEVICE_MEMORY / IMAGE / SHADER_MODULE: flat
+
+with the host accumulating 24-37 MiB/s of GPU memory while the guest's own memory did not
+move -- the pools are cheap handles in the guest and real backing store on the host. Freeing
+that set when the client finally exits is itself hazardous: on this hardware it livelocked
+the host kernel's V3D GEM-free path and starved RCU until the domain was unreachable.
+
+The upstream issue is flutter/flutter#183267, which reports the same omission for the third
+path (EmbedderExternalViewEmbedder) and notes #182265 and #182402 fixed the other two.
+
+The call goes through the base impeller::Context interface, so it is a no-op on non-Vulkan
+backends.
+
+Upstream: not submitted; upstream has its own fix, #182265, which later engines
+carry.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [engine 3.32.5 only: upstream fixed this leak in
+ GPUSurfaceVulkanImpeller::AcquireFrame (flutter/flutter#182265), which later
+ engines carry; this makes the same call from RenderToTarget() instead]
+---
+diff --git a/engine/src/flutter/impeller/display_list/dl_dispatcher.cc b/engine/src/flutter/impeller/display_list/dl_dispatcher.cc
+index 073c219c770..cee887177ca 100644
+--- a/engine/src/flutter/impeller/display_list/dl_dispatcher.cc
++++ b/engine/src/flutter/impeller/display_list/dl_dispatcher.cc
+@@ -1384,6 +1384,12 @@ bool RenderToTarget(ContentContext& context,
+       context.GetTransientsBuffer().Reset();
+     }
+     context.GetTextShadowCache().MarkFrameEnd();
++    // DisplayListToTexture() above does this and RenderToTarget() did not.
++    // Without it the Vulkan backend's thread-local command-pool and
++    // descriptor-pool caches are never trimmed, so they grow for as long as
++    // the frame loop runs. The call goes through the base impeller::Context
++    // interface and is a no-op on non-Vulkan backends.
++    context.GetContext()->DisposeThreadLocalCachedResources();
+   });
+ 
+   display_list->Dispatch(impeller_dispatcher, cull_rect);

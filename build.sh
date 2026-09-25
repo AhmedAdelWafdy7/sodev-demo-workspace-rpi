@@ -31,6 +31,10 @@ BOARD_RAM="${BOARD_RAM:-}"                         # --ram=<sku> : board SKU. rp
 ENABLE_DOMU="${ENABLE_DOMU:-no}"                   # -u/--domu    : add DomU (AGL cluster: p1 kernel + p3 rootfs)
 ENABLE_ANDROID="${ENABLE_ANDROID:-no}"             # -a/--android : add DomA (AAOS p4 nested GPT; heavy)
 ENABLE_DOMZ="${ENABLE_DOMZ:-no}"                   # -z/--domz    : add DomZ (Zephyr guest / RTOS domain: p1 zephyr-domz.bin)
+GPU="${GPU:-vulkan}"                               # --gpu=vulkan|gl : guest graphics stack. vulkan (default) = Venus (guest
+                                                   #   Vulkan over virtio-gpu) for DomA and DomU on qemu 10.0.2-xt; gl = the
+                                                   #   pre-Venus OpenGL stack on qemu 7.0.0-xt
+ENABLE_DEVEL="${ENABLE_DEVEL:-no}"                 # --devel      : add meta-rpi-sodev-devel to the DomD build (diagnostics; never ships)
 NINJA_TARGET="${NINJA_TARGET-image-full}"          # --domains-only => "" (build domains, skip SD assembly)
 AAOS_SRC_DIR="${AAOS_SRC_DIR:-}"                    # --aaos-src=<dir>       (reuse an AOSP checkout, source mode)
 AAOS_MODE="${AAOS_MODE:-}"                          # --aaos=off|auto|source|prebuilt (empty: derived from -a — off, or auto when -a given)
@@ -105,10 +109,31 @@ Domain options:
                            + DomA 2560; 4g = DomD 1024 MiB (bank2 dropped, bank0 640
                            MiB); DomA and DomU then cannot RUN at the same time (each
                            fits alone) -- build.sh says so and both still go on the SD,
-                           so pick one at run time.
+                           so pick one at run time. With --gpu=vulkan the 4g SKU moves
+                           384 MiB from DomA to DomD (DomD 1408, DomA 2176); the 8g SKU
+                           is unchanged.
       --domains-only     Build the domains but skip SD-image assembly (no full.img;
                          with -a this also skips the DomA p4 nested GPT, which rouge
                          assembles only during SD-image assembly)
+      --gpu=<stack>      vulkan (DEFAULT) | gl -- which graphics stack the guests get.
+                           vulkan: DomA and DomU render with Vulkan through Venus. The
+                             device model is qemu 10.0.2-xt (the venus= property needs
+                             >= 9.2), virglrenderer keeps its venus backend and gains
+                             render-server + minigbm_allocation, hostmem/blob/venus go on
+                             the guests' virtio-gpu-gl, the DomD/DomU Vulkan runtime is
+                             installed, DomA composites with SkiaVk and DomU's cluster
+                             runs the Vulkan (Impeller) embedder.
+                           gl: the pre-Venus OpenGL stack -- qemu 7.0.0-xt with its six
+                             device-model patches, virglrenderer without venus, no blob
+                             window, the pre-Venus memory split (rpi4 4g SKU only --
+                             the 8g SKU and the Pi 5 have one split), and the OpenGL
+                             embedder for the DomU cluster. Build it to compare against,
+                             or when a board's Venus path is not working.
+                           See docs/VULKAN-VENUS.md.
+      --devel            Add meta-rpi-sodev-devel to the DomD build: the Venus phase 0-3
+                         gate (sodev-venus-gate.sh), the Vulkan reproducers, the VRAM/CMA
+                         tools, and the diagnostic virglrenderer and Xen patches.
+                         Diagnostics only -- never part of a shipping image.
 
 DomA (AAOS) options:
       --aaos=<mode>      off | auto | source | prebuilt   (default: off; -a => auto)
@@ -223,6 +248,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -u|--domu)          ENABLE_DOMU=yes ;;
     -a|--android)       ENABLE_ANDROID=yes; ANDROID_FLAG=yes ;;   # "want DomA"; required-ness is derived below
+    --gpu)              needval $# "$1"; GPU="$2"; shift ;;
+    --gpu=*)            GPU="${1#*=}" ;;
+    --devel)            ENABLE_DEVEL=yes ;;
     --board)            needval $# "$1"; BOARD="$2"; shift ;;
     --board=*)          BOARD="${1#*=}" ;;
     -z|--domz)          ENABLE_DOMZ=yes ;;
@@ -280,6 +308,13 @@ case "$ENABLE_DOMU" in no|yes) ;; *) echo "ERROR: ENABLE_DOMU must be 'no' or 'y
 # variants are exactly "yes"/"no", so a stray value would pass through and then
 # silently mean "no".
 case "$ENABLE_DOMZ" in no|yes) ;; *) echo "ERROR: ENABLE_DOMZ must be 'no' or 'yes' (got '$ENABLE_DOMZ'); use -z/--domz" >&2; exit 1 ;; esac
+# Same for GPU and ENABLE_DEVEL: both reach moulin verbatim, and the yaml parameters
+# accept only these values (moulin errors out on anything else, but late and less
+# clearly).
+# GPU is not namespaced like the other knobs, so name the environment in the error.
+case "$GPU" in vulkan|gl) ;; *) echo "ERROR: --gpu must be 'vulkan' or 'gl' (got '$GPU'; from the GPU environment variable?)" >&2; exit 1 ;; esac
+case "$ENABLE_DEVEL" in no|yes) ;; *) echo "ERROR: ENABLE_DEVEL must be 'no' or 'yes' (got '$ENABLE_DEVEL'); use --devel" >&2; exit 1 ;; esac
+
 # --- Board selection (which product yaml) --------------------------------------
 # One yaml per board, named <board>-sodev.yaml. They are siblings, not variants of one
 # file: the SoC, the machine, the Zephyr Dom0 board, the passthrough set and the whole
@@ -409,6 +444,23 @@ if [ "$AAOS_MODE" = auto ]; then
 fi
 # ENABLE_ANDROID is derived from the resolved mode (drives moulin + yaml DomA gating).
 if [ "$AAOS_MODE" = off ]; then ENABLE_ANDROID=no; else ENABLE_ANDROID=yes; fi
+
+# --gpu=gl: say out loud that this is the pre-Venus stack rather than the default one.
+# Note rather than warn: the lane is legitimate and supported, it is simply not what
+# the product ships. Same shape as the rpi4-4g/rpi5-8g + DomA warnings below.
+if [ "$GPU" = gl ]; then
+  echo ">> NOTE: --gpu=gl builds the PRE-VENUS OpenGL stack, not the default one:"
+  echo ">>       device model qemu 7.0.0-xt with its six 7.0.0-only patches,"
+  echo ">>       virglrenderer without the venus backend, no blob/hostmem window on the"
+  echo ">>       guests' virtio-gpu-gl, the pre-Venus memory split (rpi4 4g SKU only),"
+  echo ">>       and the OpenGL embedder for the DomU cluster."
+  echo ">>       NOTE: DomA's AOSP-side settings (the Venus ICD, SkiaVk"
+  echo ">>       compositing) come from this tree whatever --gpu says, so a"
+  echo ">>       DomA built here still asks for Vulkan on a device model that"
+  echo ">>       has no venus. That pairing is not measured; a pre-Venus DomA"
+  echo ">>       needs those settings reverted."
+  echo ">>       See docs/VULKAN-VENUS.md."
+fi
 echo ">> AAOS mode: $AAOS_MODE  (ENABLE_ANDROID=$ENABLE_ANDROID)"
 
 # --- 8 GB SKU: report the memory budget ---------------------------------------
@@ -1575,6 +1627,72 @@ if [ "${ENABLE_DOMU}" = "yes" ]; then
   fi
   mkdir -p "$AGL_DL_DIR" "$AGL_SSTATE_DIR"
   echo ">> DomU(AGL) in ${AGL_DOCKER}: branch=${AGL_BRANCH} image=${AGL_IMAGE}"
+  # The Venus lane reaches this rootfs through four conf lines plus one layer,
+  # appended below.
+  # This bitbake runs the AGL manifest's own Yocto (poky scarthgap) in its own
+  # container, and that series does not do Venus out of the box -- measured against
+  # the pinned revisions, not assumed:
+  #   * AGL_DEFAULT_DISTRO_FEATURES (meta-agl-core/conf/distro/poky-agl.conf:50) is
+  #     "usrmerge largefile opengl wayland pam bluetooth bluez5 3g polkit" -- no
+  #     'vulkan', so vulkan-loader/vulkan-tools are skipped by their
+  #     REQUIRED_DISTRO_FEATURES and putting them in IMAGE_INSTALL fails the build;
+  #   * scarthgap's mesa.inc:107-115 never puts 'virtio' in VULKAN_DRIVERS (intel and
+  #     amd on x86, freedreno, broadcom, swrast, imagination-experimental only), so
+  #     libvulkan_virtio.so is not produced. mesa.inc:116's PACKAGECONFIG[vulkan]
+  #     runs the value through strip_comma, which is why ",virtio" is the right
+  #     idiom, and PACKAGECONFIG picks 'vulkan' up from DISTRO_FEATURES
+  #     (mesa.inc:86) -- so the first line is what unlocks the second.
+  # Verified by building mesa + vulkan-loader + vulkan-tools on this branch:
+  # do_configure gets -Dvulkan-drivers=virtio, and mesa-vulkan-drivers ships
+  # libvulkan_virtio.so + virtio_icd.aarch64.json.
+  #
+  # THE FIRST THREE LINES ALONE ARE NOT ENOUGH, measured by running the built
+  # binaries in a Venus guest: scarthgap's mesa 24.0.7 keeps
+  # VIRTGPU_PARAM_CROSS_DEVICE in Venus's
+  # required_params (vn_renderer_virtgpu.c:1489), qemu's virtio-gpu does not advertise
+  # VIRTIO_GPU_F_RESOURCE_UUID, so the kernel does not report that param and
+  # vkCreateInstance fails with VK_ERROR_INITIALIZATION_FAILED ("required kernel param
+  # 5 is missing"). Mesa 26.0.5 -- what wrynose gives the in-tree DomU -- dropped it
+  # from required_params, which is why that guest works.
+  #
+  # So meta-agl-venus is added to the AGL build as well: one bbappend carrying that
+  # backport. With it, the AGL-built ICD enumerates -- driverName = venus,
+  # driverInfo = Mesa 24.0.7 -- measured, see docs/VULKAN-VENUS.md section 7.
+  #
+  # NOTE the scope of the first line: 'vulkan' is a DISTRO feature, so it applies to
+  # every image this AGL build produces, not only the cluster rootfs. That is the
+  # default now (--gpu=vulkan); --gpu=gl removes the whole block again.
+  # Handed to the container as a FILE, not a shell variable: the in_docker command
+  # string is double-quoted, so a host variable holding these lines (they contain
+  # double quotes and newlines) cannot survive the round trip, and escaping the $
+  # would make the container expand a variable it does not have.
+  AGL_VENUS_CONF="$workdir/.agl-venus.conf"
+  AGL_VENUS_LAYER="$workdir/meta-rpi-sodev/meta-agl-venus"
+  rm -f "$AGL_VENUS_CONF"
+  if [ "$GPU" = vulkan ]; then
+    # Marker-delimited so the container can REPLACE a previous block rather than
+    # append another one. conf/local.conf survives between runs -- aglsetup does not
+    # truncate it -- so without the markers a second run would carry
+    # VULKAN_DRIVERS:append:pn-mesa = ",virtio" twice, and a later --gpu=gl run would
+    # leave the whole block behind, making the lane sticky.
+    #
+    # flutter-auto-vulkan is the second embedder binary the Vulkan cluster needs
+    # (ivi-homescreen picks its backend at compile time, so it cannot be the same
+    # binary as the OpenGL one); meta-agl-venus builds it and switches the cluster
+    # service onto it with a systemd drop-in.
+    cat > "$AGL_VENUS_CONF" <<'AGLVENUS'
+
+# >>> venus-lane (build.sh --gpu=vulkan) >>>
+DISTRO_FEATURES:append = " vulkan"
+VULKAN_DRIVERS:append:pn-mesa = ",virtio"
+IMAGE_INSTALL:append = " mesa-vulkan-drivers vulkan-loader vulkan-tools"
+IMAGE_INSTALL:append = " flutter-auto-vulkan flutter-cluster-dashboard-conf-vulkan"
+# <<< venus-lane (build.sh --gpu=vulkan) <<<
+AGLVENUS
+    echo ">>   Venus: adding 'vulkan' to the AGL DISTRO_FEATURES, the virtio ICD to mesa"
+    echo ">>          (distro-wide for this AGL build) and the Vulkan cluster embedder"
+    echo ">>          (docs/VULKAN-VENUS.md section 7)"
+  fi
   echo ">>   AGL cache: DL_DIR=${AGL_DL_DIR}  SSTATE_DIR=${AGL_SSTATE_DIR}"
   in_docker "$AGL_DOCKER" "
     set -e
@@ -1590,6 +1708,27 @@ if [ "${ENABLE_DOMU}" = "yes" ]; then
     # conf/local.conf (relative to the build dir), last so they win over aglsetup's
     # defaults. Values are host-expanded absolute paths.
     printf '%s\n' 'DL_DIR = \"${AGL_DL_DIR}\"' 'SSTATE_DIR = \"${AGL_SSTATE_DIR}\"' >> conf/local.conf
+    # The Venus conf lines, appended after the cache paths so they are last in the
+    # file. Any block a PREVIOUS run left is deleted first: conf/local.conf is not
+    # truncated by aglsetup, so appending unconditionally would accumulate duplicates
+    # on a repeat run and would leave the block in place on a later --gpu=gl run.
+    sed -i '/^# >>> venus-lane (build.sh --gpu=vulkan) >>>$/,/^# <<< venus-lane (build.sh --gpu=vulkan) <<<$/d' conf/local.conf
+    # In the Vulkan lane the file is mandatory: without it the AGL rootfs would come out
+    # with no Venus ICD and no Vulkan embedder, i.e. a silently GL guest in the DEFAULT
+    # configuration. In the gl lane there is nothing to append.
+    if [ '${GPU}' = vulkan ] && [ ! -f '${AGL_VENUS_CONF}' ]; then
+      echo 'ERROR: ${AGL_VENUS_CONF} is missing; refusing to build AGL without Venus' >&2; exit 1
+    fi
+    if [ -f '${AGL_VENUS_CONF}' ]; then cat '${AGL_VENUS_CONF}' >> conf/local.conf; fi
+    # meta-agl-venus carries the mesa backport those conf lines need -- added when the
+    # lane is on and REMOVED when it is off, for the same reason: bitbake-layers only
+    # ever adds, so a layer left behind would keep applying its bbappends to a
+    # non-Venus AGL build.
+    if [ '${GPU}' = vulkan ]; then
+      grep -qF '${AGL_VENUS_LAYER}' conf/bblayers.conf || bitbake-layers add-layer '${AGL_VENUS_LAYER}'
+    elif grep -qF '${AGL_VENUS_LAYER}' conf/bblayers.conf; then
+      bitbake-layers remove-layer '${AGL_VENUS_LAYER}'
+    fi
     bitbake '${AGL_IMAGE}'
   "
 else
@@ -1623,7 +1762,7 @@ if [ "$AAOS_MODE" = prebuilt ]; then
   [ "$ENABLE_DOMZ" = yes ] && dom_targets="$dom_targets domz"
   NINJA_CMD="ninja $dom_targets"
   if [ "$NINJA_TARGET" = "image-full" ]; then
-    ROUGE_CMD="rouge '${MOULIN_YAML}' --DOM0_OS '${DOM0_OS}' --ENABLE_ANDROID yes --ENABLE_DOMU '${ENABLE_DOMU}' --ENABLE_DOMU_RESERVED '${ENABLE_DOMU_RESERVED}' --ENABLE_DOMZ '${ENABLE_DOMZ}' --BOARD_RAM '${BOARD_RAM}' -fi full -o full.img"
+    ROUGE_CMD="rouge '${MOULIN_YAML}' --DOM0_OS '${DOM0_OS}' --ENABLE_ANDROID yes --ENABLE_DOMU '${ENABLE_DOMU}' --ENABLE_DOMU_RESERVED '${ENABLE_DOMU_RESERVED}' --ENABLE_DOMZ '${ENABLE_DOMZ}' --BOARD_RAM '${BOARD_RAM}' --GPU '${GPU}' --ENABLE_DEVEL '${ENABLE_DEVEL}' -fi full -o full.img"
   else
     ROUGE_CMD=":"
   fi
@@ -1769,6 +1908,12 @@ if [ "$NINJA_TARGET" = "image-full" ]; then
   # BOARD_RAM is 4g|8g|16g and was validated against this board above.
   IMG_NAME="${BOARD}-${BOARD_RAM%g}GB-${img_dom0}"
   [ "$ENABLE_DOMU" = yes ]    && IMG_NAME="${IMG_NAME}-DomU"
+  # The graphics stack belongs in the name for exactly the reason this block exists:
+  # it swaps the device model (qemu 10.0.2 <-> 7.0.0) and the guests' whole render
+  # path, which is a larger difference than any other flag here, and two images that
+  # differ only by --gpu would otherwise be told apart only by timestamp. The default
+  # (vulkan) is named too, so an image's name always says which stack is in it.
+  IMG_NAME="${IMG_NAME}-$([ "$GPU" = vulkan ] && echo Venus || echo GL)"
   [ "$ENABLE_ANDROID" = yes ] && IMG_NAME="${IMG_NAME}-DomA"
   # DomZ changes what is on p1, so it belongs in the name for the same reason
   # DomU/DomA do: two images that differ only by -z are otherwise
@@ -1806,7 +1951,7 @@ in_docker "$XT_DOCKER" "
   # ENABLE_ANDROID=yes run) would otherwise be reused, so a later --dom0/-a/-u
   # change would build against the wrong bblayers.conf.
   rm -rf yocto/build-dom*/conf
-  moulin '${MOULIN_YAML}' --DOM0_OS '${DOM0_OS}' --ENABLE_ANDROID '${ENABLE_ANDROID}' --ENABLE_DOMU '${ENABLE_DOMU}' --ENABLE_DOMU_RESERVED '${ENABLE_DOMU_RESERVED}' --ENABLE_DOMZ '${ENABLE_DOMZ}' --BOARD_RAM '${BOARD_RAM}'
+  moulin '${MOULIN_YAML}' --DOM0_OS '${DOM0_OS}' --ENABLE_ANDROID '${ENABLE_ANDROID}' --ENABLE_DOMU '${ENABLE_DOMU}' --ENABLE_DOMU_RESERVED '${ENABLE_DOMU_RESERVED}' --ENABLE_DOMZ '${ENABLE_DOMZ}' --BOARD_RAM '${BOARD_RAM}' --GPU '${GPU}' --ENABLE_DEVEL '${ENABLE_DEVEL}'
   # Zephyr source cache (Yocto DL_DIR analogue): when XT_WEST_CACHE_DIR points at a
   # pre-populated west reference workspace, pull the manifest+projects from it so the
   # west fetches run offline (past a blocking proxy). 'west update' projects come via
@@ -1920,7 +2065,7 @@ in_docker "$XT_DOCKER" "
 "
 }
 
-echo ">> moulin BOARD=${BOARD} (${MOULIN_YAML}) DOM0_OS=${DOM0_OS} BOARD_RAM=${BOARD_RAM} ENABLE_ANDROID=${ENABLE_ANDROID} ENABLE_DOMU=${ENABLE_DOMU} ENABLE_DOMU_RESERVED=${ENABLE_DOMU_RESERVED} ENABLE_DOMZ=${ENABLE_DOMZ} AAOS_MODE=${AAOS_MODE} ninja='${AOSP_CMD:+$AOSP_CMD ; }${NINJA_CMD}'${rouge_note} in ${XT_DOCKER}"
+echo ">> moulin BOARD=${BOARD} (${MOULIN_YAML}) DOM0_OS=${DOM0_OS} BOARD_RAM=${BOARD_RAM} ENABLE_ANDROID=${ENABLE_ANDROID} ENABLE_DOMU=${ENABLE_DOMU} ENABLE_DOMU_RESERVED=${ENABLE_DOMU_RESERVED} ENABLE_DOMZ=${ENABLE_DOMZ} GPU=${GPU} ENABLE_DEVEL=${ENABLE_DEVEL} AAOS_MODE=${AAOS_MODE} ninja='${AOSP_CMD:+$AOSP_CMD ; }${NINJA_CMD}'${rouge_note} in ${XT_DOCKER}"
 if [ -n "$AOSP_CMD" ]; then
   echo ">> [1/2] AOSP components (DomA source build) in ${XT_DOCKER}${XT_DOCKER_RUN_OPTS_AOSP:+, extra docker run opts: $XT_DOCKER_RUN_OPTS_AOSP}"
   STAGE_RUN_OPTS=( ${XT_DOCKER_RUN_OPTS_AOSP:-} )

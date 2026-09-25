@@ -1,0 +1,145 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Thu, 24 Sep 2026 19:05:26 +0900
+Subject: [PATCH] libxl/arm: give a virtio-pci host a 256M prefetchable window
+
+libxl hands the guest's prefetchable virtio-PCI region out in eight equal slices,
+one per virtio-pci host. With the old 64 MiB region that is 8 MiB per host, and
+8 MiB is too small for the window a virtio-gpu host-visible blob (Venus) lives
+in: measured on a Raspberry Pi 5, venus itself holds ~1.2 MiB of it for its ring
+and pools, and a Vulkan client asking for anything of display size then fails
+vkAllocateMemory with VK_ERROR_OUT_OF_DEVICE_MEMORY. 32 MiB was measured and is
+too small in turn -- venus takes ~25 MiB of it and a 1920x1080 swapchain fails
+the same way.
+
+128 MiB then ran out on a full-Vulkan AAOS once its resident apps were up. Each
+process that renders with HWUI on Venus maps its own blocks into the window;
+measured on a Raspberry Pi 4 (DomA at 1280x720, 2026-09-24): launcher 23.6,
+systemui 20.6, SurfaceFlinger 19.8, car settings 19.6, maps placeholder 10.6
+and rotary 9.1 MiB -- 103 MiB of 128, the 25 MiB left split into two 11 MiB
+holes. A WebView playing video on top of that fails vkAllocateMemory
+("SharedContextState context lost via Skia OOM"), and the app either shows a
+white page or aborts with "Non owned context lost!". With HWUI on GL
+instead, the same page renders and the app maps 0-5.5 MiB of the window.
+
+Hand the region out in 256 MiB slices, against the 768 MiB region the companion
+hypervisor patch (4.22-0008) provides, so a guest's first virtio-pci host can
+carry a 256 MiB BAR (256 MiB-aligned at GUEST_VIRTIO_PCI_PREFETCH_MEM_ADDR,
+0xc0000000). That leaves three prefetchable slices where there are eight
+ECAM/MEM/IRQ slices, so a guest served by more virtio-pci hosts than there are
+prefetchable slices is refused with an explicit error instead of being handed an
+overlapping window. Every guest in this product has exactly one virtio-pci host
+-- one backend domain -- so nothing that works today stops working. The slice
+only makes room for the BAR: the window a guest actually gets is qemu's
+hostmem, which the board yamls raise to match.
+
+THE COUPLING IS ASSERTED AT COMPILE TIME. VIRTIO_PCI_MAX_PREFETCH_HOSTS is
+derived from GUEST_VIRTIO_PCI_PREFETCH_MEM_SIZE, which lives in the
+hypervisor's public/arch-arm.h and is grown from 64 MiB to 768 MiB by
+4.22-0008. The two changes are carried by two different recipes (xen and
+xen-tools), so it is possible for a tree to get one without the other. The
+BUILD_BUG_ON that the xen-troops toolstack series adds in its 0018
+(VIRTIO_PCI_MAX_HOSTS != window / slice) cannot stay, because a 256 MiB
+slice gives fewer prefetchable hosts than VIRTIO_PCI_MAX_HOSTS by design,
+and a single `<` check in its place would not catch a missing 4.22-0008
+either: with the old 64 MiB window, 64 MiB / 256 MiB truncates to zero and
+BUILD_BUG_ON(8 < 0) passes, so libxl would build and then refuse EVERY guest
+with a virtio-pci host at run time. Three assertions replace it -- at most
+VIRTIO_PCI_MAX_HOSTS slices, at least one slice, and the slice size divides
+the window -- so a tree missing 4.22-0008 fails to build instead. That is
+why the xen-tools bbappend lists 4.22-0008 as well and lists it first.
+
+The guest device tree and the device-model's xenstore keys both come from these
+values, so the guest, libxl and qemu move together. Verified on the board with
+the 32 MiB intermediate (prefetch_mem_size = 0x2000000 in
+device-model/<domid>/virtio_pci_host, guest assigning BAR 4 at
+0x3a000000-0x3bffffff), and with 128 MiB slices on a Raspberry Pi 4
+(2026-09-12, Xen 4.22 with this series: the guest is assigned its BAR out of the
+0xc0000000 window, the device model shares the blob into the guest's p2m, and a
+Vulkan client in DomU and full-Vulkan AAOS in DomA both render).
+
+Rebased onto Xen 4.22 (d45d5687f1) on top of the xen-troops toolstack series.
+Regenerate against the TOOLSTACK series tree, not the hypervisor one: the two see
+different libxl_arm.c context and a hypervisor-tree regeneration applies here
+with fuzz 1, which plain patch -p1 accepts silently.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [the slice size wants to be a per-domain config
+ knob rather than a compile-time constant before this goes upstream]
+---
+ tools/libs/light/libxl_arm.c | 48 +++++++++++++++++++++++++++++++++---
+ 1 file changed, 45 insertions(+), 3 deletions(-)
+
+--- a/tools/libs/light/libxl_arm.c
++++ b/tools/libs/light/libxl_arm.c
+@@ -21,9 +21,32 @@
+ #define VIRTIO_MMIO_DEV_SIZE   xen_mk_ullong(0x200)
+ 
+ #define VIRTIO_PCI_HOST_MEM_SIZE            xen_mk_ullong(0x800000)
+-#define VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE   xen_mk_ullong(0x800000)
++/*
++ * The prefetchable window is what a virtio-gpu host-visible blob (Venus) is
++ * mapped into, and one 8 MiB slice of it -- 64 MiB split eight ways -- is too
++ * small for a guest to allocate anything of display size in: measured on RPi5,
++ * an 8 MiB window leaves Vulkan clients failing vkAllocateMemory with
++ * VK_ERROR_OUT_OF_DEVICE_MEMORY as soon as they want a full-screen buffer, while
++ * venus itself already holds ~1.2 MiB of it for its ring. 32 MiB was measured to
++ * be too small in turn: venus takes ~25 MiB of it and a 1920x1080 swapchain then
++ * fails the same way. 128 MiB ran out in turn once a full-Vulkan AAOS had its
++ * resident apps up: each process that renders with HWUI on Venus maps its own
++ * blocks into the window (103 MiB of 128 in use by SurfaceFlinger and five apps
++ * on RPi4), and a WebView then fails the same way. So hand the window out in
++ * 256 MiB slices, which a guest's first virtio-pci host gets 256 MiB-aligned at
++ * GUEST_VIRTIO_PCI_PREFETCH_MEM_ADDR.
++ *
++ * That leaves three slices (768 MiB / 256 MiB) where there are eight ECAM/MEM/IRQ
++ * slices, so a guest served by more virtio-pci hosts than there are prefetchable
++ * slices is refused explicitly below rather than handed an overlapping window.
++ * Every guest in this product has exactly one virtio-pci host (one backend
++ * domain), so nothing that works today stops working.
++ */
++#define VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE   xen_mk_ullong(0x10000000)
+ #define VIRTIO_PCI_HOST_NUM_SPIS            4
+ #define VIRTIO_PCI_MAX_HOSTS                8
++#define VIRTIO_PCI_MAX_PREFETCH_HOSTS       \
++    (GUEST_VIRTIO_PCI_PREFETCH_MEM_SIZE / VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE)
+ 
+ static uint64_t alloc_virtio_mmio_base(libxl__gc *gc, uint64_t *virtio_mmio_base)
+ {
+@@ -97,8 +120,20 @@ static int alloc_virtio_pci_host(libxl__gc *gc,
+                  GUEST_VIRTIO_PCI_TOTAL_ECAM_SIZE / GUEST_VIRTIO_PCI_HOST_ECAM_SIZE);
+     BUILD_BUG_ON(VIRTIO_PCI_MAX_HOSTS !=
+                  GUEST_VIRTIO_PCI_MEM_SIZE / VIRTIO_PCI_HOST_MEM_SIZE);
+-    BUILD_BUG_ON(VIRTIO_PCI_MAX_HOSTS !=
+-                 GUEST_VIRTIO_PCI_PREFETCH_MEM_SIZE / VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE);
++    /*
++     * The prefetchable slice is larger than the others, so there are fewer of
++     * them than VIRTIO_PCI_MAX_HOSTS -- but there must be at least one, and the
++     * slice size must divide the window. Both of those depend on
++     * GUEST_VIRTIO_PCI_PREFETCH_MEM_SIZE, which lives in the hypervisor's
++     * arch-arm.h and is changed by a companion patch. Assert them here so a tree
++     * that has this patch WITHOUT that one fails to build: with the old 64 MiB
++     * window, 64 MiB / 256 MiB truncates to zero prefetchable hosts and every
++     * guest with a virtio-pci host would fail at run time instead.
++     */
++    BUILD_BUG_ON(VIRTIO_PCI_MAX_HOSTS < VIRTIO_PCI_MAX_PREFETCH_HOSTS);
++    BUILD_BUG_ON(VIRTIO_PCI_MAX_PREFETCH_HOSTS < 1);
++    BUILD_BUG_ON(GUEST_VIRTIO_PCI_PREFETCH_MEM_SIZE %
++                 VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE);
+     BUILD_BUG_ON(VIRTIO_PCI_MAX_HOSTS !=
+                  (GUEST_VIRTIO_PCI_SPI_LAST - GUEST_VIRTIO_PCI_SPI_FIRST) / VIRTIO_PCI_HOST_NUM_SPIS);
+ 
+@@ -141,6 +176,13 @@ static int alloc_virtio_pci_host(libxl__gc *gc,
+     hosts[i].mem_base = GUEST_VIRTIO_PCI_MEM_ADDR +
+         i * VIRTIO_PCI_HOST_MEM_SIZE;
+     hosts[i].mem_size = VIRTIO_PCI_HOST_MEM_SIZE;
++    if (i >= VIRTIO_PCI_MAX_PREFETCH_HOSTS) {
++        LOG(ERROR, "virtio-pci host #%u has no prefetchable window left "
++                   "(%lu x 0x%"PRIx64" available)", i,
++                   (unsigned long)VIRTIO_PCI_MAX_PREFETCH_HOSTS,
++                   (uint64_t)VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE);
++        return ERROR_FAIL;
++    }
+     hosts[i].prefetch_mem_base = GUEST_VIRTIO_PCI_PREFETCH_MEM_ADDR +
+         i * VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE;
+     hosts[i].prefetch_mem_size = VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE;

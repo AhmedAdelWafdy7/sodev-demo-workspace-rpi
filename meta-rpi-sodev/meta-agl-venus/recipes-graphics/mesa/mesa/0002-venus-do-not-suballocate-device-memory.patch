@@ -1,0 +1,76 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 06 Sep 2026 01:20:01 +0900
+Subject: [PATCH] venus: do not suballocate device memory
+
+Venus in mesa 24.0.7 carves small host-visible VkDeviceMemory allocations out of a
+shared 16 MiB pool (vn_device_memory_should_suballocate() -> the pool machinery in
+vn_device_memory.c, with vn_device_memory::base_memory/base_offset naming the
+sub-range). On a Raspberry Pi 5 that pool is live -- the renderer does not report
+has_guest_vram, which is the other thing that would disable it -- and it is broken:
+every buffer bound to a sub-range ends up at the POOL BASE on the host, so two
+suballocated buffers alias.
+
+Measured in DomU with a three-buffer probe (xt-venus-diag's vk-suballoc-probe):
+three 4 KiB HOST_VISIBLE|HOST_COHERENT buffers with distinct sentinels, mapped
+64 KiB apart as sub-ranges of one pool blob, and a vkCmdFillBuffer aimed at the
+second one. The block below is an ANNOTATED SUMMARY, not verbatim output -- the
+real run also prints the per-dword "buf<i> dword <n> (offset <o>) = 0x...
+expected 0x..." lines, a three-field "VERDICT: probe fence=... target_dword0=...
+stray_in_decoys=...", and its layout:/reading: lines:
+
+  buf0: 1024 of 1024 dwords unexpected      <- the fill landed here, entirely
+  buf0 dword 0 = VK_SUCCESS                 <- and so did venus' fence feedback
+  buf1: still holds its own sentinel        <- the buffer that was asked for
+  buf2: intact
+  VERDICT: probe fence=STUCK
+
+So vkWaitForFences never returns (venus polls its feedback slot where it belongs,
+while the host wrote the status at the pool base), and -- worse than the hang -- any
+client that allocates more than one small host-visible buffer silently corrupts its
+own data. VN_PERF=no_memory_suballoc fixes all of it at run time, which is what this
+makes the default.
+
+Upstream deletes the pool rather than fixing it: mesa 26.0.5 has no "pool" in
+vn_device_memory.c at all (45 mentions at 24.0.7, 0 at 26.0.5) and no
+base_memory/base_offset fields, so the failure cannot occur there. That is the real
+fix; this is the one-line equivalent for 24.0.7, kept as an early return rather than
+a deletion so the diff stays reviewable and the reason stays next to the code.
+
+The pool existed to save KVM memslots ("each BO takes up a KVM memslot currently and
+some CTS tests exhausts them", per the comment it keeps below). That does not apply
+to this configuration, and correctness comes first regardless.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [fixed differently upstream]
+ mesa 26.x deletes the suballocation pool outright -- vn_device_memory.c has no
+ "pool" and no vn_device_memory::base_memory/base_offset there -- so there is no
+ upstream commit to backport onto 24.0.7. This is the one-line 24.0.7 equivalent,
+ and it is only needed while this build is pinned to scarthgap's mesa.
+---
+--- a/src/virtio/vulkan/vn_device_memory.c
++++ b/src/virtio/vulkan/vn_device_memory.c
+@@ -253,6 +253,23 @@
+ vn_device_memory_should_suballocate(const struct vn_device *dev,
+                                     const VkMemoryAllocateInfo *alloc_info)
+ {
++   /* Never suballocate. Later mesa deletes this pool outright -- 26.0.5 has no
++    * "pool" in this file at all and no vn_device_memory::base_memory/base_offset --
++    * and on a Raspberry Pi 5 (V3D, whose renderer does not report has_guest_vram,
++    * so the pool is live here) it is actively wrong rather than merely
++    * unnecessary: every buffer bound to a sub-range of the pool ends up at the
++    * POOL BASE on the host, so two suballocated buffers alias.
++    *
++    * Measured with a three-buffer probe in DomU: a vkCmdFillBuffer aimed at the
++    * second buffer landed entirely in the first, the second kept its own sentinel,
++    * and venus' own fence-feedback VK_SUCCESS landed in the first buffer's dword 0
++    * -- so vkWaitForFences never returns and any client with more than one small
++    * host-visible buffer silently corrupts its own data. Setting
++    * VN_PERF=no_memory_suballoc at run time fixes all of it, which is exactly what
++    * this makes the default.
++    */
++   return false;
++
+    if (VN_PERF(NO_MEMORY_SUBALLOC))
+       return false;
+ 

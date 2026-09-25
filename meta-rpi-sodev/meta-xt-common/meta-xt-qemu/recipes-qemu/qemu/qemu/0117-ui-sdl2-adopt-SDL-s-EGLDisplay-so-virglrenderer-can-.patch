@@ -1,0 +1,107 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 06 Sep 2026 01:09:22 +0900
+Subject: [PATCH] ui/sdl2: adopt SDL's EGLDisplay so virglrenderer can import
+ dma-bufs
+
+With -display sdl, qemu_egl_display is never set -- only egl-headless, dbus, spice and
+gtk set it (ui/egl-helpers.c, ui/gtk.c:2137). virtio_gpu_virgl_init() installs the v4
+get_egl_display callback only when qemu_egl_display is non-NULL
+(hw/display/virtio-gpu-virgl.c), so with SDL virglrenderer never reaches
+vrend_winsys_init_external() and vrend's `egl` stays NULL. vrend then imports dma-bufs
+through GL_EXT_memory_object[_fd] instead of EGL_LINUX_DMA_BUF_EXT.
+
+V3D's GL driver does not implement GL_EXT_memory_object, so on a Raspberry Pi the host
+compositor cannot import a guest Vulkan (venus) buffer: PIPE_RESOURCE_SET_TYPE returns
+EINVAL, the compositor's virgl context dies, and the guest has to fall back to a CPU copy
+per frame (MESA_VK_WSI_DEBUG=sw). Measured on an AGL instrument cluster in a DomU, that
+fallback costs 33 -> 24 fps in the guest and 0.18 -> 0.57 cores in the host domain.
+
+Adopt the display SDL already created rather than creating a second one. That distinction
+matters: vrend also creates EGL fences on this display, and eglCreateSyncKHR against a
+display that does not own the current context fails ("Failed to create fence sync
+object"), which is what calling egl_init() here, and so creating a second display,
+runs into.
+SDL_GL_CreateContext() has just made the context current, so eglGetCurrentDisplay() is
+that display -- the same thing ui/gtk.c's gl_area_realize() does for GtkGLArea.
+
+If SDL chose GLX there is no EGLDisplay to adopt; warn once and keep the previous
+behaviour rather than refusing to start.
+
+Building this needs no new configure test and no new dependency: the display is
+read with plain eglGetCurrentDisplay(), and the EGL declarations come from the
+epoxy headers ui/sdl2.c's neighbours in ui/ already use. A host whose SDL chose
+GLX rather than EGL therefore still compiles; there the call returns
+EGL_NO_DISPLAY at run time, the code warns once, qemu_egl_display stays unset,
+and virglrenderer behaves exactly as it does today.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [not yet submitted to qemu-devel]
+---
+ ui/sdl2.c | 46 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+index cda4293..cf45657 100644
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -33,6 +33,7 @@
+ #include "system/runstate-action.h"
+ #include "system/system.h"
+ #include "qemu/log.h"
++#include "qemu/error-report.h"
+ #include "qemu-main.h"
+ 
+ static int sdl2_num_outputs;
+@@ -116,6 +117,51 @@ void sdl2_window_create(struct sdl2_console *scon)
+ 
+         scon->winctx = SDL_GL_CreateContext(scon->real_window);
+         SDL_GL_SetSwapInterval(0);
++#ifdef CONFIG_OPENGL
++        /*
++         * Adopt SDL's own EGLDisplay instead of leaving qemu_egl_display unset.
++         *
++         * virglrenderer only gets an EGL dma-buf import path if the caller
++         * hands it an EGLDisplay: virtio_gpu_virgl_init() installs the v4
++         * get_egl_display callback only when qemu_egl_display is non-NULL, and
++         * virglrenderer then calls vrend_winsys_init_external(), which is what
++         * makes vrend's `egl` non-NULL. Without that, vrend imports dma-bufs
++         * through GL_EXT_memory_object[_fd] instead, which drivers such as V3D
++         * do not implement -- so importing a guest Vulkan (venus) buffer into
++         * the host GL compositor fails with EINVAL and the guest has to fall
++         * back to a CPU copy per frame.
++         *
++         * It has to be SDL's display rather than a freshly created one. vrend
++         * also creates EGL fences on it, and eglCreateSyncKHR against a display
++         * that does not own the current context fails. SDL_GL_CreateContext()
++         * has just made the context current, so eglGetCurrentDisplay() is
++         * exactly that display. ui/gtk.c's gl_area_realize() does the same for
++         * GtkGLArea.
++         *
++         * Only EGL can provide this. If SDL chose GLX there is nothing to
++         * adopt, so say so once and keep the previous behaviour rather than
++         * failing to start. The warning needs its own guard to be once: this
++         * function runs per output, and on the GLX path qemu_egl_display stays
++         * NULL, so the condition above does not become false after the first
++         * window the way it does on success.
++         */
++        if (scon->winctx && !qemu_egl_display) {
++            EGLDisplay dpy = eglGetCurrentDisplay();
++
++            if (dpy != EGL_NO_DISPLAY) {
++                qemu_egl_display = dpy;
++            } else {
++                static bool warned;
++
++                if (!warned) {
++                    warned = true;
++                    warn_report("SDL GL context is not EGL;"
++                                " virglrenderer dma-buf import stays"
++                                " unavailable");
++                }
++            }
++        }
++#endif
+     } else {
+         /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
+         scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);

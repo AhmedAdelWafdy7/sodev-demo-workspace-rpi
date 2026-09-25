@@ -1,0 +1,85 @@
+From 1fbd03b2094a488c067dcbcc03172bada7fad14c Mon Sep 17 00:00:00 2001
+From: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Date: Wed, 9 Jul 2025 15:52:40 +0300
+Subject: [PATCH] vrend: Correct minigbm definitions
+
+Properly specify minigbm definitions when building without libminigbm
+of CrOS to make more of vrend's GBM code work without libminigbm.
+
+Reviewed-by: Gert Wollny <gert.wollny@collabora.com>
+Reviewed-by: Yiwei Zhang <zzyiwei@gmail.com>
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Part-of: <https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1561>
+
+[Backport note] 1.2.0's non-MINIGBM fallback gives these minigbm-only flags
+made-up bit values that COLLIDE with real libgbm: GBM_BO_USE_TEXTURING is
+(1 << 5), which mesa's gbm.h defines as GBM_BO_USE_PROTECTED, and
+GBM_BO_USE_CAMERA_WRITE is (1 << 6) = GBM_BO_USE_FRONT_RENDERING. Since
+virgl_gbm_convert_flags() sets GBM_BO_USE_TEXTURING for every
+VIRGL_BIND_SAMPLER_VIEW resource, and virgl_gbm_convert_flags() hands those flags
+to gbm_bo_create(), a build that enables GBM allocation without this commit asks
+mesa for protected buffers. It is the first commit of MR 1561; it is applied on its
+own here because the shipping configuration sets the minigbm_allocation
+PACKAGECONFIG (so the 1.2.0 #if is live) and because 0018 depends on the macro
+being 0. The rest of MR 1561 is the tiled-GBM work, which this layer does not carry.
+
+(cherry picked from commit 1fbd03b2094a488c067dcbcc03172bada7fad14c)
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Backport [https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1561 commit 1fbd03b2094a488c067dcbcc03172bada7fad14c]
+---
+ src/vrend/vrend_winsys_gbm.h | 41 ++++++++++++++++++++++++++----------
+ 1 file changed, 30 insertions(+), 11 deletions(-)
+
+diff --git a/src/vrend/vrend_winsys_gbm.h b/src/vrend/vrend_winsys_gbm.h
+index cd92e0f28..1445cf656 100644
+--- a/src/vrend/vrend_winsys_gbm.h
++++ b/src/vrend/vrend_winsys_gbm.h
+@@ -42,17 +42,36 @@
+ 
+ #ifndef MINIGBM
+ 
+-#define GBM_BO_USE_TEXTURING (1 << 5)
+-#define GBM_BO_USE_CAMERA_WRITE (1 << 6)
+-#define GBM_BO_USE_CAMERA_READ (1 << 7)
+-#define GBM_BO_USE_PROTECTED (1 << 8)
+-#define GBM_BO_USE_SW_READ_OFTEN (1 << 9)
+-#define GBM_BO_USE_SW_READ_RARELY (1 << 10)
+-#define GBM_BO_USE_SW_WRITE_OFTEN (1 << 11)
+-#define GBM_BO_USE_SW_WRITE_RARELY (1 << 12)
+-#define GBM_BO_USE_HW_VIDEO_DECODER (1 << 13)
+-#define GBM_BO_USE_HW_VIDEO_ENCODER (1 << 14)
+-#define GBM_TEST_ALLOC (1 << 15)
++#ifndef GBM_BO_USE_TEXTURING
++#define GBM_BO_USE_TEXTURING 0
++#endif
++#ifndef GBM_BO_USE_CAMERA_WRITE
++#define GBM_BO_USE_CAMERA_WRITE 0
++#endif
++#ifndef GBM_BO_USE_CAMERA_READ
++#define GBM_BO_USE_CAMERA_READ 0
++#endif
++#ifndef GBM_BO_USE_PROTECTED
++#define GBM_BO_USE_PROTECTED 0
++#endif
++#ifndef GBM_BO_USE_SW_READ_OFTEN
++#define GBM_BO_USE_SW_READ_OFTEN 0
++#endif
++#ifndef GBM_BO_USE_SW_READ_RARELY
++#define GBM_BO_USE_SW_READ_RARELY 0
++#endif
++#ifndef GBM_BO_USE_SW_WRITE_OFTEN
++#define GBM_BO_USE_SW_WRITE_OFTEN 0
++#endif
++#ifndef GBM_BO_USE_SW_WRITE_RARELY
++#define GBM_BO_USE_SW_WRITE_RARELY 0
++#endif
++#ifndef GBM_BO_USE_HW_VIDEO_DECODER
++#define GBM_BO_USE_HW_VIDEO_DECODER 0
++#endif
++#ifndef GBM_BO_USE_HW_VIDEO_ENCODER
++#define GBM_BO_USE_HW_VIDEO_ENCODER 0
++#endif
+ 
+ #endif
+ 

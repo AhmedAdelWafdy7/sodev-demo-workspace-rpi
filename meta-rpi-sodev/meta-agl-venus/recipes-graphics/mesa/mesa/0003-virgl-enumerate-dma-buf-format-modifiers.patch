@@ -1,0 +1,177 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 06 Sep 2026 01:20:01 +0900
+Subject: [PATCH] virgl: enumerate dma-buf format modifiers
+
+pipe_screen::query_dmabuf_modifiers was never implemented for virgl, so it stayed NULL and
+dri2_query_dma_buf_modifiers() (src/gallium/frontends/dri/dri2.c:1745) returned a count of
+zero for every format:
+
+    if (pscreen->query_dmabuf_modifiers != NULL) {
+       pscreen->query_dmabuf_modifiers(...);
+       ...
+    } else {
+       *count = 0;
+    }
+
+A Wayland compositor running on virgl therefore advertises only the implicit modifier. On a
+Raspberry Pi 5 with an AGL cluster in a Xen DomU, weston-simple-dmabuf-feedback shows exactly
+that -- all 34 formats as "modifier NONE_INVALID (0xffffffffffffff)" and nothing else.
+
+The consequence lands on guest Vulkan. Venus' WSI, finding no modifiers, takes the legacy path
+in vn_wsi.c which forces DRM_FORMAT_MOD_LINEAR on scanout images -- it says so when run with
+VN_DEBUG=wsi:
+
+    MESA-VIRTIO: debug: forcing scanout image linear (no explicit modifier support)
+
+and that path carries its own TODO ("We should require modifier support at some point"). The
+host GPU is tiled, so it then re-tiles the linear image once per frame in order to sample it.
+Measured with V3D_DEBUG=perf on the host: 2122 occurrences of
+
+    Updating 1920x1080@0 shadow for linear texture
+
+in 40 s of a 54 fps cluster -- one 1920x1080 conversion per frame, about 7.9 MiB, and the only
+reason the TFU engine shows up at all in the Vulkan lane (0.98 jobs/frame against exactly zero
+on both OpenGL lanes).
+
+virgl_is_dmabuf_modifier_supported() already returns true for *any* modifier, with a comment
+saying so, and virgl_get_dmabuf_modifier_planes() already answers plane queries. Enumeration
+was the only missing piece.
+
+Multi-planar formats are deliberately excluded: virgl resolves aux planes on the host, and
+venus separately refuses modifiers whose memory-plane count differs from the format plane
+count (vn_GetPhysicalDeviceImageFormatProperties2), so advertising them would only produce a
+rejection later.
+
+Why advertising a tiled modifier from the GUEST is safe here, which is the obvious
+objection: the modifier only decides what the guest's WSI asks the compositor for, and
+the buffer itself is still allocated by the host through venus. When vrend imports it
+the modifier travels with the dma-buf as an EGL attribute
+(EGL_LINUX_DMA_BUF_EXT/EGL_DMA_BUF_PLANE0_MODIFIER_*), so host and guest cannot
+disagree about the layout -- which is why the mid-draw screenshots below show a
+correct picture rather than tile noise.
+
+The limitation is the other direction: a GL client in the same guest that uses dma-buf
+feedback now sees BROADCOM_UIF advertised too, and nothing here checks that the host
+can import it. On this platform it can, because the host IS Broadcom.
+
+XXX This is a proof of concept, not a finished driver. The correct modifier list is the host
+renderer's, and virgl cannot ask for it -- union virgl_caps carries no modifier table.
+Productising this needs a caps addition on the virglrenderer side so the guest enumerates what
+the host can actually allocate and import. Until then the list is LINEAR (always valid) plus
+the Broadcom UIF modifier this platform's host GPU uses, which is enough to test whether the
+rest of the chain -- weston advertisement, venus modifier selection, host V3DV allocation,
+host V3D import -- lights up.
+
+Verified on the platform described above, AGL instrument cluster at 1080x1920 fullscreen in a
+Xen DomU, 40 s window, frame rate counted from wl_surface.commit in WAYLAND_DEBUG:
+
+  * weston-simple-dmabuf-feedback now lists LINEAR (0x0) and BROADCOM_UIF
+    (0x700000000000006) per format, where before every format had only NONE_INVALID.
+  * The Vulkan client's buffers arrive with the tiled modifier -- zwp_linux_buffer_params_v1
+    .add() carries hi=117440512 lo=6 (BROADCOM_UIF), against hi=16777215 lo=4294967295
+    (DRM_FORMAT_MOD_INVALID) before. Checked directly, because venus no longer logging
+    "forcing scanout image linear" only proves the legacy path was skipped, not that a tiled
+    modifier was chosen.
+  * VN_DEBUG=init,wsi shows the wsi debug channel live (swapchain created/acquired) with the
+    linear-forcing line absent.
+  * The host's per-frame re-tile is gone: v3d-jobs tfu 0.98/frame -> 0.0, and the cost of a
+    render job falls 1.25 ms -> 0.95 ms.
+  * Vulkan reaches the OpenGL lane's frame rate -- 54.0 -> 60.0 fps, with the host GPU's
+    render engine at 75.3 % against the OpenGL lane's 80.4 %.
+  * The cluster still renders correctly. This is the check that matters for a patch that
+    advertises a modifier the host was never asked about: a UIF/linear mismatch corrupts the
+    image while every counter above improves, so screenshots were taken mid-draw on both the
+    Vulkan and the OpenGL lane. Neither shows an artefact, and the OpenGL lane -- which
+    shares this driver through the compositor -- holds 60.0 fps unchanged.
+
+Upstream: not submitted.
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [proof of concept]
+ Not submittable as written, and the patch's own XXX says why: the modifier list
+ belongs to the host renderer and virgl has no way to ask for it (union virgl_caps
+ carries no modifier table). Productising it needs a virglrenderer caps addition
+ first; the hardcoded LINEAR + BROADCOM_UIF list here exists to test whether the
+ rest of the chain lights up.
+---
+--- a/src/gallium/drivers/virgl/virgl_screen.c
++++ b/src/gallium/drivers/virgl/virgl_screen.c
+@@ -35,6 +35,8 @@
+ #include "vl/vl_decoder.h"
+ #include "vl/vl_video_buffer.h"
+ 
++#include "drm-uapi/drm_fourcc.h"
++
+ #include "virgl_screen.h"
+ #include "virgl_resource.h"
+ #include "virgl_public.h"
+@@ -1092,6 +1094,61 @@
+    return true;
+ }
+ 
++/* virgl never enumerated modifiers, so pipe_screen::query_dmabuf_modifiers stayed NULL and
++ * dri2_query_dma_buf_modifiers() (src/gallium/frontends/dri/dri2.c) returned a count of zero
++ * for every format. A Wayland compositor running on virgl therefore advertised only the
++ * implicit modifier, and a guest Vulkan (venus) client's WSI, finding no modifiers, fell back
++ * to the legacy path in vn_wsi.c which forces DRM_FORMAT_MOD_LINEAR on scanout images
++ * ("forcing scanout image linear (no explicit modifier support)"). On a tiled GPU the host
++ * then re-tiles that linear image once per frame so it can be sampled -- measured on a
++ * Raspberry Pi 5 as one 1920x1080 "shadow for linear texture" conversion per frame.
++ *
++ * Note that virgl_is_dmabuf_modifier_supported() above already accepts *any* modifier, so the
++ * only thing that was missing is the enumeration.
++ *
++ * XXX The list below is a proof of concept, not a finished driver. The correct list is the
++ * host renderer's, and virgl has no way to ask for it: union virgl_caps carries no modifier
++ * table. Productising this needs a caps addition on the virglrenderer side so the guest can
++ * enumerate what the host can actually allocate and import. Until then this advertises
++ * LINEAR (always valid) plus the Broadcom UIF modifier this platform's host GPU uses.
++ */
++static void
++virgl_query_dmabuf_modifiers(UNUSED struct pipe_screen *pscreen,
++                             enum pipe_format format,
++                             int max,
++                             uint64_t *modifiers,
++                             unsigned int *external_only,
++                             int *count)
++{
++   static const uint64_t supported[] = {
++      DRM_FORMAT_MOD_LINEAR,
++      DRM_FORMAT_MOD_BROADCOM_UIF,
++   };
++   const int num = ARRAY_SIZE(supported);
++
++   /* Multi-planar formats are out of scope: virgl resolves aux planes on the host, and
++    * venus additionally refuses modifiers whose memory-plane count differs from the format
++    * plane count (vn_GetPhysicalDeviceImageFormatProperties2). Advertise nothing for them
++    * rather than something that will be rejected later.
++    */
++   if (util_format_get_num_planes(format) != 1) {
++      *count = 0;
++      return;
++   }
++
++   if (max <= 0) {
++      *count = num;
++      return;
++   }
++
++   *count = MIN2(max, num);
++   for (int i = 0; i < *count; i++) {
++      modifiers[i] = supported[i];
++      if (external_only)
++         external_only[i] = 0;
++   }
++}
++
+ static unsigned int
+ virgl_get_dmabuf_modifier_planes(UNUSED struct pipe_screen *pscreen,
+                                  UNUSED uint64_t modifier,
+@@ -1199,6 +1256,7 @@
+    screen->base.fence_get_fd = virgl_fence_get_fd;
+    screen->base.query_memory_info = virgl_query_memory_info;
+    screen->base.get_disk_shader_cache = virgl_get_disk_shader_cache;
++   screen->base.query_dmabuf_modifiers = virgl_query_dmabuf_modifiers;
+    screen->base.is_dmabuf_modifier_supported = virgl_is_dmabuf_modifier_supported;
+    screen->base.get_dmabuf_modifier_planes = virgl_get_dmabuf_modifier_planes;
+ 

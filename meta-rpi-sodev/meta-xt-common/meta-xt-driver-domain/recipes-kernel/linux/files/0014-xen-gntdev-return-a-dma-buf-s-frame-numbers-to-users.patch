@@ -1,0 +1,236 @@
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Sun, 06 Sep 2026 01:10:52 +0900
+Subject: [PATCH] xen/gntdev: return a dma-buf's frame numbers to userspace
+
+A device model that shares a buffer with the guest it serves needs the frame
+numbers of that buffer's pages, so it can map them into the guest's physical map
+with XENMAPSPACE_gmfn_foreign. For a dma-buf it cannot work them out itself: the
+mapping is VM_PFNMAP, which Linux's page walker reports as a hole, so
+/proc/self/pagemap returns zeroes and MADV_POPULATE_WRITE -- which is what the
+device model uses, because a READ would map the shared zero page -- refuses the
+VMA with EINVAL. Measured on a Raspberry Pi 5, where this is what stops a guest from using
+Vulkan through virtio-gpu/Venus: the large mappable allocations Mesa's venus makes
+are dma-buf backed, so their window stays device-model MMIO, and on arm64 an
+emulated access from a SIMD instruction is not even decodable by Xen -- it kills
+the guest's client.
+
+gntdev-dmabuf already computes exactly those frame numbers on the import path: it
+attaches the dma-buf, maps the attachment, and walks the sg table's dma addresses
+to build a gfn array, which it then converts into grant references. Add an ioctl
+that hands the array back instead, for a caller that is going to do the mapping
+itself rather than pass grant references to the guest:
+
+  IOCTL_GNTDEV_DMABUF_IMP_TO_GFNS
+
+No grant references are created. The import is registered exactly as IMP_TO_REFS
+registers it, so the attachment -- and with it the pages -- stays in place until
+IOCTL_GNTDEV_DMABUF_IMP_RELEASE is called for the same fd, which is a stronger
+guarantee than an mlock() the device model could manage on its own.
+
+dmabuf_imp_to_refs() gains an out_gfns argument to serve both callers rather than
+duplicating the attach/map/walk sequence; passing NULL keeps the existing
+behaviour, which is what the IMP_TO_REFS ioctl does. The grant-reference array
+dmabuf_imp_alloc_storage() allocates stays filled with INVALID_GRANT_REF on the
+out_gfns path, which is what makes the shared release path
+(dmabuf_imp_end_foreign_access()) a no-op for these imports.
+
+The reserved[] words are rejected unless zero, and the struct's size and the
+offset of its array are pinned with static_assert: the ioctl number encodes
+sizeof(the struct), and the device model on the other side of this interface
+carries the same two assertions against its own copy of it, so a layout change on
+either side fails a build instead of turning the request into a different ioctl at
+run time.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Inappropriate [needs discussion upstream: the natural question
+ is whether this belongs in gntdev at all or wants its own interface, and
+ whether the frame numbers should be handed out under a capability check]
+---
+--- a/drivers/xen/gntdev-dmabuf.c
++++ b/drivers/xen/gntdev-dmabuf.c
+@@ -554,9 +554,15 @@ fail_no_free:
+ 	return ERR_PTR(-ENOMEM);
+ }
+ 
++/*
++ * Import a dma-buf and either hand back grant references to its pages (@out_gfns
++ * NULL, the IMP_TO_REFS behaviour) or the frame numbers themselves (@out_gfns
++ * non-NULL, for a caller that maps them into another domain's physmap itself).
++ * Either way the attachment is kept, so the pages stay put, until released.
++ */
+ static struct gntdev_dmabuf *
+ dmabuf_imp_to_refs(struct gntdev_dmabuf_priv *priv, struct device *dev,
+-		   int fd, int count, int domid)
++		   int fd, int count, int domid, u64 *out_gfns)
+ {
+ 	struct gntdev_dmabuf *gntdev_dmabuf, *ret;
+ 	struct dma_buf *dma_buf;
+@@ -632,12 +638,18 @@ dmabuf_imp_to_refs(struct gntdev_dmabuf_priv *priv, struct device *dev,
+ 		gfns[i++] = pfn_to_gfn(pfn);
+ 	}
+ 
+-	ret = ERR_PTR(dmabuf_imp_grant_foreign_access(gfns,
+-						      gntdev_dmabuf->u.imp.refs,
+-						      count, domid));
+-	kfree(gfns);
+-	if (IS_ERR(ret))
+-		goto fail_end_access;
++	if (out_gfns) {
++		for (i = 0; i < count; i++)
++			out_gfns[i] = gfns[i];
++		kfree(gfns);
++	} else {
++		ret = ERR_PTR(dmabuf_imp_grant_foreign_access(gfns,
++							     gntdev_dmabuf->u.imp.refs,
++							     count, domid));
++		kfree(gfns);
++		if (IS_ERR(ret))
++			goto fail_end_access;
++	}
+ 
+ 	pr_debug("Imported DMA buffer with fd %d\n", fd);
+ 
+@@ -787,7 +799,7 @@ long gntdev_ioctl_dmabuf_imp_to_refs(struct gntdev_priv *priv,
+ 
+ 	gntdev_dmabuf = dmabuf_imp_to_refs(priv->dmabuf_priv,
+ 					   priv->dma_dev, op.fd,
+-					   op.count, op.domid);
++					   op.count, op.domid, NULL);
+ 	if (IS_ERR(gntdev_dmabuf))
+ 		return PTR_ERR(gntdev_dmabuf);
+ 
+@@ -803,6 +815,63 @@ out_release:
+ 	return ret;
+ }
+ 
++/*
++ * The ioctl NUMBER encodes sizeof(the struct), so userspace and this file have to
++ * agree on the layout or the request silently becomes a different one and the
++ * kernel answers ENOTTY. The device model that uses this carries the same two
++ * assertions against its own copy of the struct, so a change on either side fails
++ * a build rather than an ioctl.
++ */
++static_assert(sizeof(struct ioctl_gntdev_dmabuf_imp_to_gfns) == 24);
++static_assert(offsetof(struct ioctl_gntdev_dmabuf_imp_to_gfns, gfns) == 16);
++
++long gntdev_ioctl_dmabuf_imp_to_gfns(struct gntdev_priv *priv,
++				     struct ioctl_gntdev_dmabuf_imp_to_gfns __user *u)
++{
++	struct ioctl_gntdev_dmabuf_imp_to_gfns op;
++	struct gntdev_dmabuf *gntdev_dmabuf;
++	u64 *gfns;
++	long ret;
++
++	if (copy_from_user(&op, u, sizeof(op)) != 0)
++		return -EFAULT;
++
++	/*
++	 * "Reserved - must be zero" only means that if it is enforced; otherwise
++	 * the words are decoration and can never carry a future flag.
++	 */
++	if (op.reserved[0] || op.reserved[1])
++		return -EINVAL;
++
++	if (unlikely(gntdev_test_page_count(op.count)))
++		return -EINVAL;
++
++	gfns = kcalloc(op.count, sizeof(*gfns), GFP_KERNEL);
++	if (!gfns)
++		return -ENOMEM;
++
++	/* No grants are created here, so the domid argument is not used. */
++	gntdev_dmabuf = dmabuf_imp_to_refs(priv->dmabuf_priv,
++					   priv->dma_dev, op.fd,
++					   op.count, 0, gfns);
++	if (IS_ERR(gntdev_dmabuf)) {
++		ret = PTR_ERR(gntdev_dmabuf);
++		goto out_free;
++	}
++
++	if (copy_to_user(u->gfns, gfns, sizeof(*gfns) * op.count) != 0) {
++		ret = -EFAULT;
++		dmabuf_imp_release(priv->dmabuf_priv, op.fd);
++		goto out_free;
++	}
++
++	ret = 0;
++
++out_free:
++	kfree(gfns);
++	return ret;
++}
++
+ long gntdev_ioctl_dmabuf_imp_release(struct gntdev_priv *priv,
+ 				     struct ioctl_gntdev_dmabuf_imp_release __user *u)
+ {
+--- a/drivers/xen/gntdev-dmabuf.h
++++ b/drivers/xen/gntdev-dmabuf.h
+@@ -27,6 +27,9 @@ long gntdev_ioctl_dmabuf_exp_wait_released(struct gntdev_priv *priv,
+ long gntdev_ioctl_dmabuf_imp_to_refs(struct gntdev_priv *priv,
+ 				     struct ioctl_gntdev_dmabuf_imp_to_refs __user *u);
+ 
++long gntdev_ioctl_dmabuf_imp_to_gfns(struct gntdev_priv *priv,
++				     struct ioctl_gntdev_dmabuf_imp_to_gfns __user *u);
++
+ long gntdev_ioctl_dmabuf_imp_release(struct gntdev_priv *priv,
+ 				     struct ioctl_gntdev_dmabuf_imp_release __user *u);
+ 
+--- a/drivers/xen/gntdev.c
++++ b/drivers/xen/gntdev.c
+@@ -1045,6 +1045,9 @@ static long gntdev_ioctl(struct file *flip,
+ 	case IOCTL_GNTDEV_DMABUF_IMP_TO_REFS:
+ 		return gntdev_ioctl_dmabuf_imp_to_refs(priv, ptr);
+ 
++	case IOCTL_GNTDEV_DMABUF_IMP_TO_GFNS:
++		return gntdev_ioctl_dmabuf_imp_to_gfns(priv, ptr);
++
+ 	case IOCTL_GNTDEV_DMABUF_IMP_RELEASE:
+ 		return gntdev_ioctl_dmabuf_imp_release(priv, ptr);
+ #endif
+--- a/include/uapi/xen/gntdev.h
++++ b/include/uapi/xen/gntdev.h
+@@ -298,10 +298,42 @@ struct ioctl_gntdev_dmabuf_imp_to_refs {
+ 	__u32 refs[1];
+ };
+ 
++/*
++ * Import a dma-buf with file descriptor @fd and return the frame numbers of
++ * its pages in array @gfns of size @count.
++ *
++ * This is the sibling of IOCTL_GNTDEV_DMABUF_IMP_TO_REFS for a caller that maps
++ * those frames into another domain's physical map itself -- a device model
++ * sharing a buffer with the guest it serves, via XENMAPSPACE_gmfn_foreign --
++ * rather than handing grant references to the guest. A device model cannot work
++ * the frame numbers out for itself: a dma-buf mapping is VM_PFNMAP, which
++ * /proc/self/pagemap reports as a hole.
++ *
++ * No grant references are created. As with IMP_TO_REFS the buffer stays
++ * attached, and so its pages stay where they are, until
++ * IOCTL_GNTDEV_DMABUF_IMP_RELEASE is called for the same @fd.
++ */
++#define IOCTL_GNTDEV_DMABUF_IMP_TO_GFNS \
++	_IOC(_IOC_NONE, 'G', 13, \
++	     sizeof(struct ioctl_gntdev_dmabuf_imp_to_gfns))
++struct ioctl_gntdev_dmabuf_imp_to_gfns {
++	/* IN parameters. */
++	/* File descriptor of the dma-buf. */
++	__u32 fd;
++	/* Number of frame numbers in @gfns array. */
++	__u32 count;
++	/* Reserved - must be zero. */
++	__u32 reserved[2];
++	/* OUT parameters. */
++	/* Array of frame numbers of size @count. */
++	__u64 gfns[1];
++};
++
+ /*
+  * This will close all references to the imported buffer with file descriptor
+  * @fd, so it can be released by the owner. This is only valid for buffers
+- * created with IOCTL_GNTDEV_DMABUF_IMP_TO_REFS.
++ * created with IOCTL_GNTDEV_DMABUF_IMP_TO_REFS or
++ * IOCTL_GNTDEV_DMABUF_IMP_TO_GFNS.
+  */
+ #define IOCTL_GNTDEV_DMABUF_IMP_RELEASE \
+ 	_IOC(_IOC_NONE, 'G', 12, \
