@@ -1111,6 +1111,24 @@ parameters:
               # series. That order is the one verified at fuzz 0.
               layers:
                 - "../../meta-rpi-sodev/meta-rpi-sodev-devel"
+  # linux-firmware-rpidistro, the recipe that carries the BCM43455 Wi-Fi
+  # firmware, declares LICENSE_FLAGS = "synaptics-killswitch"
+  # (meta-raspberrypi's docs/ipcompliance.md explains the flag). Nothing here
+  # accepts it on the user's behalf: "yes" (build.sh
+  # --accept-synaptics-killswitch) adds the acceptance to the configuration
+  # moulin writes for DomD, and the DomD image then installs the firmware. With
+  # "no", the default, the image is built without it and DomD has no Wi-Fi.
+  ACCEPT_SYNAPTICS_KILLSWITCH:
+    desc: "Accept linux-firmware-rpidistro's synaptics-killswitch licence flag, so the DomD image gets the BCM43455 Wi-Fi firmware. yaml default no; build.sh sets it with --accept-synaptics-killswitch."
+    "no":
+      default: true
+    "yes":
+      overrides:
+        components:
+          domd:
+            builder:
+              conf:
+                - [LICENSE_FLAGS_ACCEPTED:append, " synaptics-killswitch"]
   # Board note: what is verified on this board, and on which tree. Two different
   # things, so they are recorded separately rather than as one "verified" claim.
   #

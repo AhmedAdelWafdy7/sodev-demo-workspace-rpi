@@ -391,7 +391,16 @@ fdt rm /soc/serial@7e201a00
 #    with the UART. Disable it explicitly in case the overlay is ever dropped.
 fdt set /soc/serial@7e201000/bluetooth status "disabled"
 
-# 4. SD card stays with Dom0 in this flavour (it owns /dev/mmcblk0), so emmc2 is
+# 4. Onboard Wi-Fi SDIO and the legacy DMA engine stay with Dom0 in this flavour
+#    and nothing is done here. /soc/mmcnr@7e300000 shares GIC SPI 126 with the
+#    emmc2 that Dom0 owns (item 5), so it cannot be handed to DomD without DomD
+#    and Dom0 both routing that line; domd-vc4.bb strips mmcnr and its DMA engine
+#    (/soc/dma-controller@7e007000, DREQ 11) out of DomD's partial DT for
+#    DOM0_OS=linux accordingly. The zephyr flavour marks both `xen,passthrough`
+#    instead -- that is the one ownership pair the shared Xen host overlay cannot
+#    express, because it is applied by both flavours.
+#
+# 5. SD card stays with Dom0 in this flavour (it owns /dev/mmcblk0), so emmc2 is
 #    NOT marked xen,passthrough. But the mailbox and /soc/firmware DO go to DomD
 #    — the display cannot work otherwise — and that takes `expgpio`
 #    (/soc/firmware/gpio) with them. emmc2's vmmc-supply / vqmmc-supply are the
@@ -492,7 +501,7 @@ fdt set /regulator-sd-io-1v8 regulator-always-on
 #    needs no equivalent line. This is a genuine BCM2711-only link in the chain.
 fdt rm /soc/cprman@7e101000 firmware
 
-# 5. Drop the CMA reservation from the host DT. /reserved-memory/linux,cma has
+# 6. Drop the CMA reservation from the host DT. /reserved-memory/linux,cma has
 #    alloc-ranges = <0x0 0x0 0x30000000> (low 768 MiB) and is inherited by Dom0;
 #    Dom0 does not touch the GPU here (vc4/v3d are blacklisted on its cmdline),
 #    and if its RAM does not overlap that window the reservation just fails with
@@ -503,7 +512,7 @@ fdt rm /soc/cprman@7e101000 firmware
 #    atf@0 no-map entry that protects TF-A.
 fdt rm /reserved-memory/linux,cma
 
-# 6. VideoCore-injected framebuffer nodes. Each `fdt rm` is best effort; the Hush
+# 7. VideoCore-injected framebuffer nodes. Each `fdt rm` is best effort; the Hush
 #    parser skips a line whose path is absent without aborting the script.
 fdt rm /chosen/framebuffer
 fdt rm /chosen/framebuffer@3f800000

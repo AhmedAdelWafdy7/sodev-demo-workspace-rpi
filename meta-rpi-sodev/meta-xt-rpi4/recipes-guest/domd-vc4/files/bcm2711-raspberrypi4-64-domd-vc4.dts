@@ -61,15 +61,25 @@
  * the pre-fixup alias to emmc2 did on hardware. GENET (/scb, 16 GiB) and V3D
  * (/v3dbus, own MMU) are identity-mapped and unrestricted.
  *
- * That is modelled with three intermediate simple-bus wrappers, each carrying
+ * That is modelled with four intermediate simple-bus wrappers, each carrying
  * only the dma-ranges its children need (MMIO stays identity via `ranges;`):
  *     soc_bus                ->  <0x0 0xc8000000  0x0 0x08000000  0x0 0x18000000>
  *                                bus 0xc8000000 == phys 0x08000000, 384 MiB
  *     emmc2_bus              ->  <0x0 0x0  0x0 0x0  0x0 0xfc000000>
  *                                identity, as the firmware-fixed host DT has it
+ *     legacy_dma_bus         ->  <0x0 0x7c000000  0x0 0xfc000000  0x0 0x03800000>,
+ *                                <0x0 0xc0000000  0x0 0x00000000  0x0 0x40000000>
+ *                                the host /soc pair verbatim: peripherals as the
+ *                                VideoCore sees them, plus the DRAM alias
  *     scb_bus   / v3d_bus    ->  identity
  * 0x08000000+0x18000000 is exactly DomD static-mem bank1 from
  * bcm2711-raspberrypi4-64-xen.dtso, i.e. the only DomD RAM the VideoCore can see.
+ * legacy_dma_bus is a bus of its own rather than a second dma-ranges entry on
+ * soc_bus because of_dma_get_max_cpu_address() takes the MAXIMUM of cpu_addr+size
+ * WITHIN a node but the MINIMUM ACROSS nodes: this bus's own maximum is
+ * 0xff7fffff, higher than soc_bus's 0x1fffffff, so the tree minimum -- and with it
+ * consequence (a) below -- does not move. Widening soc_bus instead would move it
+ * and would break scanout.
  *
  * Two consequences we rely on:
  *   a) of_dma_get_max_cpu_address() takes the MINIMUM dma-ranges limit found
@@ -120,6 +130,42 @@
 	 * failed (-75)", panic, reboot loop); that is an upstream regression
 	 * fixed here by xen patch 4.22-0006, not a reason to change this value.
 	 */
+	aliases {
+		/* SODEV-LINUX-DOM0-SD-STRIP-BEGIN: these TWO LINES ONLY.
+		 * Pin the mmc host index. Linux assigns it in mmc_alloc_host() from
+		 * of_alias_get_id(dev->of_node, "mmc") and only falls back to
+		 * first-come-first-served when there is no alias. DomD boots with
+		 * root=/dev/mmcblk0p2, so emmc2 MUST be mmc0; without this the mmcnr
+		 * below probes first, takes index 0, the SD card slides to mmcblk1 and
+		 * `rootwait` waits forever with no error printed:
+		 *
+		 *     mmc0: SDHCI controller on fe300000.mmcnr ... using PIO
+		 *     mmc1: SDHCI controller on fe340000.mmc ... using ADMA
+		 *     mmcblk1: mmc1:d555 ST512 456 GiB
+		 *     Waiting for root device /dev/mmcblk0p2...
+		 *
+		 * The host DT pins the same two (mmc0 = /emmc2bus/mmc@7e340000,
+		 * mmc1 = /soc/mmcnr@7e300000); this mirrors it.
+		 *
+		 * &emmc2 and &mmcnr are both declared inside the big SD-STRIP block near
+		 * the end of this file, so for DOM0_OS=linux domd-vc4.bb deletes the
+		 * nodes and these two references would be left dangling. dtc then
+		 * refuses the whole tree --
+		 *     ERROR (path_references): /aliases: Reference to non-existent node
+		 *                              or label "emmc2"
+		 * -- and do_compile produces no DTB at all.
+		 *
+		 * JUST these two lines are marked, and NOT the whole /aliases node, so
+		 * that an alias added to it later survives the strip. domd-vc4.bb's sed is
+		 * `/BEGIN/,/END/d`, which deletes EVERY BEGIN..END range it finds, so a
+		 * second pair here needs no recipe change. Comments are dropped by dtc,
+		 * so the zephyr DTB is unaffected by the markers themselves.
+		 */
+		mmc0 = &emmc2;
+		mmc1 = &mmcnr;
+		/* SODEV-LINUX-DOM0-SD-STRIP-END */
+	};
+
 	gic: gic {
 		#interrupt-cells = <0x3>;
 		interrupt-controller;
@@ -1119,6 +1165,289 @@
 			enable-active-high;
 			gpios = <&expgpio 6 0>;
 			status = "okay";
+		};
+
+		/* ==================================================================
+		 * Legacy DMA engine (bcm2835-dma) -> DomD, for the Wi-Fi SDIO.
+		 * ==================================================================
+		 * mmcnr's only route to DMA is this EXTERNAL engine: the Arasan SDHCI
+		 * block it sits on has no usable internal bus master (see the
+		 * compatible note on mmcnr below). The host wires it up as
+		 *     dmas = <&dma-controller@7e007000 11>   / * DREQ 11 * /
+		 * so the engine has to be in this domain for bcm2835-mmc.c to get a
+		 * channel.
+		 *
+		 * ---- Why the wrapper bus exists ----------------------------------
+		 * bcm2835-mmc.c hands the engine a CPU-physical slave address:
+		 *     host->bus_addr = iomem->start;                    / * :1422 * /
+		 *     cfg.dst_addr   = host->bus_addr + SDHCI_BUFFER;   / * :1329 * /
+		 * and bcm2835-dma.c turns it into a bus address with
+		 *     dst = dma_map_resource(chan->device->dev, c->cfg.dst_addr, ...)
+		 *                                                      / * :1026-1032 * /
+		 * dma_map_resource() consults the DMA CONTROLLER device's
+		 * dma_range_map, i.e. the dma-ranges of the bus this node sits under.
+		 * translate_phys_to_dma() returns DMA_MAPPING_ERROR when no entry
+		 * matches -- the kernel says so itself: "make sure dma_capable fails
+		 * when no translation is available". soc_bus's dma-ranges covers only
+		 * DomD bank1, so putting this node there would fail every transfer.
+		 *
+		 * Both dma-ranges entries below are COPIED VERBATIM from the host
+		 * /soc node (dma-ranges = <0xc0000000 0x0 0x0 0x40000000
+		 * 0x7c000000 0x0 0xfc000000 0x3800000>), re-expressed with this bus's
+		 * 2 address cells:
+		 *   peripherals  bus 0x7c000000 == cpu 0xfc000000, 0x3800000
+		 *                -> dma_map_resource(0xfe300000) yields 0x7e300000
+		 *   DRAM         bus 0xc0000000 == cpu 0x0, 0x40000000
+		 *                -> the VideoCore alias, LOW 1 GiB ONLY
+		 * Copying rather than reasoning matters here: the emmc2 note above
+		 * records a board A/B where guessing this window wrong produced
+		 * "mmc0: ADMA error: 0x02000000" retried forever and a silent
+		 * rootwait hang. Measured on the board, channel 2 during a transfer
+		 * holds SRC = 0x7e300020 (the SDHCI BUFFER as the VideoCore addresses
+		 * it) and DST inside 0xc8000000..0xe0000000 (the bank1 alias window),
+		 * and CS.ERROR is never set.
+		 *
+		 * ---- The hardware limit that remains (read this before tuning) ----
+		 * This engine is a 32-bit master and only ever sees the low 1 GiB of
+		 * DRAM through the alias above. Of DomD's three static-mem banks
+		 * (bcm2711-raspberrypi4-64-xen.dtso: 0x40000000+0x40000000,
+		 * 0x08000000+0x18000000, 0x80000000+0x20000000) ONLY bank1 is inside
+		 * it, and DomD's `cma=` reservation (128 MiB in the 4 GiB lane) takes
+		 * part of that 384 MiB for vc4. Everything else is bounced by swiotlb
+		 * (CONFIG_SWIOTLB=y, and SWIOTLB_XEN is def_bool y on ARM64+XEN), so
+		 * the win over PIO is a memcpy trade, not a free ride -- and it is a
+		 * win in INTERRUPTS, not in CPU time: a fixed 609 KB firmware load
+		 * repeated three times cost 4487-6533 interrupts with this engine
+		 * against 16105-16701 in PIO (about a third as many), while the CPU time
+		 * was the same within noise. `dmesg | grep swiotlb` shows the bounce
+		 * buffer and any "swiotlb buffer is full".
+		 *
+		 * ---- Why a SEPARATE bus and not soc_bus -------------------------
+		 * of_dma_get_max_cpu_address() takes the MAX of cpu_addr+size WITHIN a
+		 * node but the MIN ACROSS nodes (drivers/of/address.c). soc_bus
+		 * supplies the tree minimum 0x1fffffff, which is what makes
+		 * arm64_dma_phys_limit 0x20000000 and lands vc4's CMA inside bank1
+		 * automatically (see the header note). This bus's own maximum is
+		 * 0xff7fffff -- HIGHER -- so the tree minimum does not move and CMA
+		 * placement is unchanged. Editing soc_bus's dma-ranges instead WOULD
+		 * move it, and would break scanout.
+		 *
+		 * ---- Page 0xfe007000 is shared with dma40 -----------------------
+		 * The legacy engine's registers (0xfe007000 + 0xb00) and dma40's
+		 * (/scb/dma@7e007b00, HDMI audio, 0xfe007b00 + 0x400) sit in the same
+		 * 4 KiB page, and dma40 is NOT passed through -- it stays with the
+		 * hardware domain. So this is the one page in this file that is
+		 * mapped into DomD while another domain also has it -- a deviation
+		 * from the one-domain-per-page habit the boot scripts follow when they
+		 * `fdt rm` uart2..uart5 out of pl011's page, not from the header rule
+		 * above, which is about one xen,reg owner per page WITHIN this file.
+		 * It is benign in both directions that matter: Xen has no cross-domain
+		 * MMIO
+		 * exclusivity check, the two register windows do not overlap, and in
+		 * the DOM0_OS=zephyr flavour this node ships in there is no Linux
+		 * hardware domain to bind bcm2835-dma to dma40 at all. The global
+		 * DMA_ENABLE register at 0xfe007ff0 is the one byte of genuinely
+		 * shared state (measured 0x00007fff, i.e. channels 0..14 all enabled);
+		 * the engine is already enabled before either domain starts, so
+		 * neither has to write it.
+		 *
+		 * Interrupts are copied exactly from the host, including the two lines
+		 * that repeat: dma7/dma8 both raise SPI 87 and dma9/dma10 both raise
+		 * SPI 88. bcm2835_dma_probe() looks each up by name and skips a
+		 * channel whose IRQ is missing, so a partial set would still work --
+		 * but there is no reason to trim it.
+		 *
+		 * INSIDE THE SD-STRIP BLOCK ON PURPOSE: mmcnr is stripped for
+		 * DOM0_OS=linux (it shares SPI 126 with the emmc2 that Dom0-Linux
+		 * owns), so its DMA engine goes with it. Leaving this node outside
+		 * would hand a Linux Dom0's DMA controller to DomD for no user.
+		 */
+		legacy_dma_bus: legacy-dma-bus {
+			compatible = "simple-bus";
+			#address-cells = <0x2>;
+			#size-cells = <0x2>;
+			ranges;			/* MMIO stays identity */
+			dma-ranges = <0x0 0x7c000000 0x0 0xfc000000 0x0 0x03800000>,
+				     <0x0 0xc0000000 0x0 0x00000000 0x0 0x40000000>;
+
+			dma_legacy: dma-controller@fe007000 {
+				compatible = "brcm,bcm2835-dma";
+				reg = <0x0 0xfe007000 0x0 0xb00>;
+				interrupts = <0x0 80 0x4>,	/* dma0  */
+					     <0x0 81 0x4>,	/* dma1  */
+					     <0x0 82 0x4>,	/* dma2  */
+					     <0x0 83 0x4>,	/* dma3  */
+					     <0x0 84 0x4>,	/* dma4  */
+					     <0x0 85 0x4>,	/* dma5  */
+					     <0x0 86 0x4>,	/* dma6  */
+					     <0x0 87 0x4>,	/* dma7  */
+					     <0x0 87 0x4>,	/* dma8  (shares 87) */
+					     <0x0 88 0x4>,	/* dma9  */
+					     <0x0 88 0x4>;	/* dma10 (shares 88) */
+				interrupt-names = "dma0", "dma1", "dma2", "dma3",
+						  "dma4", "dma5", "dma6", "dma7",
+						  "dma8", "dma9", "dma10";
+				interrupt-parent = <&gic>;
+				#dma-cells = <0x1>;
+				brcm,dma-channel-mask = <0x7f5>;
+				xen,path = "/soc/dma-controller@7e007000";
+				xen,force-assign-without-iommu;
+				xen,reg = <0x0 0xfe007000 0x0 0x1000 0x0 0xfe007000>;
+				status = "okay";
+			};
+		};
+
+		/*
+		 * mmcnr's base clock. The host uses <&clocks BCM2835_CLOCK_EMMC>
+		 * (cprman index 28) and cprman is not passed through -- same
+		 * situation as emmc2 above. 250 MHz is not a guess: read in u-boot
+		 * before Xen starts, CM_EMMCCTL (0xfe1011c0) = 0x00000296, i.e.
+		 * SRC = 6 (plld_per), ENABLE = 1, BUSY = 1 -- the gate is already
+		 * open -- and CM_EMMCDIV (0xfe1011c4) = 0x3000, DIVI = 3. The same
+		 * read on EMMC2 gives DIVI = 7.5 against the 100 MHz declared for
+		 * clk_emmc2, so plld_per = 750 MHz and both declared rates are
+		 * exactly right.
+		 */
+		clk_mmcnr: clk-mmcnr {
+			compatible = "fixed-clock";
+			#clock-cells = <0x0>;
+			clock-output-names = "mmcnr-clock";
+			clock-frequency = <250000000>;	/* plld_per 750 / DIVI 3, measured */
+		};
+
+		/* ------------------------------------------------------------------
+		 * mmcnr is the SDIO controller the on-board CYW43455 (BCM4345/6)
+		 * Wi-Fi hangs off, and it is here because the Wi-Fi stack already in
+		 * DomD -- brcmfmac, brcmfmac_cyw, brcmutil, cfg80211, wpa_supplicant,
+		 * and the Cypress firmware when the build accepts synaptics-killswitch
+		 * (README, *Wi-Fi firmware licence*) -- has no device to bind to
+		 * without it.
+		 * With this node the board reaches:
+		 *
+		 *     mmc1: SDHCI controller on fe300000.mmcnr
+		 *     mmc1: new high speed SDIO card at address 0001
+		 *     brcmfmac: Firmware: BCM4345/6 wl0: ... version 7.45.265 (CY)
+		 *     wlan0  (up, scans return real APs)
+		 *
+		 * It shares GIC SPI 126 with emmc2, which is legal: IRQs are routed
+		 * from the node xen,path resolves to in the HOST DT with virq == irq,
+		 * and route_irq_to_guest() returns -EBUSY only for another domain, a
+		 * different virq on the same line, or a line Xen itself uses. The hard
+		 * requirement is the SAME trigger type in both nodes, because
+		 * irq_set_spi_type() accepts a repeat only when curr == new. Both
+		 * declare <0 126 4>. Linux is fine with the sharing: sdhci requests
+		 * its IRQ with IRQF_SHARED.
+		 *
+		 * Against the host node /soc/mmcnr@7e300000 this keeps the
+		 * compatible, replaces clocks, drops pinctrl-names, pinctrl-0
+		 * and brcm,overclock-50, and adds brcm,board-type to wifi@1,
+		 * all measured:
+		 *
+		 *   compatible  Kept in the host order, and NOT because
+		 *               "brcm,bcm2835-mmc" is listed first: compatible order
+		 *               only scores matches WITHIN one driver's
+		 *               of_match_table, while which of two different builtin
+		 *               drivers wins is decided by registration order, i.e.
+		 *               link order, because of_platform_default_populate()
+		 *               creates the device first and each driver binds the
+		 *               first time it matches. Both are builtin here
+		 *               (CONFIG_MMC_BCM2835_MMC=y, CONFIG_MMC_SDHCI_IPROC=y)
+		 *               and drivers/mmc/host/Makefile puts bcm2835-mmc.o on
+		 *               line 26 against sdhci-iproc.o on line 97, so
+		 *               bcm2835-mmc.c registers first and takes it. That is
+		 *               also why bare-metal Raspberry Pi OS -- same kernel,
+		 *               same both-listed compatible -- gets bcm2835-mmc.
+		 *               "brcm,bcm2835-sdhci" as the second entry is harmless
+		 *               and preserves the sdhci-iproc fallback if
+		 *               bcm2835-mmc is ever disabled.
+		 *
+		 *               With only "brcm,bcm2835-sdhci" the node binds
+		 *               sdhci-iproc.c, whose bcm2835_data sets
+		 *                   .caps = MAX_BLOCK | CAN_VDD_330 | CAN_DO_HISPD
+		 *                   .missing_caps = true      / * :261-270 * /
+		 *               and missing_caps makes probe pass those hardcoded
+		 *               values to __sdhci_read_caps(host, NULL, &caps, &caps1)
+		 *               (:395-396), so the capabilities register at 0x40 is
+		 *               NEVER read. Neither CAN_DO_ADMA2 (bit 19) nor
+		 *               CAN_DO_SDMA (bit 22) is in that list, so the
+		 *               controller runs in PIO. The omission is deliberate
+		 *               upstream -- the sibling iproc_data / iproc_cygnus_data
+		 *               entries in the same file DO list both bits -- because
+		 *               the BCM2835-family Arasan block has no usable internal
+		 *               bus master. Raspberry Pi's answer is the downstream
+		 *               bcm2835-mmc.c driver plus an EXTERNAL DMA engine,
+		 *               which is what this compatible selects. See
+		 *               legacy_dma_bus above, and note the fallback is safe:
+		 *               if the channel cannot be acquired,
+		 *               bcm2835_mmc_add_host() logs "Unable to initialise DMA
+		 *               channel. Falling back to PIO" and clears have_dma
+		 *               (bcm2835-mmc.c:1316).
+		 *
+		 *               THIS NODE STILL NEEDS NO dma-ranges WRAPPER:
+		 *               bcm2835-mmc.c maps every buffer and slave address with
+		 *               the DMA CONTROLLER's device, not its own --
+		 *               dma_map_sg(dma_chan->device->dev, ...) at
+		 *               bcm2835-mmc.c:522 and
+		 *               dma_map_resource(chan->device->dev, ...) inside
+		 *               bcm2835-dma.c:1026-1032. Wrapping mmcnr in the
+		 *               VideoCore-alias bus would therefore buy nothing and
+		 *               risk exactly the emmc2 failure documented above.
+		 *
+		 *   clocks      DROPPED and replaced: a fixed clock instead of cprman,
+		 *               which is not passed through -- see clk_mmcnr.
+		 *
+		 *   pinctrl-0   DROPPED, with pinctrl-names. The host points at
+		 *               <&sdio_pins> under gpio@7e200000 and DomD has
+		 *               no GPIO controller. The firmware muxes GPIO
+		 *               34-39 to ALT3 before Xen starts: GPFSEL3
+		 *               (0xfe20000c) reads 0x3ffff000.
+		 *
+		 *   brcm,overclock-50  DROPPED. The host's value is 0, and 0 is
+		 *               also what bcm2835-mmc.c uses when the property
+		 *               is absent (no overclock).
+		 *
+		 * ADDED: wifi@1 carries brcm,board-type because brcmfmac otherwise derives it
+		 * from the DT root's compatible (brcmf_of_probe -> of.c), and a Xen
+		 * guest DT has no such property -- so it asks for the unsuffixed
+		 * brcm/brcmfmac43455-sdio.bin, which meta-raspberrypi does not ship
+		 * (only board-suffixed symlinks into cypress/). With the property the
+		 * lookup hits brcmfmac43455-sdio.raspberrypi,4-model-b.bin and the
+		 * firmware loads. No rootfs change needed.
+		 * ------------------------------------------------------------------ */
+		mmcnr: mmcnr@fe300000 {
+			compatible = "brcm,bcm2835-mmc", "brcm,bcm2835-sdhci";
+			reg = <0x0 0xfe300000 0x0 0x100>;
+			interrupts = <0x0 126 0x4>;	/* GIC SPI 126, shared with emmc2 */
+			interrupt-parent = <&gic>;
+			clocks = <&clk_mmcnr>;
+			/* The cell is a DREQ number, NOT a channel index
+			 * (brcm,bcm2835-dma.yaml: "The single cell represents the DREQ
+			 * number"). bcm2835_dma_xlate() takes any free channel from
+			 * brcm,dma-channel-mask and only stores the DREQ, so DREQ 11
+			 * does not need bit 11 in the mask. Value copied from the host
+			 * mmcnr node.
+			 *
+			 * dma_request_slave_channel(dev, "rx-tx") resolves this from
+			 * mmcnr's OWN node (bcm2835-mmc.c:1426), which is why the
+			 * property lives here even though every dma_map_*() uses the DMA
+			 * controller's device instead.
+			 */
+			dmas = <&dma_legacy 11>;
+			dma-names = "rx-tx";
+			bus-width = <0x4>;
+			non-removable;
+			#address-cells = <0x1>;
+			#size-cells = <0x0>;
+			xen,path = "/soc/mmcnr@7e300000";
+			xen,force-assign-without-iommu;
+			xen,reg = <0x0 0xfe300000 0x0 0x1000 0x0 0xfe300000>;
+			status = "okay";
+
+			brcmf: wifi@1 {
+				reg = <0x1>;
+				compatible = "brcm,bcm4329-fmac";
+				brcm,board-type = "raspberrypi,4-model-b";
+			};
 		};
 		/* SODEV-LINUX-DOM0-SD-STRIP-END */
 	};

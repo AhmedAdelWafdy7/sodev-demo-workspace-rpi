@@ -218,7 +218,8 @@
  * declare it, and its MMIO stays unmapped in every guest. It only stops Xen
  * from handing SPI 110 to Dom0 first. This is the same hazard the boot scripts
  * handle with `fdt rm` for uart2..uart5 (shared SPI 121) and for
- * /soc/mmcnr@7e300000 + /soc/mmc@7e300000 (shared SPI 126); it is expressed as
+ * /soc/mmc@7e300000 (the disabled duplicate of mmcnr, shared SPI 126); it is
+ * expressed as
  * a marker here because a mistyped path in `fdt rm` is silently ignored by the
  * U-Boot Hush parser, whereas a mistyped &label makes `fdt apply` fail loudly.
  * The DomD passthrough cross-check enforces the whole class mechanically.

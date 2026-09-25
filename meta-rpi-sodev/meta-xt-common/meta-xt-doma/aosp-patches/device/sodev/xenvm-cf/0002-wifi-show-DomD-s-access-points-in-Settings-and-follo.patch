@@ -1,0 +1,3145 @@
+From 638b9003cacfe1e2a1df0978c0d3c0e872f7be00 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 25 Sep 2026 09:34:38 +0900
+Subject: [PATCH] wifi: show DomD's access points in Settings and follow the
+ Wi-Fi toggle
+
+Out of the box this guest is set up for virt_wifi, whose whole offer is
+one synthetic SSID called "VirtWifi" -- and on this product even that
+does not come up: cuttlefish's setup_wifi, which creates the interface,
+is gated on ro.boot.wifi_impl=virt_wifi, which is empty here, so there
+is no wlan0. Nothing real is reachable either way: the guest has no
+radio, and the Wi-Fi HAL has nothing to scan with.
+
+Replace it with a shadow AP. mac80211_hwsim gives the guest a simulated
+radio; hostapd beacons, on that radio, the SSIDs DomD really scanned;
+and the guest's own station associates with one of them, so the
+Settings screen lists real access points and connecting to one puts
+traffic on DomD's uplink through br-shadow. /vendor/bin/doma-shadow-ap
+builds the hostapd config and brings the bridge up; init.xenvm-hwsim.rc
+starts it once sys.boot_completed is set, and runs hostapd as a service
+of its own, because init SIGKILLs a oneshot's process group when it
+exits. With persist.vendor.doma.shadow_ap not true the script execs
+setup_wifi instead and hands wlan0 back to virt_wifi, so falling back
+costs a reboot rather than an SD rewrite.
+
+wificond is installed as well. The inherited product set carries only
+wificond_compat_symlink_module, which leaves /system/bin/wificond a
+dangling symlink, and WifiNative needs wificond for the nl80211 setup
+of wlan0, so without it enabling Wi-Fi fails at exactly that step.
+
+The list is fed by /vendor/bin/doma-wifi-relay, which reads
+newline-delimited JSON from DomD's agent over a virtio-serial port and
+writes the scan results into the shadow AP's config. It also forwards a
+connect request the other way, because a shadow AP cannot learn a
+passphrase from a 4-way handshake -- only a MIC crosses the air -- so
+on-screen entry and a real association cannot both hold unless the
+passphrase is forwarded. This is lab use, not a product design, and the
+app's source says so.
+
+The relay also mirrors the station after a reboot: it reads the SSID
+the station is on from `iw dev wlan0 link` and forwards that SSID's
+connect once per boot. iw prints every byte outside printable ASCII, a
+backslash and a space at either end as \xNN, so the relay decodes that
+before it looks the SSID up in aps.conf, and it forwards nothing for an
+SSID aps.conf has no row for. Checked on the PC, with iw's own
+print_ssid_escaped() making the input, under bash, dash, busybox sh and
+mksh R59, the last with toybox's printf as well: a Japanese SSID and
+one with a space at each end are forwarded with their PSK, and one with
+no row is not.
+
+DomaWifiRelay is the DomA half: a privileged app that watches
+WifiConfiguration's NetworkSelectionStatus for a wrong-password
+disconnect and hands the typed passphrase to the relay through a
+request file under /data/vendor/wifi/shadow/req. One failed handshake
+disables a network permanently, so the app then calls
+WifiManager.connect(), which clears that. It needs a privapp-permissions
+allowlist entry: the platform key alone does not grant
+READ_WIFI_CREDENTIAL, which is signature|privileged, and without the
+entry system_server throws on every boot.
+
+doma-shadow-aps.conf ships one placeholder row, and the file is
+credentials storage rather than a cache: doma-shadow-ap exits if the
+runtime aps.conf is empty, so something has to seed it. The shipped row
+is EXAMPLE-SSID with an obvious placeholder passphrase; a real one is
+entered on the board.
+
+sepolicy buys attribution rather than access -- the board boots
+permissive, so the scripts already run, but without an exec type every
+avc line names init and audit2allow has nothing to work with.
+BoardConfig.mk adds the directory; file_contexts gives both scripts one
+exec type and labels /data/vendor/wifi/shadow hostapd_data_file, so the
+apex hostapd can use it.
+
+The channel has to be raw. Measured on the board: without
+`stty raw -echo` on the channel fd the TTY echoes DomD's JSON back at
+it, the agent reads its own messages ("ignoring malformed line"), its
+writes time out, and the connect request never arrives -- so the AP
+list is correct and the guest still cannot get out.
+
+The relay also writes one newline right after the stty. Between opening
+the node and the stty the TTY is still cooked with ECHO on, and the
+node has had no reader until then, so DomD's queued publications are
+partly echoed straight back; the fragment, which has no newline of its
+own, corrupts the next line DomD reads. On this board that line was the
+session's only connect request, which reached the agent as
+b'{{"t":"connect",...}', was dropped, and left DomA with Wi-Fi but no
+Internet (2026-09-23). The newline ends the fragment as a line of its
+own that the agent drops, and the first real request arrives clean.
+
+Both halves run while persist.vendor.doma.wifi_relay is unset or
+"true", and they follow the Settings Wi-Fi toggle. An opt-in value
+would live in /data, so every rewrite of the SD card would turn the
+relay off again.
+
+- doma-wifi-relay reads wlan0's flags every tick. With the toggle off
+  the framework takes wlan0 down (IFF_UP clears, 0x1003 -> 0x1002
+  within 1 s on the RPi4; carrier is then unreadable), and the relay
+  holds PSK requests, the one path that asks DomD to associate while
+  the station is down. aps publications keep syncing, so the list is
+  current the moment the toggle is back on.
+- It skips publications, and leaves requests from the previous boot,
+  while doma_shadow_ap is still running, and writes aps.conf by rename,
+  because init's SIGKILL at shutdown can land in the middle of the
+  write.
+- It idles in the virt_wifi fallback (persist.vendor.doma.shadow_ap not
+  true), where there is no shadow AP: a publication would only
+  crash-loop hostapd there.
+- init starts it at sys.boot_completed, right after doma_shadow_ap.
+- DomaWifiRelay is enabled on the same two values as init, returns
+  early while Wi-Fi is off, and sweeps again on WIFI_STATE_CHANGED.
+
+Measured on the PC with the relay's device interfaces stubbed, under
+bash and under mksh (the shell the board runs it with): the toggle,
+doma_shadow_ap running, fallback and previous-boot request scenarios
+pass all 23 checks.
+
+Both hostapd.conf generators, doma-shadow-ap at boot and the relay at
+runtime, skip the same rows: an SSID that is still escaped (it has a
+backslash) or longer than 32 bytes, and a PSK that is neither 8..63
+bytes nor 64 hex digits, any of which would make hostapd refuse the
+whole file. The skip is logged to stderr, not into hostapd.conf. A
+64-digit hex PSK, which the AAOS dialog stores unquoted, is written as
+wpa_psk=, and the relay refuses any other invalid PSK before it reaches
+aps.conf or DomD. Checked on the PC under bash, busybox sh, dash and
+mksh R59: both generators write the same file from one aps.conf, and it
+carries no log line.
+
+Wi-Fi starts off on a fresh /data and keeps the user's choice.
+def_wifi_on is already false, but trout's trout-virtwifi-setup runs
+`cmd wifi set-wifi-enabled enabled` at every boot, which also saves the
+state, so the Settings toggle could neither start off nor stay off
+across a reboot.
+
+- An empty virtwifi.rc is installed over trout's. It is listed above
+  the trout inherit, because for one destination the first
+  PRODUCT_COPY_FILES entry wins and inherit-product puts the parent's
+  entries at the inherit line. The note on trout's virtwifi in
+  init.xenvm-buried-eth0.rc now mentions the replacement.
+- doma-shadow-ap cycles Wi-Fi only while it is saved on (wifi_on 1 or
+  2). The cycle is what makes the goldfish HAL, which lists wlan0/wlan1
+  once when it starts, see the radios the script creates. With Wi-Fi
+  off the framework never starts the HAL, and the user's first "on"
+  lists them.
+
+In fallback mode (persist.vendor.doma.shadow_ap not true) the empty
+virtwifi.rc also drops the automatic connection to the open VirtWifi
+network; the user picks it.
+
+With Wi-Fi off DomA has no way out other than wlan0 as far as this tree
+configures it (eth1 is a br-shadow port, and nothing routes
+buried_eth0's 192.168.97.0/30), so a fresh image stays offline until
+the user turns Wi-Fi on and joins an AP. adb over vsock is unaffected.
+
+Measured on the PC with the step extracted and stubbed: it cycles for
+wifi_on 1 and 2 and not for 0, 3, null or empty, under bash, busybox sh
+and mksh.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
+---
+ DomaWifiRelay/Android.bp                      |   76 ++
+ DomaWifiRelay/AndroidManifest.xml             |   51 +
+ ...allowlist_com.android.xt.domawifirelay.xml |   67 ++
+ .../xt/domawifirelay/BootReceiver.java        |   40 +
+ .../xt/domawifirelay/RelayService.java        |  445 +++++++
+ aosp_xenvm_trout_rpi4_arm64.mk                |  108 +-
+ init.xenvm-buried-eth0.rc                     |   10 +-
+ sepolicy/doma_shadow_ap.te                    |  212 ++++
+ sepolicy/file_contexts                        |   26 +
+ xenvm_trout_rpi4_arm64/BoardConfig.mk         |   13 +
+ xenvm_trout_rpi4_arm64/doma-shadow-ap.sh      |  467 ++++++++
+ xenvm_trout_rpi4_arm64/doma-shadow-aps.conf   |   30 +
+ xenvm_trout_rpi4_arm64/doma-wifi-relay.sh     | 1057 +++++++++++++++++
+ xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc    |  229 ++++
+ xenvm_trout_rpi4_arm64/virtwifi.rc            |    8 +
+ 15 files changed, 2832 insertions(+), 7 deletions(-)
+ create mode 100644 DomaWifiRelay/Android.bp
+ create mode 100644 DomaWifiRelay/AndroidManifest.xml
+ create mode 100644 DomaWifiRelay/privapp_allowlist_com.android.xt.domawifirelay.xml
+ create mode 100644 DomaWifiRelay/src/com/android/xt/domawifirelay/BootReceiver.java
+ create mode 100644 DomaWifiRelay/src/com/android/xt/domawifirelay/RelayService.java
+ create mode 100644 sepolicy/doma_shadow_ap.te
+ create mode 100644 sepolicy/file_contexts
+ create mode 100755 xenvm_trout_rpi4_arm64/doma-shadow-ap.sh
+ create mode 100644 xenvm_trout_rpi4_arm64/doma-shadow-aps.conf
+ create mode 100755 xenvm_trout_rpi4_arm64/doma-wifi-relay.sh
+ create mode 100644 xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc
+ create mode 100644 xenvm_trout_rpi4_arm64/virtwifi.rc
+
+diff --git a/DomaWifiRelay/Android.bp b/DomaWifiRelay/Android.bp
+new file mode 100644
+index 0000000..78a7481
+--- /dev/null
++++ b/DomaWifiRelay/Android.bp
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: Apache-2.0
++//
++// DomaWifiRelay -- closes the last gap in the shadow-AP Wi-Fi path: it is the only
++// component that can learn the passphrase the user typed on the AAOS Wi-Fi screen.
++//
++// WHY AN APP AT ALL. The shadow AP on wlan2 validates the typed password locally, and
++// it cannot recover that password from the 4-way handshake -- only a MIC crosses the
++// air. The framework is the only place the plaintext exists after the user types it,
++// and WifiManager.getPrivilegedConfiguredNetworks() is the only sanctioned way to read
++// it (WifiServiceImpl:3978 -> getConfiguredNetworksWithPasswords()). That API is
++// @SystemApi and permission-gated, so the reader has to be a platform app.
++//
++// WHY platform_apis AND NOT sdk_version: "system_current".
++//
++// Not the API surface: every member this app uses is @SystemApi (the
++// NetworkSelectionStatus class of WifiConfiguration and SystemProperties.get()
++// and getBoolean()), and both sources compile against
++// android_system_stubs_current.jar with 0 errors (measured on the PC). The
++// reason is the one recorded below next to system_ext_specific: soong refuses
++// platform_apis on a vendor/product module, this app is device-specific and
++// built in-tree with the platform, and pinning an API surface buys nothing
++// here.
++//
++// WHY certificate: "platform" + privileged, AND WHY THAT IS NOT SUFFICIENT ON ITS OWN.
++// NETWORK_SETTINGS is signature-level, so the platform key grants it, but
++// READ_WIFI_CREDENTIAL is signature|privileged, and an unlisted privileged
++// package keeps this image from booting. Measured:
++//
++//     NETWORK_SETTINGS       signature             frameworks/base/core/res/
++//     READ_WIFI_CREDENTIAL   signature|privileged      AndroidManifest.xml:2489, :2402
++//
++// The privileged flag turns the allowlist check into an AND gate placed in FRONT of the
++// signature grant (AppIdPermissionPolicy.kt:1143-1159), so the platform key does not
++// get past it; with ro.control_privapp_permissions=enforce an unlisted package throws
++// out of onSystemReady() (:1613, :1922). The proof that signing is irrelevant here is
++// in the same image: com.android.systemui is certificate: "platform" and still carries
++// an allowlist entry for READ_WIFI_CREDENTIAL, in
++// system_ext/etc/permissions/com.android.systemui.xml.
++//
++// Hence privapp_allowlist below. See that file for the full derivation.
++//
++// WHY NO NEARBY_WIFI_DEVICES / ACCESS_FINE_LOCATION RUNTIME GRANT. Both permission
++// paths inside getPrivilegedConfiguredNetworks short-circuit for a NETWORK_SETTINGS
++// holder -- measured: WifiPermissionsUtil.enforceCanAccessScanResults() returns
++// immediately when checkNetworkSettingsPermission(uid) is true, and so does
++// enforceNearbyDevicesPermission(). A headless app cannot show a grant dialog, so this
++// is what makes the app possible without default-grant plumbing.
++android_app {
++    name: "DomaWifiRelay",
++    srcs: ["src/**/*.java"],
++    platform_apis: true,
++    certificate: "platform",
++    privileged: true,
++    // Required, not optional: READ_WIFI_CREDENTIAL is signature|privileged. Installed
++    // to /system_ext/etc/permissions/DomaWifiRelay.xml -- soong names the installed
++    // file after the MODULE, and PathForModuleInstall follows system_ext_specific
++    // (build/soong/java/app.go:1230-1234). Needs privileged: true above
++    // (app.go:396-400).
++    privapp_allowlist: "privapp_allowlist_com.android.xt.domawifirelay.xml",
++    // Installs to /system_ext/priv-app, NOT /vendor/priv-app.
++    //
++    // MEASURED: soong refuses `platform_apis: true` on a vendor- or product-partition
++    // module -- "sdk_version must have a value when the module is located at vendor or
++    // product".
++    //
++    // system_ext is also the correct Treble placement independently of that: this app
++    // holds signature permissions, runs as android.uid.system and only talks to the
++    // framework, so it is coredomain -- and a coredomain app does not belong on the
++    // vendor partition. The vendor half of the relay is the shell daemon
++    // (/vendor/bin/doma-wifi-relay); the two communicate through a file in
++    // /data/vendor/wifi/shadow/req, not across a partition-crossing interface.
++    system_ext_specific: true,
++    optimize: {
++        enabled: false,
++    },
++}
+diff --git a/DomaWifiRelay/AndroidManifest.xml b/DomaWifiRelay/AndroidManifest.xml
+new file mode 100644
+index 0000000..f9040eb
+--- /dev/null
++++ b/DomaWifiRelay/AndroidManifest.xml
+@@ -0,0 +1,51 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: Apache-2.0 -->
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="com.android.xt.domawifirelay"
++    android:sharedUserId="android.uid.system">
++
++    <!-- NETWORK_SETTINGS: required by WifiManager.connect(int, ActionListener)
++         (WifiServiceImpl:7569 isPrivileged) and it is also what short-circuits every
++         location/nearby check inside getPrivilegedConfiguredNetworks. -->
++    <uses-permission android:name="android.permission.NETWORK_SETTINGS" />
++    <!-- READ_WIFI_CREDENTIAL: enforceReadCredentialPermission() in
++         getPrivilegedConfiguredNetworks (WifiServiceImpl:3980). -->
++    <uses-permission android:name="android.permission.READ_WIFI_CREDENTIAL" />
++    <!-- ACCESS_WIFI_STATE: the permission the CONFIGURED_NETWORKS_CHANGED broadcast is
++         sent with (WifiConfigManager's
++         sendConfiguredNetworkChangedBroadcast()). -->
++    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
++    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
++
++    <!-- android:persistent keeps the process alive so the RUNTIME-registered
++         CONFIGURED_NETWORKS_CHANGED receiver stays live; a runtime receiver dies with
++         its process, and the wrong-password status change is the one event that must
++         not be missed. It is an <application> attribute, not a <service> one, and only
++         an android.uid.system app may ask for it. START_STICKY on the service is the
++         belt to this braces: if the process is killed anyway, init/AMS restarts it and
++         onCreate re-registers and re-sweeps, so a missed event is recovered at the next
++         config change rather than lost forever. -->
++    <application
++        android:label="DomA Wi-Fi Relay"
++        android:allowBackup="false"
++        android:persistent="true"
++        android:directBootAware="true">
++
++        <!-- BOOT_COMPLETED is one of the few implicit broadcasts a manifest receiver
++             may still register for; CONFIGURED_NETWORKS_CHANGED is not, which is why
++             that one is registered at RUNTIME by the service below. -->
++        <receiver
++            android:name=".BootReceiver"
++            android:exported="true"
++            android:directBootAware="true">
++            <intent-filter>
++                <action android:name="android.intent.action.BOOT_COMPLETED" />
++            </intent-filter>
++        </receiver>
++
++        <service
++            android:name=".RelayService"
++            android:exported="false"
++            android:directBootAware="true" />
++    </application>
++</manifest>
+diff --git a/DomaWifiRelay/privapp_allowlist_com.android.xt.domawifirelay.xml b/DomaWifiRelay/privapp_allowlist_com.android.xt.domawifirelay.xml
+new file mode 100644
+index 0000000..e1c00f9
+--- /dev/null
++++ b/DomaWifiRelay/privapp_allowlist_com.android.xt.domawifirelay.xml
+@@ -0,0 +1,67 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- SPDX-License-Identifier: Apache-2.0
++
++     Privileged permission allowlist for DomaWifiRelay.
++
++     WHY THIS FILE IS REQUIRED.
++     READ_WIFI_CREDENTIAL is signature|privileged, not signature:
++
++         frameworks/base/core/res/AndroidManifest.xml
++           2402  <permission android:name="android.permission.READ_WIFI_CREDENTIAL"
++           2403      android:protectionLevel="signature|privileged" />
++
++     Once a permission carries the privileged flag, the allowlist check becomes an AND
++     gate placed IN FRONT of the signature grant, so holding the platform key is not
++     enough:
++
++         AppIdPermissionPolicy.kt
++           1143  val mayGrantByPrivileged =
++           1144      !permission.isPrivileged ||
++           1145          requestingPackageStates.anyIndexed { _, it ->
++           1146              checkPrivilegedPermissionAllowlistIfNeeded(it, permission)
++           1147          }
++           ...
++           1157  if (
++           1158      mayGrantByPrivileged &&
++           1159          (shouldGrantBySignature || shouldGrantByProtectionFlags)
++
++     and with ro.control_privapp_permissions=enforce (vendor/build.prop) a package that
++     is system AND privileged and is not listed here makes that helper return false
++     (:1613), which lands the package in privilegedPermissionAllowlistViolations and
++     makes onSystemReady() throw:
++
++           1922  if (!privilegedPermissionAllowlistViolations.isEmpty()) {
++           1923      throw IllegalStateException(
++
++     That is a system_server crash at every boot. AOSP documents the consequence
++     plainly: "In Android 9 and higher, privileged permissions must be allowlisted or
++     the device can't boot."
++     https://source.android.com/docs/core/permissions/perms-allowlist
++
++     The counter-example that settles it is in this same image: com.android.systemui is
++     built with certificate: "platform" (frameworks/base/packages/SystemUI/Android.bp)
++     and STILL carries an allowlist entry for this exact permission, in
++     system_ext/etc/permissions/com.android.systemui.xml. Platform signing does not
++     exempt a privileged app from the privileged allowlist.
++
++     NETWORK_SETTINGS IS DELIBERATELY ABSENT. It is signature only
++     (AndroidManifest.xml:2489-2490), so it is granted by the platform key and needs no
++     entry. Listing a non-privileged permission here is not harmless: it is what
++     CtsPrivappPermissionsTest reports as an error.
++
++     HOW THIS FILE IS INSTALLED. Android.bp sets privapp_allowlist, and soong installs
++     it with android.PathForModuleInstall(ctx, "etc", "permissions") using
++     installApkName + ".xml" (build/soong/java/app.go:1230-1234). Because the module is
++     system_ext_specific, that resolves to
++     /system_ext/etc/permissions/DomaWifiRelay.xml. Note that the file name is the
++     MODULE name, not the package name. SystemConfig reads every xml in the directory,
++     so only the package attribute below has to match.
++
++     NOTE for whoever edits this file: an XML comment may not contain two
++     consecutive hyphens, and a comment that does fails the build.
++-->
++<permissions>
++    <privapp-permissions package="com.android.xt.domawifirelay">
++        <permission name="android.permission.READ_WIFI_CREDENTIAL"/>
++    </privapp-permissions>
++</permissions>
+diff --git a/DomaWifiRelay/src/com/android/xt/domawifirelay/BootReceiver.java b/DomaWifiRelay/src/com/android/xt/domawifirelay/BootReceiver.java
+new file mode 100644
+index 0000000..998cbef
+--- /dev/null
++++ b/DomaWifiRelay/src/com/android/xt/domawifirelay/BootReceiver.java
+@@ -0,0 +1,40 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ */
++package com.android.xt.domawifirelay;
++
++import android.content.BroadcastReceiver;
++import android.content.Context;
++import android.content.Intent;
++import android.util.Log;
++
++/**
++ * Starts {@link RelayService} at boot.
++ *
++ * <p>BOOT_COMPLETED is one of the few implicit broadcasts a manifest-declared receiver
++ * may still register for. CONFIGURED_NETWORKS_CHANGED, the broadcast this app actually
++ * cares about, is not, so it is registered at runtime by the service. That is also the
++ * only way to receive it reliably: WifiConfigManager sends it with
++ * FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT (WifiConfigManager:1145).
++ */
++public final class BootReceiver extends BroadcastReceiver {
++    private static final String TAG = "DomaWifiRelay";
++
++    @Override
++    public void onReceive(Context context, Intent intent) {
++        if (!Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction())) {
++            return;
++        }
++        // Started UNCONDITIONALLY, and the service checks the property and the Settings
++        // Wi-Fi toggle on every sweep instead of at startup.
++        //
++        // WHY: gating the start on the property would make a later setprop
++        // ineffective. The setprop starts or stops the DAEMON (init has
++        // property triggers for it), but nothing would start this SERVICE --
++        // BOOT_COMPLETED has already fired, and android:persistent starts the
++        // process, not the service. Starting always and deciding per sweep
++        // costs one idle receiver and lets both switches take effect at the
++        // next sweep.
++        context.startService(new Intent(context, RelayService.class));
++    }
++}
+diff --git a/DomaWifiRelay/src/com/android/xt/domawifirelay/RelayService.java b/DomaWifiRelay/src/com/android/xt/domawifirelay/RelayService.java
+new file mode 100644
+index 0000000..243ac4e
+--- /dev/null
++++ b/DomaWifiRelay/src/com/android/xt/domawifirelay/RelayService.java
+@@ -0,0 +1,445 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ */
++package com.android.xt.domawifirelay;
++
++import android.app.Service;
++import android.content.BroadcastReceiver;
++import android.content.Context;
++import android.content.Intent;
++import android.content.IntentFilter;
++import android.net.wifi.WifiConfiguration;
++import android.net.wifi.WifiManager;
++import android.os.Handler;
++import android.os.HandlerThread;
++import android.os.IBinder;
++import android.os.SystemProperties;
++import android.util.Log;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.OutputStreamWriter;
++import java.nio.charset.StandardCharsets;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++/**
++ * Makes an arbitrary real AP connectable from the AAOS Wi-Fi screen.
++ *
++ * <h2>The problem</h2>
++ * DomA has no radio. Its {@code wlan0} is a {@code mac80211_hwsim} station that
++ * associates with a local hostapd (the "shadow AP") on {@code wlan2}, and the real
++ * association is performed by DomD. The password the user types is therefore validated
++ * by the LOCAL hostapd, whose passphrase comes from
++ * {@code /data/vendor/wifi/shadow/aps.conf}. A shadow AP cannot learn a PSK from the
++ * 4-way handshake -- only a MIC crosses the air -- so an SSID whose PSK is not already
++ * in that file cannot be connected to, and the framework does not merely retry:
++ *
++ * <pre>
++ *   config_wifiDisableReasonByWrongPasswordThreshold  = 1
++ *   config_wifiDisableReasonByWrongPasswordDurationMs = -1   (permanent)
++ * </pre>
++ *
++ * so ONE failed handshake sets
++ * {@link WifiConfiguration.NetworkSelectionStatus#DISABLED_BY_WRONG_PASSWORD} and the
++ * network stops being attempted.
++ *
++ * <h2>What this service does</h2>
++ * It is purely CORRECTIVE. It reacts only to a config that has ALREADY been permanently
++ * disabled for a wrong password, which means it does nothing at all while the normal
++ * path (an SSID whose PSK aps.conf already holds) is working -- a deliberate
++ * property, so a bug in here cannot break that path. On such a config it:
++ *
++ * <ol>
++ *   <li>reads the plaintext passphrase with
++ *       {@link WifiManager#getPrivilegedConfiguredNetworks()} (the only sanctioned
++ *       route; it returns {@code preSharedKey} unmasked),</li>
++ *   <li>hands it to {@code /vendor/bin/doma-wifi-relay}, which puts it into
++ *       {@code aps.conf}, regenerates {@code hostapd.conf}, restarts hostapd and
++ *       forwards a {@code connect} message to DomD over virtio-serial,</li>
++ *   <li>calls {@link WifiManager#connect(int, WifiManager.ActionListener)}, which
++ *       clears the permanent disable unconditionally:
++ *       {@code ConnectHelper.connectToNetwork()} then
++ *       {@code WifiConfigManager.updateBeforeConnect()} then {@code enableNetwork()}
++ *       then {@code WifiBlocklistMonitor.setNetworkSelectionEnabled()}, which resets the
++ *       status, the reason AND {@code clearDisableReasonCounter()}. The same call's
++ *       {@code onEnableNetwork()} also drops the SSID's BSSID blocklist entries
++ *       (WifiBlocklistMonitor:755-775), so the retry re-attempts the same BSS.</li>
++ * </ol>
++ *
++ * <p>The retry therefore succeeds: hostapd now holds the passphrase the user typed.
++ *
++ * <h2>Loop safety</h2>
++ * Every (netId, passphrase) pair is attempted at most once. If the passphrase really is
++ * wrong for the real AP, DomD's association fails while the local one succeeds, and the
++ * user sees "connected, no internet" rather than an endless reconnect storm. Typing a
++ * different password produces a different pair and gets one fresh attempt.
++ *
++ * <p>LAB USE ONLY. The passphrase is written to a file and crosses a virtio-serial
++ * channel in the clear. Same warning as {@code domd_wifi_agent.py}.
++ */
++public final class RelayService extends Service {
++    private static final String TAG = "DomaWifiRelay";
++
++    /**
++     * Read per sweep. Unset (the default) or "true" lets the repair run while the Settings
++     * Wi-Fi toggle is on, and any other value turns it off: the same two values
++     * init.xenvm-hwsim.rc starts the daemon on, compared as strings as init compares them.
++     */
++    static final String PROP_ENABLED = "persist.vendor.doma.wifi_relay";
++
++    /**
++     * Drop-box the daemon polls. init.xenvm-hwsim.rc creates it 0770 wifi:<b>system</b>
++     * (and doma-wifi-relay chowns it to match) precisely so this app -- uid/gid system,
++     * because NETWORK_SETTINGS and READ_WIFI_CREDENTIAL are signature permissions and
++     * android.uid.system is the only way to hold them -- can create the file in it.
++     *
++     * <p><b>Owning the last directory is not enough.</b> Creating a file here also needs
++     * the search (x) bit on <em>every</em> parent, and both {@code /data/vendor/wifi}
++     * and {@code /data/vendor/wifi/shadow} are 0770 wifi:wifi, which uid system is not a
++     * member of (platform.xml grants no {@code gid="wifi"} through any permission).
++     * Measured on a PC with the same owners and modes (2026-09-08):
++     * both parents 0770 -> EACCES; only {@code /data/vendor/wifi} given o+x -> still
++     * EACCES; both given o+x (0771) -> the write succeeds, while {@code hostapd.conf}
++     * stays unreadable (0660 wifi:wifi) and the directory stays unlistable. So the rc
++     * adds o+x -- traversal only -- on {@code sys.boot_completed}, which is
++     * after the unconditional {@code on boot} block where cuttlefish's
++     * init.vendor.rc:85 sets {@code /data/vendor/wifi} back to 0770 (init's
++     * mkdir re-applies the mode to an existing directory:
++     * system/core/init/builtins.cpp:394-436).
++     */
++    private static final File REQ_DIR = new File("/data/vendor/wifi/shadow/req");
++    private static final File REQ = new File(REQ_DIR, "relay.req");
++    private static final File REQ_TMP = new File(REQ_DIR, "relay.req.tmp");
++
++    /**
++     * One polling window. The daemon's own loop reads the channel with {@code read -t 2},
++     * so 4 s is two of its ticks. Waiting too little is the failure that matters:
++     * connect() would race hostapd, fail the handshake again and re-arm
++     * DISABLED_BY_WRONG_PASSWORD.
++     */
++    private static final long DAEMON_GRACE_MS = 4000;
++
++    /**
++     * How many {@link #DAEMON_GRACE_MS} windows to wait for the daemon to take the
++     * request. {@link #connectWhenConsumed} looks at the drop-box each window
++     * and only connects once the request is gone.
++     *
++     * <p>The bound comes from the daemon's own worst case rather than from its poll
++     * interval. In one iteration of doma-wifi-relay.sh, {@code restart_hostapd} can
++     * spend its whole poll loop (100 iterations of {@code sleep 0.1}) plus
++     * {@code confirm_hostapd_running} (6 x 0.5 s) -- about 13 s; its own
++     * comment says the wait STALLS THE MAIN LOOP FOR UP TO 10 s -- and BOTH
++     * {@code handle_aps} and {@code flush_pending_restart} can fire it in the
++     * same iteration, with
++     * {@code read -t 2} on top: roughly 28 s. (The one figure actually measured on a PC
++     * is 10.371 s for a single restart_hostapd, which does not include the confirm
++     * window.) 10 x 4 s = 40 s therefore covers a healthy-but-busy daemon, and the cost
++     * is zero on the normal path, where the request is gone at the first check.
++     */
++    private static final int REQ_POLLS = 10;
++
++    /**
++     * The daemon's init service state, for diagnostics only -- never as a liveness test.
++     * {@code init.svc.<name>} is published by NotifyStateChange() alone
++     * (system/core/init/service.cpp:192), so it is EMPTY for a service that has never
++     * started, and "running" is set in the PARENT right after fork (:817) whether or not
++     * the child survives. init.xenvm-hwsim.rc declares the relay as
++     * {@code doma_wifi_relay}, without the {@code vendor.} prefix the hostapd
++     * service carries. This app is system_app, i.e. coredomain, so it may read
++     * the {@code init.svc.} type without any extra policy.
++     */
++    private static final String PROP_RELAY_SVC_STATE = "init.svc.doma_wifi_relay";
++
++    private WifiManager mWifi;
++    private HandlerThread mThread;
++    private Handler mHandler;
++    /**
++     * (netId, psk) pairs whose single repair attempt has been SPENT. The key is
++     * {@code netId + " " + psk} and nothing ever clears it, so recovery needs a
++     * different password, forget+re-add, or a restart of this process; the permanent
++     * disable itself survives reboots (WifiConfigStore's XmlUtil). Only the mHandler
++     * thread touches it, so no synchronisation is needed.
++     *
++     * <p>An entry is added only AFTER the request is in the drop-box, and is
++     * removed again if the daemon never takes it: adding it before
++     * {@link #repair} would burn the attempt even when nothing was written, and
++     * since the key never expires that network would stay disabled forever.
++     */
++    private final Set<String> mAttempted = new HashSet<>();
++
++    static boolean isEnabled() {
++        final String v = SystemProperties.get(PROP_ENABLED, "");
++        return v.isEmpty() || "true".equals(v);
++    }
++
++    private final BroadcastReceiver mReceiver = new BroadcastReceiver() {
++        @Override
++        public void onReceive(Context context, Intent intent) {
++            mHandler.post(RelayService.this::sweep);
++        }
++    };
++
++    @Override
++    public void onCreate() {
++        super.onCreate();
++        // NOT gated on isEnabled() here. The property is read per sweep instead, so
++        // `setprop persist.vendor.doma.wifi_relay false` takes effect without a reboot --
++        // see BootReceiver for why starting conditionally did not work.
++        mWifi = getSystemService(WifiManager.class);
++        if (mWifi == null) {
++            Log.e(TAG, "no WifiManager; stopping");
++            stopSelf();
++            return;
++        }
++        mThread = new HandlerThread(TAG);
++        mThread.start();
++        mHandler = new Handler(mThread.getLooper());
++
++        // Runtime registration, not the manifest: CONFIGURED_NETWORKS_CHANGED is an
++        // implicit broadcast a manifest receiver may not register for, and it is sent
++        // with FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT (WifiConfigManager:1145).
++        // WIFI_STATE_CHANGED as well, so a config left disabled while the Settings Wi-Fi
++        // toggle was off is repaired as soon as the toggle comes back on.
++        final IntentFilter filter =
++                new IntentFilter(WifiManager.CONFIGURED_NETWORKS_CHANGED_ACTION);
++        filter.addAction(WifiManager.WIFI_STATE_CHANGED_ACTION);
++        registerReceiver(mReceiver, filter);
++        Log.i(TAG, "started (" + PROP_ENABLED + "=\"" + SystemProperties.get(PROP_ENABLED, "")
++                + "\", enabled=" + isEnabled() + ")");
++        mHandler.post(this::sweep);
++    }
++
++    @Override
++    public int onStartCommand(Intent intent, int flags, int startId) {
++        return START_STICKY;
++    }
++
++    @Override
++    public void onDestroy() {
++        if (mThread != null) {
++            try {
++                unregisterReceiver(mReceiver);
++            } catch (IllegalArgumentException ignored) {
++                // Never registered, because onCreate bailed out early.
++            }
++            mThread.quitSafely();
++        }
++        super.onDestroy();
++    }
++
++    @Override
++    public IBinder onBind(Intent intent) {
++        return null;
++    }
++
++    /** Find configs disabled for a wrong password and repair each one once. */
++    private void sweep() {
++        if (!isEnabled()) {
++            // Inert, not stopped: the property may be flipped at any time and this is
++            // the only place that has to notice.
++            return;
++        }
++        if (!mWifi.isWifiEnabled()) {
++            // The Settings Wi-Fi toggle is off: a repair would ask DomD to associate for
++            // a user who has just switched Wi-Fi off. The daemon holds requests then as
++            // well; WIFI_STATE_CHANGED brings the sweep back when the toggle is on.
++            return;
++        }
++        final List<WifiConfiguration> configs;
++        try {
++            configs = mWifi.getPrivilegedConfiguredNetworks();
++        } catch (SecurityException e) {
++            // Signature permissions are missing, which means the APK is not
++            // platform-signed. Nothing this service does can work; say so and stop.
++            // Do NOT stopSelf() here: android:persistent would restart the process and
++            // the same denial would be logged in a loop. Staying up and inert keeps the
++            // one diagnostic line visible in logcat, which is the whole value of this
++            // branch.
++            Log.e(TAG, "getPrivilegedConfiguredNetworks denied -- is the APK signed with"
++                    + " the platform key and privileged?", e);
++            return;
++        }
++        if (configs == null) {
++            // WifiServiceImpl returns null, not an exception, when a permission check
++            // inside its pre-T / T branches fails.
++            Log.w(TAG, "getPrivilegedConfiguredNetworks returned null");
++            return;
++        }
++        for (WifiConfiguration c : configs) {
++            if (c == null || c.getNetworkSelectionStatus() == null) {
++                continue;
++            }
++            if (c.getNetworkSelectionStatus().getNetworkSelectionDisableReason()
++                    != WifiConfiguration.NetworkSelectionStatus.DISABLED_BY_WRONG_PASSWORD) {
++                continue;
++            }
++            final String ssid = unquote(c.SSID);
++            final String psk = unquote(c.preSharedKey);
++            if (ssid.isEmpty() || psk.isEmpty()) {
++                // An open network (no PSK) cannot fail a handshake. A 64-digit
++                // hex PSK is stored unquoted, unquote() leaves it as it is, and
++                // the relay takes it as a raw PSK.
++                Log.w(TAG, "skipping " + ssid + ": no usable passphrase");
++                continue;
++            }
++            final String key = c.networkId + " " + psk;
++            if (mAttempted.contains(key)) {
++                Log.i(TAG, "already attempted netId=" + c.networkId + "; leaving disabled");
++                continue;
++            }
++            if (!repair(c.networkId, ssid, psk, key)) {
++                // Nothing was written, so nothing is spent: try the next candidate.
++                // continue rather than return -- the drop-box is untouched so there is
++                // no race to lose, and no connect() was issued so this cannot loop.
++                continue;
++            }
++            // Spend the attempt only now that the request is in the drop-box.
++            mAttempted.add(key);
++            // ONE PER SWEEP, AND RETURN.
++            //
++            // The request drop-box holds a single file and the daemon polls it every
++            // 2 s, so two repairs started in the same pass would race: the second
++            // renameTo(REQ) clobbers the first before the daemon reads it.
++            // repair() refuses to overwrite a request that is still sitting
++            // there, so a second write needs the daemon to have consumed the
++            // first one inside the grace window -- and in that case the first
++            // request's polling sees the second one and returns its attempt to
++            // the pool. The loss is then not permanent, just a skip that the
++            // next sweep retries. Returning here
++            // costs nothing: connect() changes the network selection status, which
++            // makes WifiConfigManager send CONFIGURED_NETWORKS_CHANGED again
++            // (sendConfiguredNetworkChangedBroadcast()), and the next sweep
++            // picks up the next one.
++            return;
++        }
++    }
++
++    /**
++     * Is a request still waiting to be picked up?
++     *
++     * <p>This uses the SAME predicate as the daemon. doma-wifi-relay.sh tests
++     * {@code [ -s "$REQ" ]} -- non-empty -- and only then moves the file aside
++     * ({@code mv "$REQ" "$REQ.busy"}). Testing {@code exists()} instead would treat a
++     * zero-byte file as "still pending" forever, because the daemon will never take it:
++     * the drop-box lives on /data, so that would be a deadlock which survives reboots
++     * and needs a manual rm. (writeRequest() writes to a temporary name and renames, so
++     * a zero-byte REQ should not happen -- which is exactly why the predicates must not
++     * disagree about it.)
++     */
++    private boolean requestPending() {
++        return REQ.length() > 0;
++    }
++
++    /** Diagnostics only; see {@link #PROP_RELAY_SVC_STATE}. */
++    private static String relaySvcState() {
++        final String s = SystemProperties.get(PROP_RELAY_SVC_STATE, "");
++        return s.isEmpty() ? "<unset>" : s;
++    }
++
++    /**
++     * @return true if a request was written -- i.e. if the caller should spend the
++     *         attempt. False means nothing was written and nothing is spent.
++     */
++    private boolean repair(final int netId, String ssid, String psk, final String key) {
++        if (requestPending()) {
++            Log.w(TAG, "a request is still unconsumed in " + REQ + "; the daemon is not"
++                    + " reading it (" + PROP_RELAY_SVC_STATE + "=" + relaySvcState()
++                    + "). Not attempting netId=" + netId + " -- attempt NOT spent."
++                    + " Check: setprop " + PROP_ENABLED + " true;"
++                    + " start doma_wifi_relay; logcat -s doma-wifi-relay");
++            return false;
++        }
++        Log.i(TAG, "repairing netId=" + netId + " ssid=" + ssid);
++        if (!writeRequest(ssid, psk)) {
++            return false;
++        }
++        connectWhenConsumed(netId, key, REQ_POLLS);
++        return true;
++    }
++
++    /**
++     * Wait for the daemon to take the request, then re-trigger the connect. If it never
++     * takes it, return the attempt to the pool instead of burning it.
++     */
++    private void connectWhenConsumed(final int netId, final String key, final int polls) {
++        mHandler.postDelayed(new Runnable() {
++            @Override
++            public void run() {
++                if (requestPending()) {
++                    if (polls > 1) {
++                        connectWhenConsumed(netId, key, polls - 1);
++                        return;
++                    }
++                    mAttempted.remove(key);
++                    Log.w(TAG, "daemon did not consume the request within "
++                            + (REQ_POLLS * DAEMON_GRACE_MS) + " ms ("
++                            + PROP_RELAY_SVC_STATE + "=" + relaySvcState()
++                            + "); not connecting netId=" + netId
++                            + ", attempt NOT spent. Check: logcat -s doma-wifi-relay");
++                    return;
++                }
++                Log.i(TAG, "re-triggering connect netId=" + netId);
++                mWifi.connect(netId, new WifiManager.ActionListener() {
++                    @Override
++                    public void onSuccess() {
++                        Log.i(TAG, "connect(" + netId + ") accepted");
++                    }
++
++                    @Override
++                    public void onFailure(int reason) {
++                        Log.w(TAG, "connect(" + netId + ") rejected, reason=" + reason);
++                    }
++                });
++            }
++        }, DAEMON_GRACE_MS);
++    }
++
++    /**
++     * Write one tab-separated {@code psk} request line for the daemon.
++     *
++     * <p>Written to a temporary name and renamed, so the daemon can never read a partial
++     * line: it polls for the final name only, and its own first action is to move the
++     * file aside.
++     */
++    private boolean writeRequest(String ssid, String psk) {
++        if (!REQ_DIR.isDirectory()) {
++            // isDirectory() is also false when the directory exists but a parent denies
++            // search, which is the failure this path actually hit (see the field's
++            // javadoc). Saying "missing" there sends the reader looking for the daemon
++            // instead of at the modes, so name both causes.
++            Log.e(TAG, REQ_DIR + " is not reachable -- either doma-wifi-relay has not "
++                    + "created it yet, or a parent lacks o+x (check: ls -ld "
++                    + "/data/vendor/wifi /data/vendor/wifi/shadow -- both need 0771)");
++            return false;
++        }
++        try (FileOutputStream fos = new FileOutputStream(REQ_TMP);
++                OutputStreamWriter w = new OutputStreamWriter(fos, StandardCharsets.UTF_8)) {
++            w.write("psk\t" + ssid + "\t" + psk + "\n");
++            w.flush();
++            fos.getFD().sync();
++        } catch (IOException e) {
++            Log.e(TAG, "cannot write " + REQ_TMP, e);
++            return false;
++        }
++        if (!REQ_TMP.renameTo(REQ)) {
++            Log.e(TAG, "cannot rename " + REQ_TMP + " to " + REQ);
++            REQ_TMP.delete();
++            return false;
++        }
++        return true;
++    }
++
++    /** WifiConfiguration keeps SSID and preSharedKey wrapped in literal double quotes. */
++    private static String unquote(String s) {
++        if (s == null) {
++            return "";
++        }
++        if (s.length() >= 2 && s.charAt(0) == '"' && s.charAt(s.length() - 1) == '"') {
++            return s.substring(1, s.length() - 1);
++        }
++        return s;
++    }
++}
+diff --git a/aosp_xenvm_trout_rpi4_arm64.mk b/aosp_xenvm_trout_rpi4_arm64.mk
+index 7b335c8..5d591dc 100644
+--- a/aosp_xenvm_trout_rpi4_arm64.mk
++++ b/aosp_xenvm_trout_rpi4_arm64.mk
+@@ -10,8 +10,9 @@
+ #
+ # The inherit has to come first for PRODUCT_* : the upstream makefile ends with its own
+ # PRODUCT_NAME / PRODUCT_DEVICE / PRODUCT_MODEL assignments, so ours have to be written
+-# after it to win. The block below is the exact opposite and has to come BEFORE, for a
+-# reason worth spelling out because it is easy to get backwards:
++# after it to win. (The one PRODUCT_COPY_FILES line above the inherit is the opposite
++# case on purpose; its comment says why.) The block below is the exact opposite and has
++# to come BEFORE, for a reason worth spelling out because it is easy to get backwards:
+ #
+ #   $(call inherit-product) does not include anything at the point it appears. It only
+ #   pushes an $(INHERIT_TAG)<path> marker onto every product variable
+@@ -63,6 +64,14 @@
+ # on the board, one level at a time.
+ TARGET_VULKAN_SUPPORT := false
+ 
++# ABOVE the inherit, on purpose: for one destination the first PRODUCT_COPY_FILES entry
++# wins (build/make/core/Makefile:139-156), and inherit-product puts the parent's entries
++# where the inherit line is (product.mk:539-540), so a line below it would be dropped
++# silently. This replaces trout's virtwifi.rc, which enabled Wi-Fi at every boot; see
++# the file.
++PRODUCT_COPY_FILES += \
++    device/sodev/xenvm-cf/xenvm_trout_rpi4_arm64/virtwifi.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/virtwifi.rc
++
+ $(call inherit-product, device/epam/aosp-xenvm-trout/aosp_xenvm_trout_arm64.mk)
+ 
+ PRODUCT_NAME := aosp_xenvm_trout_rpi4_arm64
+@@ -111,3 +120,98 @@ PRODUCT_COPY_FILES += \
+ # animations off (the device model, not the GPU, pays for them). The overlay file
+ # carries the measurements and the runtime equivalents for an existing /data.
+ DEVICE_PACKAGE_OVERLAYS += device/sodev/xenvm-cf/overlay
++
++# Shadow-AP Wi-Fi: simulated radios in this guest beaconing the SSIDs DomD really
++# sees, so the Settings Wi-Fi screen lists real access points instead of virt_wifi's
++# single synthetic "VirtWifi".
++#
++# IT STARTS AUTOMATICALLY at sys.boot_completed, and the product ships no rc
++# that starts virt_wifi: the two must never both own wlan0. No hand-typed
++# command is needed to bring the Wi-Fi path up.
++#
++# The service is declared `disabled`; the only thing that starts it is
++# `on property:sys.boot_completed=1` in the rc. The script reads
++# persist.vendor.doma.shadow_ap (default true) at its TOP, and when it is not
++# true it execs setup_wifi --interface=eth1 instead, handing wlan0 back to
++# virt_wifi. So a failure of hostapd and the Wi-Fi HAL to coexist in one guest
++# is recovered from on hardware with
++#     setprop persist.vendor.doma.shadow_ap false && reboot
++# rather than with an SD rewrite. setup_wifi itself lives in the
++# com.google.cf.wifi apex, so the fallback needs no rc of its own.
++PRODUCT_COPY_FILES += \
++    device/sodev/xenvm-cf/xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/init.xenvm-hwsim.rc \
++    device/sodev/xenvm-cf/xenvm_trout_rpi4_arm64/doma-shadow-ap.sh:$(TARGET_COPY_OUT_VENDOR)/bin/doma-shadow-ap \
++    device/sodev/xenvm-cf/xenvm_trout_rpi4_arm64/doma-shadow-aps.conf:$(TARGET_COPY_OUT_VENDOR)/etc/doma-shadow-aps.conf \
++    device/sodev/xenvm-cf/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh:$(TARGET_COPY_OUT_VENDOR)/bin/doma-wifi-relay
++
++# WHY doma-shadow-aps.conf IS SHIPPED AT ALL.
++# doma-shadow-ap dies with "$APS is empty" if /data/vendor/wifi/shadow/aps.conf
++# has no content, and /data is empty on a first boot, so on a freshly flashed
++# card the AAOS Wi-Fi screen would list nothing and there would be nothing to
++# select. The script merges this file into aps.conf on every boot, adding only
++# the SSIDs aps.conf lacks, so a row the relay or the user has written is never
++# overwritten.
++#
++# IT CARRIES ONE PLACEHOLDER ROW, EXAMPLE-SSID, AND NO REAL PASSPHRASE: this
++# file is in the source tree and in the vendor image. A real AP's passphrase is
++# typed on the Wi-Fi screen and reaches the shadow AP through DomaWifiRelay; the
++# file's own header says how, and why a shadow AP cannot learn it any other way.
++
++# wificond. WifiNative talks to it over binder to do the nl80211 setup of wlan0, so
++# without it enabling Wi-Fi fails at exactly one line -- "Failed to setup iface in
++# nl80211=wlan0" -- and the vendor HAL then tears the interface straight back down.
++#
++# It is missing here for a subtle reason worth writing down: the inherited product set
++# DOES include wificond_compat_symlink_module, which installs
++# /system/bin/wificond -> /system/system_ext/bin/wificond, but it does NOT include
++# wificond itself. The result is a DANGLING SYMLINK and no wificond.rc anywhere in
++# /system, so `start wificond` answers "Could not find 'wificond'". Verified on the
++# running guest and in the build: product_packages.txt lists only
++# wificond_compat_symlink_module, while all_modules.txt has wificond -- buildable,
++# just never selected.
++#
++# Measured on hardware before adding this (logcat, DomA):
++#   android.hardware.wifi-service: Adding interface handle for wlan0
++#   android.hardware.wifi-service: Configured chip in mode 3      <- vendor HAL is fine
++#   WifiNative: Failed to setup iface in nl80211=wlan0            <- wificond missing
++#   WifiVendorHal: onIfaceRemoved 0, name: wlan0
++#   WifiActiveModeWarden: ClientModeManager start failed!
++PRODUCT_PACKAGES += wificond
++
++# ---------------------------------------------------------------------------
++# WHY DomaWifiRelay. It is the ONLY component that can learn the passphrase the user
++# types on the AAOS Wi-Fi screen. The shadow AP on wlan2 validates that passphrase
++# locally and cannot recover it from the 4-way handshake -- only a MIC crosses the air --
++# so an SSID whose PSK is not already in /data/vendor/wifi/shadow/aps.conf cannot be
++# connected to. Worse, one failed handshake disables the network PERMANENTLY:
++# config_wifiDisableReasonByWrongPasswordThreshold is 1 and
++# ...DurationMs is -1 in ServiceWifiResources/res/values/config.xml.
++#
++# The app reads the plaintext PSK with WifiManager.getPrivilegedConfiguredNetworks(),
++# hands it to /vendor/bin/doma-wifi-relay (which updates hostapd and forwards it to
++# DomD), and then calls WifiManager.connect(netId, ...), which clears the permanent
++# disable unconditionally via WifiConfigManager.updateBeforeConnect() ->
++# enableNetwork() -> WifiBlocklistMonitor.setNetworkSelectionEnabled().
++#
++# PURELY CORRECTIVE, AND IT FOLLOWS THE SETTINGS WI-FI TOGGLE. It acts only on a config
++# ALREADY disabled for a wrong password, and only while Wi-Fi is on. Both halves also
++# read persist.vendor.doma.wifi_relay: unset (the default) or true runs them, and
++#     setprop persist.vendor.doma.wifi_relay false
++# turns both off.
++#
++# Installs to /system_ext/priv-app (system_ext_specific + privileged in its
++# Android.bp), not /vendor: soong rejects platform_apis on a vendor-partition module,
++# and a platform-signed android.uid.system app that only talks to the framework is
++# coredomain, which does not belong on vendor anyway. The vendor half is the shell
++# daemon /vendor/bin/doma-wifi-relay; they meet at a file in
++# /data/vendor/wifi/shadow/req, not across a partition interface.
++#
++# A privapp-permissions allowlist entry IS needed. NETWORK_SETTINGS is
++# signature-level, so the platform key grants it; but READ_WIFI_CREDENTIAL is
++# signature|privileged, and for a privileged permission the allowlist check is
++# an AND gate in front of the signature grant, so an unlisted package makes
++# system_server throw at every boot. The entry ships with the app through
++# Android.bp's privapp_allowlist; the derivation is in
++# DomaWifiRelay/privapp_allowlist_com.android.xt.domawifirelay.xml.
++PRODUCT_PACKAGES += \
++    DomaWifiRelay
+diff --git a/init.xenvm-buried-eth0.rc b/init.xenvm-buried-eth0.rc
+index c6a9c90..3830385 100644
+--- a/init.xenvm-buried-eth0.rc
++++ b/init.xenvm-buried-eth0.rc
+@@ -85,11 +85,11 @@
+ # Trout sets the property because trout wants eth0 for its own virtwifi
+ # (DEVICE_VIRTWIFI_PORT := eth0, two lines above it). Overriding that is
+ # deliberate here, for two reasons measured on this board:
+-#   - trout's virtwifi does not actually produce a wlan0 on this product. Its
+-#     setup service is a oneshot that runs `cmd wifi set-wifi-enabled` /
+-#     `connect-network VirtWifi`, and cuttlefish's setup_wifi, which is what
+-#     creates the interface, is gated on ro.boot.wifi_impl=virt_wifi -- empty
+-#     here. There is no wlan0 to protect.
++#   - trout's virtwifi does not produce a wlan0 on this product. Its setup
++#     service only runs `cmd wifi set-wifi-enabled` / `connect-network VirtWifi`
++#     (the product installs an empty virtwifi.rc over it), and cuttlefish's
++#     setup_wifi, which is what creates the interface, is gated on
++#     ro.boot.wifi_impl=virt_wifi -- empty here. There is no wlan0 to protect.
+ #   - doma.cfg gives DomA two vifs on the same bridge, so eth0 and eth1 were both
+ #     taking a lease out of 192.168.10.0/24 (.14 and .13) and
+ #     ConnectivityService carried two ETHERNET networks, one of which never
+diff --git a/sepolicy/doma_shadow_ap.te b/sepolicy/doma_shadow_ap.te
+new file mode 100644
+index 0000000..4d8a465
+--- /dev/null
++++ b/sepolicy/doma_shadow_ap.te
+@@ -0,0 +1,212 @@
++# SPDX-License-Identifier: Apache-2.0
++#
++# /vendor/bin/doma-shadow-ap -- the shadow-AP bring-up script.
++#
++# WHY THIS EXISTS EVEN THOUGH THE BOARD IS PERMISSIVE.
++# This product boots permissive: device/epam/aosp-xenvm-trout/xenvm_trout_arm64/
++# BoardConfig.mk:31 adds androidboot.selinux=permissive and :56 sets
++# BOARD_KERNEL_CMDLINE = enforcing=0, and androidboot.selinux=permissive is present in
++# the built vendor-bootconfig.img (measured, so it is not clobbered by the := on :23).
++# The script therefore runs today without any policy. What it does NOT do today is
++# produce usable denials: with no exec type, /vendor/bin/doma-shadow-ap keeps the
++# generic vendor_file label and every avc line is attributed to init, which makes
++# audit2allow useless. Declaring the domain is what makes the remaining rules
++# measurable instead of guessed.
++#
++# Correspondingly, the rule set below is deliberately NOT complete. Every rule
++# here is justified by a specific step of doma-shadow-ap.sh; nothing is added
++# speculatively. Finish it from real denials:
++#     adb shell dmesg | grep 'avc: .*doma_shadow_ap'
++#     ... | audit2allow
++# and add what comes out, with a comment saying which step provoked it.
++
++type doma_shadow_ap, domain;
++type doma_shadow_ap_exec, exec_type, vendor_file_type, file_type;
++
++init_daemon_domain(doma_shadow_ap)
++
++# The script is #!/system/bin/sh (doma-shadow-ap.sh:1), so the domain runs the shell.
++allow doma_shadow_ap shell_exec:file rx_file_perms;
++
++# log, getprop and insmod (all called by doma-shadow-ap.sh) are toybox/toolbox
++# SYMLINKS, so the label that matters for execute is the target's: toolbox_exec.
++# MEASURED on the built image --
++#   /system/bin/getprop -> toolbox   (u:object_r:toolbox_exec:s0)
++#   /system/bin/insmod  -> toybox    (u:object_r:toolbox_exec:s0)
++#   /system/bin/log     -> toybox    (u:object_r:toolbox_exec:s0)
++# and toolbox_exec is one of the few types system/sepolicy/private/domain.te explicitly
++# excludes from the "vendor components must not execute files from system" neverallows
++# (:1246-1247 and :1334-1335, alongside shell_exec).
++allow doma_shadow_ap toolbox_exec:file rx_file_perms;
++
++# NOT ALLOWED, AND CANNOT BE: /system/bin/ip (steps 1 and 4 of the script).
++# It is a REAL binary, not a toybox symlink (450512 bytes on the built image), and it has
++# no entry in plat_file_contexts, so it falls through to the default rule
++# `/system(/.*)?  u:object_r:system_file:s0` (plat_file_contexts:194) = system_file.
++#
++# `allow doma_shadow_ap system_file:file rx_file_perms;` BREAKS THE BUILD -- it
++# violates two neverallows in domain.te at once (:1228
++# entrypoint/execute/execute_no_trans, and :1302 which covers `:file *`), and a
++# neverallow violation is a hard secilc failure, not a warning:
++#
++#   neverallow check failed at ... from system/sepolicy/private/domain.te:1302
++#     allow at ... from device/sodev/xenvm-cf/sepolicy/doma_shadow_ap.te:33
++#     (allow doma_shadow_ap system_file_202704 (file (... execute ...)))
++#   Failed to build policydb
++#
++# The board is permissive, so the script's `ip` calls succeed today regardless. The
++# sanctioned Treble route when this board goes enforcing is
++# /system/bin/netutils-wrapper-1.0 (netutils_wrapper_exec, which IS excluded from both
++# neverallows and is present on the built image) -- i.e. change the SCRIPT to invoke
++# `netutils-wrapper-1.0 ip ...`, then add the allow for netutils_wrapper_exec here. That
++# allow is deliberately not added yet because nothing calls the wrapper.
++
++# CONF_DIR=/data/vendor/wifi/shadow: the mkdir -p, the chmods and the generated
++# hostapd.conf of step 3 of doma-shadow-ap.sh, and aps.conf, which
++# doma-wifi-relay writes.
++allow doma_shadow_ap hostapd_data_file:dir create_dir_perms;
++allow doma_shadow_ap hostapd_data_file:file create_file_perms;
++
++# `ip link add name br-shadow type bridge`, `ip link set <p> master br-shadow`,
++# `ip link del wlan0` (steps 1 and 4 of doma-shadow-ap.sh).
++allow doma_shadow_ap self:capability { net_admin net_raw };
++allow doma_shadow_ap self:netlink_route_socket create_socket_perms_no_ioctl;
++
++# NOT WRITTEN HERE, ON PURPOSE: the transitions for the two apex binaries the script
++# execs, /apex/com.google.cf.wifi/bin/mac80211_create_radios
++# (mac80211_create_radios_exec, device/google/cuttlefish/shared/sepolicy/vendor/
++# mac80211_create_radios.te) and /apex/com.google.cf.wpa_supplicant/bin/hw/hostapd
++# (hal_wifi_hostapd_default_exec, system/sepolicy/vendor/hal_wifi_hostapd_default.te).
++# Both target domains exist in the built policy, so domain_auto_trans() into them is the
++# obvious rule -- but a transition from an arbitrary vendor domain into a hal_ domain is
++# exactly the shape system/sepolicy guards with neverallow rules, and a neverallow
++# violation is a hard build failure. It is not worth risking that without being able to
++# build. Permissive mode lets both execs succeed meanwhile; add the transitions once the
++# build loop is available and the denials confirm which form is needed.
++
++# The shipped AP-list seed, /vendor/etc/doma-shadow-aps.conf ($SEED in
++# doma-shadow-ap.sh, merged into $APS in step 3). PRODUCT_COPY_FILES puts it
++# under /vendor/etc with no file_contexts entry of its own, so it takes the
++# partition default
++# `/vendor/etc(/.*)?  u:object_r:vendor_configs_file:s0` (vendor_file_contexts). A vendor
++# domain reading a vendor config file is the sanctioned direction -- unlike the
++# system_file case above it trips no neverallow -- so this one is safe to write without a
++# build to check it against.
++allow doma_shadow_ap vendor_configs_file:file r_file_perms;
++
++# /sys/class/net/<if>/carrier, which stations_present() reads (THE PRIMARY way it
++# detects a station). The label comes from genfs:
++# system/sepolicy/private/genfs_contexts:138
++#   `genfscon sysfs /class/net   u:object_r:sysfs_net:s0`
++# A vendor domain reading sysfs_net is NOT COVERED BY ANY NEVERALLOW (the only
++# neverallows constraining sysfs_net are app_neverallows.te:118 /
++# gmscore_app.te:176 / priv_app_all.te:284 / netd.te:214, four rules, and each of
++# them targets an app or netd). Therefore, like vendor_configs_file above, this is
++# A DIRECTION THAT IS SAFE TO WRITE WITHOUT A BUILD TO CHECK IT.
++allow doma_shadow_ap sysfs_net:dir search;
++allow doma_shadow_ap sysfs_net:file r_file_perms;
++
++# `setprop ctl.restart vendor.doma_shadow_hostapd` (the relay's only actuator) and
++# `setprop ctl.stop/start vendor.doma_shadow_hostapd` (this script).
++#
++# WRITE IT AGAINST ctl_default_prop. It must NOT be written against
++#   `ctl_restart_prop`: that allow is a hard secilc failure and breaks the build
++#   (the same shape as /system/bin/iw).
++#   THERE ARE TWO primary-source lines here, one prohibiting and one permitting;
++#   do not confuse them:
++#     private/property.te:190-193
++#       neverallow { domain -coredomain } { system_property_type
++#                                          -system_public_property_type }:property_service set;
++#       -> This is what blocks `set` (the property_service class).
++#         `ctl_default_prop` is a `system_public_prop()` at
++#         public/property.te:218, so IT IS SUBTRACTED OUT AND NEVER MATCHES,
++#         i.e. it is legal. `ctl_restart_prop` is a `system_internal_prop`, so it
++#         does match.
++#     public/te_macros:932-937 (the body of `system_internal_prop`)
++#       treble_sysprop_neverallow(`neverallow { domain -coredomain } $1:file no_rw_file_perms;')
++#       -> This one blocks READ (the file class). This is the line `get_prop`
++#         runs into.
++#   `ctl_restart_prop` IS DECLARED TWICE, at public/property.te:31 (internal) and
++#     :308 (public). The former sits inside the `compatible_property_only` at :15,
++#     the latter inside the `not_compatible_property` at :292, and
++#     `compatibleProperty()` in system/sepolicy/build/soong/policy.go:192-200 is
++#     HARDWIRED to "true" outside CTS and recovery, SO ONLY THE INTERNAL
++#     DECLARATION IS LIVE.
++#   The `dontaudit domain { ... ctl_default_prop ... }:property_service set;` at
++#     `private/property.te:253-262` IS NOT A PROHIBITION (it only silences auditing of
++#     the legacy `ctl.` property handling).
++#   Why ctl_default_prop is enough: when init receives `ctl.restart` it builds, at
++#   system/core/init/property_service.cpp:472-486, the legacy-check name
++#   `ctl.` + value = `ctl.vendor.doma_shadow_hostapd` and looks up permission on
++#   that. private/property_contexts has no individual line for
++#   `ctl.vendor.doma_shadow_hostapd`, so it falls to the `ctl.` prefix at :183 and
++#   becomes ctl_default_prop (a system_public_prop at public/property.te:218).
++#   Once that passes, property_service.cpp:484 returns true, so the newer
++#   `ctl.restart$...` check is never reached.
++set_prop(doma_shadow_ap, ctl_default_prop)
++
++# The relay's entry point `exec 3<> /dev/hvc4` (the Wi-Fi channel).
++#
++# THE LABELS COME FROM cuttlefish, which assigns A DIFFERENT TYPE PER hvc NUMBER
++#   (device/google/cuttlefish/shared/sepolicy/vendor/file_contexts:21-24):
++#     /dev/hvc1 -> serial_device   /dev/hvc3 -> keymaster_device
++#     /dev/hvc4 -> gatekeeper_device   (OUR Wi-Fi channel)
++#   That directory is listed in BOARD_VENDOR_SEPOLICY_DIRS, so it is part of the
++#   policy. There is not a single neverallow on gatekeeper_device, SO THE ALLOW
++#   CAN BE WRITTEN (unlike iw_exec or init_service_status_private_prop, which
++#   cannot). The type name disagreeing with the use is just cuttlefish's
++#   assignment taken as is; overriding it from our own file_contexts risks a
++#   duplicate-specification failure in checkfc, so we leave the label alone and
++#   write the allow instead.
++allow doma_shadow_ap gatekeeper_device:chr_file rw_file_perms;
++
++# `getprop ro.boot.wifi_mac_prefix` (doma-shadow-ap.sh uses it as the hwsim MAC
++# prefix).
++#
++# THE LABEL IS OVERRIDDEN BY cuttlefish's vendor side WITH AN `exact` MATCH, so it
++#   is not the `ro.boot.` prefix in private/property_contexts (bootloader_prop,
++#   which private/domain.te:519 grants to all of domain) that wins, but
++#   device/google/cuttlefish/shared/sepolicy/vendor/property_contexts:3
++#     `ro.boot.wifi_mac_prefix  u:object_r:vendor_wifi_mac_prefix:s0 exact string`
++#   -- AN exact MATCH BEATS A prefix MATCH.
++#   That type is declared by `vendor_internal_prop(vendor_wifi_mac_prefix)` in the
++#   same vendor/init_wifi_sh.te:11, and it is granted to exactly two domains:
++#   init_wifi_sh (:12) and setup_wifi (setup_wifi.te:12).
++#   So IT HAS TO BE ADDED EXPLICITLY for our domain. Being a vendor type, it can
++#   be written (the vendor_internal_prop neverallow at te_macros:1008-1014 targets
++#   `{ coredomain -init -dumpstate }`, which does not cover a vendor domain).
++#   Corroboration: device/epam/aosp-xenvm-trout/sepolicy/dontaudit.te:129 carries a
++#   dontaudit of this type for flags_health_check, i.e. it is a type that really
++#   does show up as a denial.
++get_prop(doma_shadow_ap, vendor_wifi_mac_prefix)
++
++# NOT ALLOWED, AND CANNOT BE: /system/bin/iw (the SECONDARY way stations_present()
++# detects a station).
++# The conclusion is the same as for /system/bin/ip above, but THE REASON DIFFERS;
++# do not confuse the two:
++#   - ip has no label and falls through to `system_file`.
++#   - iw HAS A LABEL OF ITS OWN (system/sepolicy/private/file_contexts:292
++#     `/system/bin/iw  u:object_r:iw_exec:s0`). But private/iw.te:2 declares
++#     `type iw_exec, system_file_type, exec_type, file_type;`, so it IS A MEMBER OF
++#     system_file_type, and iw_exec IS NOT IN the exclusion list of domain.te's
++#     "vendor must not access files on /system" neverallow (the `:file *` one) --
++#     that list is cgroup_desc_file / crash_dump_exec / file_contexts_file /
++#     netutils_wrapper_exec / property_contexts_file / system_event_log_tags_file /
++#     system_group_file / system_lib_file / system_bootstrap_lib_file /
++#     system_linker_exec / system_linker_config_file / system_passwd_file /
++#     system_seccomp_policy_file / system_security_cacerts_file / system_zoneinfo_file /
++#     task_profiles_file / shell_exec / toolbox_exec / virtualizationmanager_exec /
++#     early_virtmgr_exec.
++#     So `allow doma_shadow_ap iw_exec:file rx_file_perms;` WOULD BREAK THE BUILD
++#     (a hard secilc failure, exactly as measured for ip).
++#   - There is no netutils-wrapper escape either: the wrapped commands are only the
++#     five at system/netd/netutils_wrappers/NetUtilsWrapper-1.0.cpp:44-51 --
++#     ip6tables / iptables / ndc / tc / ip -- AND iw IS NOT AMONG THEM.
++# THE IMPLEMENTATION IS WRITTEN ON THE SAFE SIDE with this in mind:
++#   stations_present() consults carrier first. Even if iw cannot be exec'd (denied
++#   under enforcing), the decision is still reached from carrier, and when neither
++#   can be read it falls back to "a station is present", i.e. DO NOT RESTART
++#   hostapd. iw is therefore a bonus that only works while the board is
++#   permissive, and going enforcing regresses no functionality (all that is lost is
++#   the ability to find stations other than DomA on a secondary BSS, and in this
++#   configuration the only station that exists is DomA itself).
+diff --git a/sepolicy/file_contexts b/sepolicy/file_contexts
+new file mode 100644
+index 0000000..3a6d344
+--- /dev/null
++++ b/sepolicy/file_contexts
+@@ -0,0 +1,26 @@
++# SPDX-License-Identifier: Apache-2.0
++#
++# Labels for the shadow-AP bring-up path. See sepolicy/doma_shadow_ap.te.
++
++# Give the script its own exec type so init has something to transition to, and so
++# avc denials name doma_shadow_ap instead of being attributed to init.
++/vendor/bin/doma-shadow-ap       u:object_r:doma_shadow_ap_exec:s0
++# doma-wifi-relay SHARES doma_shadow_ap_exec on purpose. It touches exactly the same
++# objects -- $CONF_DIR, hostapd.conf, the hostapd binary -- so a second domain would
++# need a duplicate of every rule in doma_shadow_ap.te for no gain, and inventing a
++# domain is where the neverallow risk lives.
++# Attribution stays useful because the two run at different times: doma_shadow_ap is
++# oneshot at bring-up, doma_wifi_relay is the long-lived loop.
++/vendor/bin/doma-wifi-relay      u:object_r:doma_shadow_ap_exec:s0
++
++# /data/vendor/wifi/shadow holds the generated hostapd.conf, the AP list
++# doma-wifi-relay writes (aps.conf) and hostapd's ctrl_interface sockets.
++# system/sepolicy/vendor/file_contexts:169-170 label /data/vendor/wifi/hostapd
++# and /data/vendor/wifi/wpa but nothing else under /data/vendor/wifi, so without
++# this line the directory init.xenvm-hwsim.rc creates falls back to the generic
++# vendor label and hostapd cannot use it.
++#
++# Reusing hostapd_data_file rather than inventing a type is deliberate: hal_wifi_hostapd_
++# default already has the rules it needs for that type (22 references in the built
++# vendor_sepolicy.cil), so the apex hostapd works with no policy of its own.
++/data/vendor/wifi/shadow(/.*)?   u:object_r:hostapd_data_file:s0
+diff --git a/xenvm_trout_rpi4_arm64/BoardConfig.mk b/xenvm_trout_rpi4_arm64/BoardConfig.mk
+index 3443306..dacd2f4 100644
+--- a/xenvm_trout_rpi4_arm64/BoardConfig.mk
++++ b/xenvm_trout_rpi4_arm64/BoardConfig.mk
+@@ -51,6 +51,19 @@ include device/epam/aosp-xenvm-trout/xenvm_trout_arm64/BoardConfig.mk
+ TARGET_ARCH_VARIANT := armv8-a
+ TARGET_CPU_VARIANT := cortex-a72
+ 
++# ---------------------------------------------------------------------------
++# sepolicy for the shadow-AP bring-up script.
++#
++# The board boots permissive (device/epam/aosp-xenvm-trout/xenvm_trout_arm64/
++# BoardConfig.mk:31 androidboot.selinux=permissive, :56 enforcing=0 -- and the
++# bootconfig entry is present in the built vendor-bootconfig.img, verified), so
++# /vendor/bin/doma-shadow-ap already runs without this. What it buys is ATTRIBUTION:
++# without an exec type the script keeps the generic vendor_file label and every avc
++# line names init, so audit2allow has nothing to work with. See
++# ../sepolicy/doma_shadow_ap.te for the rule set and for what is deliberately left
++# to be derived from measured denials.
++BOARD_VENDOR_SEPOLICY_DIRS += device/sodev/xenvm-cf/sepolicy
++
+ # ---------------------------------------------------------------------------
+ # Build the Venus ICD.
+ #
+diff --git a/xenvm_trout_rpi4_arm64/doma-shadow-ap.sh b/xenvm_trout_rpi4_arm64/doma-shadow-ap.sh
+new file mode 100755
+index 0000000..2e3e1a2
+--- /dev/null
++++ b/xenvm_trout_rpi4_arm64/doma-shadow-ap.sh
+@@ -0,0 +1,467 @@
++#!/system/bin/sh
++# SPDX-License-Identifier: Apache-2.0
++#
++# Give AAOS a Wi-Fi station that can see and join REAL access points, by simulating the
++# radios locally and beaconing the SSIDs DomD actually sees.
++#
++# WHY THIS EXISTS
++# virt_wifi, the Wi-Fi the upstream product sets up, is an L2 shim over an
++# ethernet link that synthesises exactly one fake network called "VirtWifi". It
++# has no radio and cannot scan, so the Settings Wi-Fi screen can never list real
++# APs with it. The board's real radio is not passed to this guest either: DomA's
++# devices are qemu device models, so DomD drives the radio and this guest
++# simulates its own.
++#
++# What is left is to simulate: mac80211_hwsim gives this kernel several radios on one
++# in-kernel "perfect channel medium". wlan0 becomes the station AAOS uses; a further
++# radio runs hostapd beaconing SSIDs copied from DomD's real scan. The user picks a
++# genuine SSID on screen, and traffic leaves through DomD's real Wi-Fi.
++#
++# WHICH INTERFACE FOR WHAT, AND WHY IT MATTERS
++#   wlan0  station. Fixed by the property wifi.interface=wlan0.
++#   wlan1  LEFT ALONE. Android's SoftAp claims this name: the board sets
++#          WIFI_HAL_INTERFACE_COMBINATIONS={{{STA},1},{{AP},1},{{P2P},1}}, so STA+AP
++#          concurrency is allowed and wifi_chip.cpp's startIdxOfApIface() returns 1. No
++#          ro.vendor.wifi.sap.interface is set anywhere to move it.
++#   wlan2+ our shadow APs. Invisible to the vendor HAL, which does not enumerate wiphys
++#          at all -- device/generic/goldfish/wifi/wifi_hal/info.cpp stats a hardcoded
++#          {"wlan0","wlan1"} against /sys/class/net. wificond is name-driven too.
++#
++# STARTED AUTOMATICALLY AT BOOT. init.xenvm-hwsim.rc carries
++#     on property:sys.boot_completed=1
++#         start doma_shadow_ap
++# and the service line says `disabled`, which only means init will not start it
++# with its class -- that property trigger is what starts it.
++#
++# Manual control still works and is the right tool when debugging:
++#     stop doma_shadow_ap ; start doma_shadow_ap
++# and `setprop persist.vendor.doma.shadow_ap false` hands wlan0 back to virt_wifi (see
++# the check further down). Taking wlan0 away from virt_wifi remains a one-way step for
++# an already-running system, which is why that escape hatch exists.
++#
++# THE AP LIST IS AN INPUT, NOT A CONSTANT
++# /data/vendor/wifi/shadow/aps.conf holds one AP per line:
++#     <SSID>TAB<PSK>        PSK empty -> the shadow AP is open
++# doma-wifi-relay keeps it in sync with DomD's scan, and the shipped seed fills
++# it on a first boot; this script only reads it.
++set -u
++
++TAG=doma-shadow-ap
++# Android's logger binary is also called `log`, so it must be called by absolute path:
++# a bare `log` inside a function named log() recurses until the shell dies.
++# THE TRAILING `:` IS MANDATORY. Without it, LOG()'S EXIT STATUS IS THAT OF
++#   /system/bin/log, which turns the `A && log ... || die ...` idiom into "A
++#   succeeded, yet die fired" (/system/bin/log is a toybox symlink and normally
++#   succeeds, but if it fails you get a bogus FATAL).
++log() { echo "$TAG: $*"; /system/bin/log -t "$TAG" "$*" 2>/dev/null; :; }
++
++RADIOS=${RADIOS:-3}                       # wlan0 station + wlan1 (SoftAp) + wlan2 shadow
++MAC_PREFIX=${MAC_PREFIX:-$(getprop ro.boot.wifi_mac_prefix)}
++[ -n "$MAC_PREFIX" ] || MAC_PREFIX=5554   # BoardConfig.mk sets this; default matches it
++AP_IF=${AP_IF:-wlan2}
++UPLINK_IF=${UPLINK_IF:-eth1}              # the vif bridged to DomD's xenbr0
++BR=${BR:-br-shadow}
++CONF_DIR=/data/vendor/wifi/shadow
++APS=$CONF_DIR/aps.conf
++# Shipped seed for $APS. /data is empty on a first boot, so without this the
++# script dies before hostapd ever runs and the AAOS Wi-Fi screen shows nothing.
++# The shipped seed carries one placeholder row; see its header.
++SEED=${SEED:-/vendor/etc/doma-shadow-aps.conf}
++HOSTAPD=/apex/com.google.cf.wpa_supplicant/bin/hw/hostapd
++CREATE_RADIOS=/apex/com.google.cf.wifi/bin/mac80211_create_radios
++
++die() { log "FATAL: $*"; exit 1; }
++
++# ssid_hostapd_safe / psk_is_hex / psk_valid -- the same functions as in
++# doma-wifi-relay.sh, which writes hostapd.conf at runtime by the same rules;
++# the comments there say why each rule exists.
++ssid_hostapd_safe() {
++    case "$1" in ''|*\\*) return 1;; esac
++    [ "$(printf '%s' "$1" | wc -c)" -le 32 ]
++}
++psk_is_hex() {
++    case "$1" in ''|*[!0-9A-Fa-f]*) return 1;; esac
++    [ "${#1}" -eq 64 ]
++}
++psk_valid() {
++    psk_is_hex "$1" && return 0
++    _n=$(printf '%s' "$1" | wc -c)
++    [ "$_n" -ge 8 ] && [ "$_n" -le 63 ]
++}
++
++# --- 0. which implementation owns wlan0 this boot ------------------------------------
++# ONE OWNER PER BOOT, CHOSEN BY A PROPERTY.
++#
++# virt_wifi and the shadow AP must never both own wlan0, so the owner is chosen
++# here, before anything is touched.
++#
++# WHY A PROPERTY AND NOT AN IN-SCRIPT FALLBACK. The failure that matters most is
++# one no error handler in here can see: this script exits 0, hostapd is up, and
++# the FRAMEWORK still cannot scan or connect. Worse, a handler could not recover
++# even from the failures it can see: wlan0 is deleted in step 1 and the hwsim
++# radios take the name immediately after, and mac80211_create_radios has no
++# destroy mode, so setup_wifi could not create its virt_wifi wlan0 afterwards.
++# Selecting the owner BEFORE anything is touched, and recovering by reboot, is
++# the only shape that covers both.
++#
++# RECOVERY ON HARDWARE, with no SD rewrite:
++#     setprop persist.vendor.doma.shadow_ap false && reboot
++# which hands wlan0 back to virt_wifi.
++#
++# getprop's second argument is the default, so the property does not have to exist in
++# build.prop for this to read `true`.
++if [ "$(getprop persist.vendor.doma.shadow_ap true)" != "true" ]; then
++    log "persist.vendor.doma.shadow_ap is not true -- handing wlan0 to virt_wifi"
++    # exec, not a background start: this service is `oneshot`, so init waits for it, and
++    # setup_wifi is itself a oneshot that exits. It runs in the doma_shadow_ap domain
++    # rather than setup_wifi's, which is harmless on this permissive board; if the board
++    # ever goes enforcing, add the transition (setup_wifi_exec is already labelled).
++    #
++    # TIMING: setup_wifi renames eth1 with SIOCSIFNAME, which needs the
++    # interface administratively down. This runs at sys.boot_completed, and
++    # EthernetService was measured claiming eth0 at about 200 s (see
++    # init.xenvm-buried-eth0.rc), well after that.
++    exec /apex/com.google.cf.wifi/bin/setup_wifi --interface="$UPLINK_IF"
++fi
++
++# --- preconditions -----------------------------------------------------------------
++# The modules are in vendor_ramdisk/lib/modules/modules.load, so first-stage init has
++# already loaded them; insmod here only covers a hand-built image that lacks that.
++[ -d /sys/module/mac80211_hwsim ] || {
++    for m in libarc4 mac80211 mac80211_hwsim; do
++        [ -d "/sys/module/$m" ] && continue
++        insmod "/vendor_dlkm/lib/modules/$m.ko" 2>/dev/null \
++            || insmod "/vendor/lib/modules/$m.ko" 2>/dev/null \
++            || die "$m not loaded and no .ko to insmod (is it in _VIRT_COMMON_MODULES?)"
++    done
++}
++[ -x "$CREATE_RADIOS" ] || die "$CREATE_RADIOS missing (com.google.cf.wifi apex?)"
++[ -x "$HOSTAPD" ]       || die "$HOSTAPD missing (com.google.cf.wpa_supplicant apex?)"
++
++# --- 1. take wlan0 back from virt_wifi ---------------------------------------------
++# setup_wifi (the fallback above) creates a virt_wifi wlan0 on top of a buried
++# ethernet link. Both providers want the name, and whoever created it first
++# holds it, so the old one has to go before the radios are made.
++if [ -e /sys/class/net/wlan0 ] && [ -e /sys/class/net/wlan0/lower_buried_eth1 ]; then
++    log "removing virt_wifi wlan0 (was stacked on buried_eth1)"
++    ip link set wlan0 down 2>/dev/null
++    ip link del wlan0 2>/dev/null || log "could not delete virt_wifi wlan0; continuing"
++fi
++# AND RENAME THE LOWER INTERFACE BACK. Deleting the upper link does NOT undo
++# setup_wifi's SIOCSIFNAME on the lower one, so eth1 stays called buried_eth1. Step 4
++# then finds no $UPLINK_IF, logs "WARNING: eth1 absent; not enslaving", and br-shadow
++# comes up with NO UPLINK -- the station associates to the shadow AP and never gets a
++# DHCP lease, with nothing in the log pointing at the cause. A normal boot never
++# needs this -- nothing runs setup_wifi before this script -- but a boot where
++# the virt_wifi fallback ran first and the property was then switched back to
++# true does.
++if [ ! -e "/sys/class/net/$UPLINK_IF" ] && [ -e "/sys/class/net/buried_$UPLINK_IF" ]; then
++    log "renaming buried_$UPLINK_IF back to $UPLINK_IF"
++    ip link set "buried_$UPLINK_IF" down 2>/dev/null
++    ip link set "buried_$UPLINK_IF" name "$UPLINK_IF" 2>/dev/null \
++        || log "WARNING: could not rename buried_$UPLINK_IF; the bridge will have no uplink"
++    ip link set "$UPLINK_IF" up 2>/dev/null
++fi
++
++# --- 2. simulated radios ------------------------------------------------------------
++# The module is loaded with radios=0 (BOARD_KERNEL_CMDLINE carries
++# mac80211_hwsim.radios=0) precisely so the count can be chosen here.
++n_phy=$(ls -d /sys/class/ieee80211/phy* 2>/dev/null | wc -l)
++if [ "$n_phy" -lt "$RADIOS" ]; then
++    log "creating $RADIOS radios (mac prefix $MAC_PREFIX); had $n_phy"
++    "$CREATE_RADIOS" --enable-pmsr "$RADIOS" "$MAC_PREFIX" || die "mac80211_create_radios failed"
++else
++    log "$n_phy radios already present; not creating more"
++fi
++for i in 0 1 2 3 4 5 6 7 8 9; do
++    [ -e "/sys/class/net/$AP_IF" ] && break
++    sleep 1
++done
++[ -e "/sys/class/net/$AP_IF" ] || die "$AP_IF never appeared after creating $RADIOS radios"
++
++# --- 3. hostapd config from the AP list ---------------------------------------------
++mkdir -p "$CONF_DIR" "$CONF_DIR/sockets" 2>/dev/null
++# CONF_DIR must be 0771. The sys.boot_completed block of init.xenvm-hwsim.rc
++#   sets 0771 on /data/vendor/wifi{,/shadow} right before
++#   `start doma_shadow_ap`, so that DomaWifiRelay (uid system) can reach its
++#   request drop-box, and a 0770 here would undo that on every boot (confirmed
++#   on hardware).
++#   o+x only; neither r nor w is granted. sockets/ stays 0770.
++chmod 0771 "$CONF_DIR" 2>/dev/null
++chmod 0770 "$CONF_DIR/sockets" 2>/dev/null
++# Seed $APS on first run, then MERGE the seed on every later run: add only the
++# seed SSIDs $APS does not have and leave every existing row alone, so a PSK the
++# user typed on screen is never reverted to the seed's value. $APS is where
++# credentials live, not a cache: the merge brings a seed row back if $APS is
++# lost, and doma-wifi-relay's seed_psk_of() keeps a publication from writing a
++# placeholder over a seeded SSID. The merge skips `#` lines, so $APS carries
++# data rows only (psk_of() and the two hostapd.conf generators ignore `#` lines
++# anyway). If $APS cannot be written and is still empty, _seeded stays 0 and the
++# `[ -s "$APS" ] || die` below trips.
++if [ -s "$SEED" ]; then
++    _seeded=0
++    # DO NOT PRE-CREATE $APS. `:` is a POSIX special builtin in mksh
++    #   ("*=:" in external/mksh/src/funcs.c), and A FAILED REDIRECTION ONTO A
++    #   SPECIAL BUILTIN MAKES MKSH TERMINATE THE WHOLE SCRIPT (iosetup() failure in
++    #   exec.c -> errorfz() -> LERROR -> exit 1 for a non-interactive shell). On top
++    #   of that, `2>/dev/null` swallows the diagnostic too, so a missing $CONF_DIR
++    #   alone would make us DIE SILENTLY HERE AT BOOT, never reaching hostapd.conf
++    #   generation, br-shadow creation or the hostapd start.
++    #   The existence-check loop below uses `done < "$APS"` (a redirection onto a
++    #   compound command), so a missing $APS is not fatal there, and the appending
++    #   `>>` creates the file when it is needed.
++    # KEEP THE `|| [ -n "$_line" ]`. The seed is a hand-edited file, and IF THE LAST
++    #   LINE HAS NO NEWLINE, read DROPS THAT LAST LINE, and that line could be
++    #   the seed's only data row.
++    while IFS= read -r _line || [ -n "$_line" ]; do
++        case "$_line" in ''|'#'*) continue;; esac
++        _ss=${_line%%	*}
++        [ -n "$_ss" ] || continue
++        # If it is already there, leave it alone.
++        #
++        # DO NOT USE grep. With `grep -q "^$_ss<TAB>"` THE SSID IS INTERPRETED AS A
++        #   BRE, so an SSID containing `.`, `[` or `*` matches the wrong row (for
++        #   example a seed `A.B` matching an existing `AXB`, so the seed row
++        #   never gets added). Use the same "read line by line and compare
++        #   as strings" approach as psk_of(). A partial match (a shorter
++        #   `<SSID-PREFIX>` masking `<SSID-A>`) is then also ruled out naturally by
++        #   the field boundary.
++        _have=0
++        # GUARD IT WITH `[ -s "$APS" ]`. On a first boot ($APS absent),
++        #   `done < "$APS"` prints `cannot open` on stderr ONCE PER SEED ROW. The
++        #   script does not die, because while is not a special builtin in mksh (and
++        #   the behaviour is still correct, since `>>` creates the file), but there is
++        #   no reason to pollute the log with a harmless diagnostic on every boot. The
++        #   decision "absent => _have=0" is correct as is: just append.
++        if [ -s "$APS" ]; then
++            while IFS="$(printf '\t')" read -r _k _rest; do
++                [ "$_k" = "$_ss" ] && { _have=1; break; }
++            done < "$APS"
++        fi
++        if [ "$_have" = 0 ]; then
++            printf '%s\n' "$_line" >> "$APS" && _seeded=$((_seeded+1))
++        fi
++    done < "$SEED"
++    chmod 0660 "$APS" 2>/dev/null
++    # '^[^#]' and not a BRE alternation: toybox grep is what runs here and
++    # GNU's \| is not portable to it. An empty line has no character to
++    # match [^#], so blanks are excluded for free.
++    # DO NOT WRITE `A && log ... || log ...`. log() ends with `:` today, but
++    #   without that its exit status would be /system/bin/log's, and if the
++    #   logger failed BOTH branches would print. Do not add an instance of the
++    #   trap.
++    if [ "$_seeded" -gt 0 ]; then
++        log "merged $_seeded AP(s) from $SEED into $APS (now $(grep -c '^[^#]' "$APS") AP(s))"
++    else
++        log "$APS already carries every seed AP ($(grep -c '^[^#]' "$APS") AP(s))"
++    fi
++fi
++[ -s "$APS" ] || die "$APS is empty and $SEED gave nothing -- nothing to beacon (see the header of this script)"
++
++CONF=$CONF_DIR/hostapd.conf
++{
++    echo "interface=$AP_IF"
++    echo "bridge=$BR"
++    echo "driver=nl80211"
++    echo "ctrl_interface=$CONF_DIR/sockets"
++    echo "hw_mode=g"
++    echo "channel=6"
++    echo "ieee80211n=1"
++    # First line of aps.conf is the primary BSS; any further lines become bss= stanzas.
++    #
++    # EMIT `bridge=` IN EVERY BSS STANZA.
++    #   hostapd's hostapd_config_bss() does not copy the preceding BSS's `bridge`, so
++    #   writing it once at the top means EVERY BSS AFTER THE FIRST COMES UP WITH NO
++    #   BRIDGE.
++    #   PRIMARY SOURCES (the apex is not a prebuilt, it is built from this tree:
++    #   device/google/cuttlefish/apex/com.google.cf.wpa_supplicant/Android.bp:28-29):
++    #     external/wpa_supplicant_8/hostapd/config_file.c:2240-2241
++    #         os_strlcpy(bss->bridge, ...) -- so bridge IS A PER-BSS FIELD
++    #     same file :871-906, hostapd_config_bss() only does os_zalloc +
++    #         defaults_bss + copying iface/vlan, AND DOES NOT COPY bridge
++    #     src/ap/hostapd.c:1510 passes conf->bridge[0] ? conf->bridge : NULL, and
++    #     the `bridge &&` at src/drivers/driver_nl80211.c:9706 is the gate
++    #   THE MECHANISM (source) AND THE DAMAGE (measurement below) ARE SEPARATE PIECES
++    #   OF EVIDENCE; read them as such.
++    #   Damage (measured): when the order in aps.conf changed and the seed SSID
++    #   (<SSID-A>) ended up sixth, DomA's own station got as far as association
++    #   (COMPLETED / RSSI -30) but GOT NO IP (DHCP never completes, because nothing
++    #   reaches DomD's dnsmasq via br-shadow -> eth1). Moving it back to the front
++    #   gave wlan0 192.168.10.134/24.
++    #   => Emit bridge explicitly in each BSS so nothing depends on the ordering.
++    first=1
++    idx=0
++    while IFS="$(printf '\t')" read -r ssid psk; do
++        case "$ssid" in ''|'#'*) continue;; esac
++        # Skip what hostapd would reject, by the same rules doma-wifi-relay.sh
++        # applies when it writes this file at runtime: ONE bad row makes hostapd
++        # refuse the entire file. log() writes to stdout, which is $CONF here,
++        # so send it to stderr.
++        if ! ssid_hostapd_safe "$ssid"; then
++            log "skip SSID hostapd would reject: $ssid" >&2
++            continue
++        fi
++        if [ -n "${psk:-}" ] && ! psk_valid "$psk"; then
++            log "skip $ssid: PSK neither 8..63 bytes nor 64 hex" >&2
++            continue
++        fi
++        if [ "$first" = 1 ]; then
++            first=0
++        else
++            idx=$((idx+1))
++            echo "bss=${AP_IF}_$idx"
++            echo "bridge=$BR"
++        fi
++        echo "ssid=$ssid"
++        if [ -n "${psk:-}" ]; then
++            echo "wpa=2"
++            echo "wpa_key_mgmt=WPA-PSK"
++            echo "rsn_pairwise=CCMP"
++            if psk_is_hex "$psk"; then
++                echo "wpa_psk=$psk"
++            else
++                echo "wpa_passphrase=$psk"
++            fi
++        else
++            echo "wpa=0"
++        fi
++    done < "$APS"
++} > "$CONF"
++log "wrote $CONF ($(grep -c '^ssid=' "$CONF") SSID(s))"
++
++# Match the owner init gives the directory. init's post-fs-data block creates
++#     mkdir /data/vendor/wifi/shadow 0771 wifi wifi
++# but this script runs as root, so anything it writes lands root:root 0644 inside a
++# wifi:wifi directory.
++#
++# NOT COSMETIC. With the file at root:root 0660 hostapd fails with
++#     E hostapd : Could not open configuration file '.../hostapd.conf' for reading.
++#     E hostapd : Failed to initialize interface
++# and exits 1 three times in a row, until init reports
++# `exited 4 times in 4 minutes` (measured); at wifi:wifi 0660 the same file
++# takes it all the way to `wlan2: AP-ENABLED`. HOSTAPD DOES NOT READ IT AS root
++# (it drops to uid wifi), so this chown/chmod is mandatory. $CONF also holds a
++# wpa_passphrase, so it must not be left at 0644.
++chown wifi:wifi "$CONF" 2>/dev/null || log "WARNING: chown $CONF failed"
++chmod 0660 "$CONF" 2>/dev/null || log "WARNING: chmod $CONF failed"
++
++# --- 4. uplink bridge ----------------------------------------------------------------
++# The AP side has to reach DomD. eth1 is this guest's second vif and is already on DomD's
++# xenbr0, so bridging the two puts the station on the same L2 as DomD's dnsmasq: wlan0
++# gets a lease and leaves through DomD's NAT. eth1 stops being an Android "Ethernet"
++# network when it becomes a bridge port -- that is intended, the whole point is that
++# connectivity now arrives over Wi-Fi.
++if [ ! -e "/sys/class/net/$BR" ]; then
++    ip link add name "$BR" type bridge || die "cannot create $BR"
++fi
++ip link set "$BR" up
++# WAIT FOR THE UPLINK. This oneshot runs at sys.boot_completed and normally
++# finds eth1 registered long before (init's `wait for /sys/class/net/eth1` fires
++# at ~27 s), but br-shadow has come up on the board with eth1 NOT a port, and
++# only `stop doma_shadow_ap; start doma_shadow_ap` repaired it.
++# A vif that shows up late, or one still called buried_eth1 (see step 1), must not end
++# as a one-line "WARNING: eth1 absent; not enslaving": that state has no DHCP for the
++# station and nothing in the UI says why. Poll up to UPLINK_WAIT_S, then say so loudly.
++UPLINK_WAIT_S=${UPLINK_WAIT_S:-20}
++_w=0
++while [ ! -e "/sys/class/net/$UPLINK_IF" ] && [ "$_w" -lt "$UPLINK_WAIT_S" ]; do
++    if [ -e "/sys/class/net/buried_$UPLINK_IF" ]; then
++        log "renaming buried_$UPLINK_IF back to $UPLINK_IF (late)"
++        ip link set "buried_$UPLINK_IF" down 2>/dev/null
++        ip link set "buried_$UPLINK_IF" name "$UPLINK_IF" 2>/dev/null \
++            || log "WARNING: could not rename buried_$UPLINK_IF"
++        ip link set "$UPLINK_IF" up 2>/dev/null
++        break
++    fi
++    [ "$_w" = 0 ] && log "$UPLINK_IF not present yet; waiting up to ${UPLINK_WAIT_S}s"
++    sleep 1
++    _w=$((_w+1))
++done
++[ -e "/sys/class/net/$UPLINK_IF" ] \
++    || log "ERROR: $UPLINK_IF did not appear within ${UPLINK_WAIT_S}s -- $BR will have NO UPLINK (the station gets no DHCP lease). Recover: stop doma_shadow_ap; start doma_shadow_ap"
++for p in "$AP_IF" "$UPLINK_IF"; do
++    [ -e "/sys/class/net/$p" ] || { log "WARNING: $p absent; not enslaving"; continue; }
++    [ -e "/sys/class/net/$p/master" ] && continue
++    ip link set "$p" down 2>/dev/null
++    ip link set "$p" master "$BR" && log "$p -> $BR"
++    ip link set "$p" up
++done
++# Say plainly whether the uplink made it; this is the line to look for in
++# `logcat -s doma-shadow-ap` when wlan0 associates but never gets an address.
++if [ -e "/sys/class/net/$UPLINK_IF/master" ]; then
++    log "$BR uplink OK ($UPLINK_IF is a port)"
++else
++    log "ERROR: $UPLINK_IF is NOT a port of $BR after step 4 -- the station will get no DHCP lease"
++fi
++
++# --- 5. hostapd ----------------------------------------------------------------------
++# A distinct process name on purpose: the service name `hostapd` and the AIDL name
++# android.hardware.wifi.hostapd.IHostapd/default belong to the apex's own SoftAp service
++# (com.google.cf.wpa_supplicant.rc), which the framework starts on demand. This one is
++# ours and must not collide with it.
++# START IT AS AN INIT SERVICE. DO NOT EXEC IT WITH -B FROM HERE.
++#
++# This service is `oneshot`, so the moment this script exits init SIGKILLs the
++# whole process group, as the board's dmesg shows:
++#     init: Service 'doma_shadow_ap' (pid 1567) exited with status 0 oneshot ...
++#     init: Sending SIGKILL to service 'doma_shadow_ap' (pid 1567) process group...
++# A -B daemon stays in that group and dies with it. Handing it to init instead
++# means it survives, and init restarts it if it crashes.
++#
++# vendor.doma_shadow_hostapd is defined in init.xenvm-hwsim.rc and is NOT oneshot.
++HOSTAPD_SVC=${HOSTAPD_SVC:-vendor.doma_shadow_hostapd}
++setprop ctl.stop "$HOSTAPD_SVC" 2>/dev/null || true
++pid=$(pidof hostapd 2>/dev/null)
++[ -n "${pid:-}" ] && { log "stopping previous hostapd ($pid)"; kill "$pid" 2>/dev/null; sleep 1; }
++setprop ctl.start "$HOSTAPD_SVC" \
++    || log "WARNING: ctl.start $HOSTAPD_SVC failed (the rc has no such service)"
++
++i=0
++while [ $i -lt 20 ]; do
++    pidof hostapd >/dev/null 2>&1 && break
++    sleep 0.5
++    i=$((i+1))
++done
++# DO NOT WRITE `A && log ... || die ...` (see the note on log() at the top).
++#   log() ends with `:` so its exit status is 0, but the idiom invites the next
++#   editor to reintroduce the trap.
++if pidof hostapd >/dev/null 2>&1; then
++    log "hostapd up on $AP_IF (bridge $BR) as init service $HOSTAPD_SVC"
++else
++    die "hostapd did not come up; check that the apex path in the service line exists and see logcat -s doma-shadow-ap, $CONF"
++fi
++
++# --- 6. make the Wi-Fi HAL re-enumerate the radios -----------------------------------
++# The goldfish HAL lists wlan0/wlan1 once, when the framework starts it
++# (device/generic/goldfish/wifi/wifi_hal/info.cpp:23-37), and those radios exist only
++# from step 1 of this script. With Wi-Fi saved ON the framework starts the HAL at
++# system-services-ready, always before this script, and then holds a stale radio list.
++#
++# Moving this service to an earlier trigger is not the fix: the fallback path execs
++# setup_wifi, which has to run after the virtio NIC exists (see the trigger note in
++# init.xenvm-hwsim.rc). So do not bet on ordering -- cycle Wi-Fi once, after the
++# radios and hostapd are up.
++#
++# ONLY WHILE WI-FI IS SAVED ON. A fresh /data starts with Wi-Fi off
++# (def_wifi_on=false, and nothing enables it at boot), and with it off the
++# framework never starts the HAL, so the user's first ON -- after the radios exist --
++# enumerates them. Cycling regardless would save Wi-Fi ON at every boot and override the
++# Settings toggle. wifi_on is 1 when saved ON and 2 when ON in airplane mode
++# (WifiSettingsStore.java:50-58).
++case "$(settings get global wifi_on 2>/dev/null)" in
++    1|2)
++        if command -v cmd >/dev/null 2>&1; then
++            cmd wifi set-wifi-enabled disabled >/dev/null 2>&1 || true
++            sleep 3
++            cmd wifi set-wifi-enabled enabled  >/dev/null 2>&1 || true
++            log "cycled Wi-Fi so the HAL re-enumerates the hwsim radios"
++        else
++            log "WARNING: cmd not found; Wi-Fi not cycled -- the HAL may hold a stale radio list"
++        fi
++        ;;
++    *)
++        log "Wi-Fi is off in Settings; not cycling it (the HAL lists the radios when it is turned on)"
++        ;;
++esac
++
++log "done"
+diff --git a/xenvm_trout_rpi4_arm64/doma-shadow-aps.conf b/xenvm_trout_rpi4_arm64/doma-shadow-aps.conf
+new file mode 100644
+index 0000000..fd96acf
+--- /dev/null
++++ b/xenvm_trout_rpi4_arm64/doma-shadow-aps.conf
+@@ -0,0 +1,30 @@
++# SPDX-License-Identifier: Apache-2.0
++#
++# Seed for /data/vendor/wifi/shadow/aps.conf.
++#
++# /vendor/bin/doma-shadow-ap MERGES this file into aps.conf on every boot,
++# adding only the SSIDs aps.conf does not have yet, so a PSK the user typed on
++# screen is never overwritten.
++#
++# FORMAT: one AP per line, <SSID>TAB<PSK>. An empty PSK makes the shadow AP
++# open. The first row of aps.conf becomes the primary BSS.
++#
++# THE ROW BELOW IS A PLACEHOLDER, NOT A WORKING AP.
++# doma-shadow-ap exits with "$APS is empty" when this file has no data row, so
++# one row has to exist for a freshly flashed card to reach a usable Wi-Fi screen
++# at all. It is deliberately not a real network: this file lives in a source
++# tree, and a real row here is a passphrase published inside a vendor image.
++#
++# To join a real AP, type its passphrase on the DomA Wi-Fi settings screen. The
++# shadow AP validates that handshake locally and cannot learn a PSK from it --
++# only a MIC crosses the air -- and one failed handshake disables the network
++# permanently (config_wifiDisableReasonByWrongPasswordThreshold is 1 and
++# ...DurationMs is -1 in ServiceWifiResources/res/values/config.xml).
++# DomaWifiRelay then reads the typed passphrase, hands it to the shadow AP and
++# to DomD, and calls WifiManager.connect(), which clears the disable. Editing
++# the copy on the device -- /data/vendor/wifi/shadow/aps.conf, one
++# "SSID<TAB>PSK" per line -- works as well.
++#
++# Never commit a real SSID or passphrase back into this file, as a row or in a
++# comment.
++EXAMPLE-SSID	change-me-00000000
+diff --git a/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh b/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh
+new file mode 100755
+index 0000000..401eb6a
+--- /dev/null
++++ b/xenvm_trout_rpi4_arm64/doma-wifi-relay.sh
+@@ -0,0 +1,1057 @@
++#!/system/bin/sh
++# SPDX-License-Identifier: Apache-2.0
++#
++# /vendor/bin/doma-wifi-relay -- the DomA half of the shadow-AP Wi-Fi relay.
++#
++# WHAT IT CLOSES
++# doma-shadow-ap beacons whatever is in /data/vendor/wifi/shadow/aps.conf, and the
++# DomD-side agent (domd_wifi_agent.py) already publishes the real scan results and
++# already performs the real association on request. Nothing on this side consumed
++# either half, so the AP list was static and the passphrase the user typed never
++# reached DomD. This daemon is that consumer.
++#
++# WHY BOTH HALVES ARE ONE PROGRAM, NOT TWO
++# The `aps` message the agent sends carries {ssid, bssid, sec, freq, dbm} and NO
++# psk (see the PROTOCOL block of domd_wifi_agent.py) -- a scan cannot reveal a
++# PSK. So "write aps.conf from the real scan" on its own would leave hostapd
++# with no passphrase for the new SSIDs, and the first attempt against one would
++# fail the 4-way handshake locally. That failure is NOT retried:
++# config_wifiDisableReasonByWrongPasswordThreshold is 1 and
++# config_wifiDisableReasonByWrongPasswordDurationMs is -1 in
++# ServiceWifiResources/res/values/config.xml, so the network is disabled permanently
++# (WifiConfiguration.NetworkSelectionStatus.DISABLED_BY_WRONG_PASSWORD). Publishing a
++# list is therefore only safe together with a way to learn the PSK, which is what the
++# companion app supplies over $REQ below.
++#
++# THE TWO INPUTS
++#   $CHAN  /dev/hvc4         virtio-serial to DomD. Newline-delimited JSON both ways.
++#                            The INBOUND format is json.dumps() output, so it has a
++#                            space after every colon -- written out in full here because
++#                            a pattern for the compact form never matches it:
++#                            in : {"t": "aps", "v": [{"ssid": "X", "bssid": ..,
++#                                  "sec": "wpa2", ..}, ..]}
++#                                 {"t": "state", "ssid": "X", "state": "COMPLETED", "ip": ..}
++#                            out: {"t":"connect","ssid":"X","psk":"Y"}   (ours, compact)
++#   $REQ   .../relay.req     one line per request from DomaWifiRelay (the priv-app):
++#                                 psk<TAB><SSID><TAB><PSK>
++#                            The app has NETWORK_SETTINGS + READ_WIFI_CREDENTIAL and
++#                            reads the PSK with WifiManager.getPrivilegedConfiguredNetworks().
++#
++# WHY A REQUEST FILE AND NOT A SOCKET
++# mksh cannot select() over two descriptors. `read -t` on $CHAN plus a stat of $REQ
++# polls both with one loop and no helper process. $REQ lives in $CONF_DIR/req,
++# which file_contexts already labels hostapd_data_file, so no new sepolicy is
++# needed (the owner and mode of that directory are explained where REQ_DIR is
++# set).
++#
++# IT FOLLOWS THE SETTINGS WI-FI TOGGLE. init.xenvm-hwsim.rc starts it at
++# sys.boot_completed while persist.vendor.doma.wifi_relay is unset or "true", and while
++# the toggle is off it asks DomD for nothing -- see sta_is_up().
++set -u
++
++TAG=doma-wifi-relay
++# THE TRAILING `:` IS MANDATORY. Without it, LOG()'S EXIT STATUS IS THAT OF
++#   /system/bin/log, which turns the `A && log ... || die ...` idiom into "A
++#   succeeded, yet die fired" (/system/bin/log is a toybox symlink and normally
++#   succeeds, but if it fails you get a bogus FATAL).
++log() { echo "$TAG: $*"; /system/bin/log -t "$TAG" "$*" 2>/dev/null; :; }
++
++# THE PATHS CAN BE OVERRIDDEN FROM THE ENVIRONMENT, so the script also runs on a
++#   PC against a scratch directory. Nothing sets them on the device.
++CONF_DIR=${CONF_DIR:-/data/vendor/wifi/shadow}
++APS=${APS:-$CONF_DIR/aps.conf}
++CONF=${CONF:-$CONF_DIR/hostapd.conf}
++# The request drop-box. A SUBDIRECTORY, not a file in $CONF_DIR, because of DAC:
++# $CONF_DIR is wifi:wifi 0771 (init.xenvm-hwsim.rc creates it and doma-shadow-ap
++# keeps the mode), and the app that writes requests runs as uid/gid system, so
++# it could not create a file there. This
++# directory is created wifi:system 0770 by init.xenvm-hwsim.rc (and chowned to match
++# by this daemon as a fallback), which lets the app create and replace the request file while
++# keeping the passphrase out of reach of everything else. SELinux needs nothing:
++# file_contexts already labels /data/vendor/wifi/shadow(/.*)? hostapd_data_file, so
++# the subdirectory inherits the same type.
++REQ_DIR=${REQ_DIR:-$CONF_DIR/req}
++REQ=${REQ:-$REQ_DIR/relay.req}
++# $CHAN is the hvc node, not /dev/vport2p4. The Wi-Fi channel in doma.cfg is
++#   declared as `-device virtconsole,chardev=virts_chardev5`, i.e. AS A CONSOLE
++#   PORT. virtio_console only assigns an hvc to ports the host declared
++#   VIRTIO_CONSOLE_CONSOLE_PORT, and the generic /dev/vportXpY node of a port
++#   that got an hvc CANNOT BE OPENED (port_fops_open returns -ENXIO): init then
++#   restarts this script every 10 s, and it dies before it can log anything.
++#
++#   Why this number (same as the corresponding comment in doma.cfg): hvc_alloc()
++#   takes the lowest free vtermnos[] slot, and Xen's PV console has taken 0, so
++#   the five virtconsoles land ON hvc1..hvc5 IN PORT ORDER.
++#     virts1 -> hvc1   virts2 -> hvc2   virts4 -> hvc3
++#     virts5 -> hvc4  <- Wi-Fi (this script)
++#     virts6 -> hvc5
++#   (virts3 is a virtserialport, so it takes no hvc and stays /dev/vport2p2.)
++#   Measured 2026-09-07: on /dev/hvc4 the JSON from DomD's agent arrives, and a
++#   connect to <SSID-A> reached COMPLETED on the DomD side.
++CHAN=${CHAN:-/dev/hvc4}
++AP_IF=${AP_IF:-wlan2}
++BR=${BR:-br-shadow}
++# The two things used to detect a station. See the stations_present() comment.
++STA_IF=${STA_IF:-wlan0}
++# NETDEV_DIR / STA_CARRIER / STA_FLAGS / IW can be overridden like the paths
++#   above, so stations_present() and sta_is_up() also run without hardware. On
++#   the device the defaults apply.
++NETDEV_DIR=${NETDEV_DIR:-/sys/class/net}
++STA_CARRIER=${STA_CARRIER:-$NETDEV_DIR/$STA_IF/carrier}
++STA_FLAGS=${STA_FLAGS:-$NETDEV_DIR/$STA_IF/flags}
++IW=${IW:-/system/bin/iw}
++# Passphrase a newly discovered SSID gets until the user types the real one.
++#
++# IT MUST BE A VALID WPA2 PASSPHRASE, NOT EMPTY. An empty PSK makes the BSS
++# beacon OPEN, and an open BSS optimises away the exact event this whole design
++# depends on: the AAOS Wi-Fi screen shows no lock and NEVER PROMPTS FOR A
++# PASSWORD, the association succeeds locally, DISABLED_BY_WRONG_PASSWORD never
++# fires, DomaWifiRelay never learns a passphrase, DomD never associates -- a
++# permanent "connected, no internet" dead end with no way out. The failure is
++# load-bearing: the BSS must be WPA2 so the UI prompts, the handshake fails
++# against this placeholder, and the app can then read the typed value and
++# repair. Any 8..63 character string works; it is never meant to match anything.
++#
++# CONSEQUENCE TO EXPECT ON SCREEN: an SSID the relay discovered but nobody has
++# typed a password for yet shows a lock icon, and the first attempt fails for a
++# few seconds before the repair completes. A genuinely OPEN real AP is not
++# supported through this path: the `sec` field of the aps message says which are
++# open, but the extraction in handle_aps reads only the ssid values.
++PLACEHOLDER_PSK=${PLACEHOLDER_PSK:-doma-relay-unprovisioned-0000}
++
++# --- boot-time mirror --------------------------------------------------------
++# After a reboot DomD's real association is gone (its wpa_supplicant starts
++# INACTIVE) while DomA's station re-associates with the shadow AP on its own,
++# because the saved PSK is already in aps.conf and the framework auto-connects.
++# Nothing in the UI path fires -- the LOCAL handshake succeeds -- so no
++# connect() would be forwarded and DomA would sit on a Wi-Fi with no upstream.
++#
++# So mirror_station() (main loop, every tick) reads the SSID the station is
++# associated with (`iw dev wlan0 link`, decoded by iw_ssid()) and forwards
++# connect(ssid, psk_of ssid) to DomD ONCE per (boot, ssid, psk). The marker file lives
++# in $CONF_DIR (persistent) but carries the kernel boot_id, so a daemon restart does not
++# re-forward and a reboot does. handle_psk() writes the same marker after its own
++# forward, so the UI repair path and the mirror never send the same connect twice. A
++# placeholder PSK is never forwarded, and neither is an SSID $APS has no row for.
++# Kill switch:  setprop persist.vendor.doma.wifi_relay_mirror false
++MIRROR_MARK=${MIRROR_MARK:-$CONF_DIR/mirror.mark}
++BOOTID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
++[ -n "$BOOTID" ] || BOOTID=noboot-$$
++STA_LAST_SSID=""
++# 1 when hostapd.conf has changes that hostapd has not picked up yet, because a
++# station was associated at the time. See flush_pending_restart().
++RESTART_PENDING=0
++# The shipped seed. Why handle_aps consults it: see the seed_psk_of() comment.
++SEED=${SEED:-/vendor/etc/doma-shadow-aps.conf}
++# Whether an incoming aps message may restart hostapd. THE DEFAULT IS auto.
++#   auto (unset / default): restart only when stations_present() is false. While a
++#     station is associated, do not restart; set RESTART_PENDING instead and apply it
++#     on the first tick after it leaves (flush_pending_restart), so an
++#     unattended restart does not drop the user's connection.
++#   false: never touch hostapd on aps (update the conf only). A new SSID starts
++#     beaconing at the next boot (regenerated by doma-shadow-ap) or on a PSK repair.
++#   true : restart even with a station present. THIS CAN DROP DomA'S ONLY WAY IN, so
++#     use it only while sitting in front of the screen.
++#
++# THE VALUE IS getprop'd BY handle_aps FOR EVERY MESSAGE, so a `setprop` takes
++#   effect from the next publication without restarting the relay. The
++#   environment variable BOUNCE_ON_APS takes precedence if set.
++# (A PSK repair -- the restart after the user types a passphrase on screen -- always
++#  happens, independently of this flag.)
++BOUNCE_ON_APS=${BOUNCE_ON_APS:-}
++TAB="$(printf '\t')"
++
++# NOT IN THE virt_wifi FALLBACK. With persist.vendor.doma.shadow_ap not true,
++# doma-shadow-ap hands wlan0 to virt_wifi and creates no shadow AP (no wlan2, no
++# br-shadow), so there is nothing to relay: a publication would only crash-loop hostapd,
++# and the mirror would forward the VirtWifi association to DomD. Idle rather than exit,
++# since init restarts a service that exits. Same property and default as doma-shadow-ap.
++if [ "$(getprop persist.vendor.doma.shadow_ap true)" != "true" ]; then
++    log "persist.vendor.doma.shadow_ap is not true (virt_wifi fallback) -- nothing to relay; idling"
++    while :; do sleep 3600; done
++fi
++
++[ -d "$CONF_DIR" ] || { log "FATAL: $CONF_DIR missing -- start doma_shadow_ap first"; exit 1; }
++[ -e "$CHAN" ]     || { log "FATAL: $CHAN missing -- is the doma.cfg virtio-serial chardev there?"; exit 1; }
++
++mkdir -p "$REQ_DIR" 2>/dev/null
++# init.xenvm-hwsim.rc already creates this as wifi:system 0770 in `on post-fs-data`;
++# this is the fallback for a /data where the directory exists with another
++# owner.
++chown wifi:system "$REQ_DIR" 2>/dev/null || log "WARNING: chown $REQ_DIR failed; the app may not be able to write requests"
++chmod 0770 "$REQ_DIR" 2>/dev/null
++
++# --- helpers -------------------------------------------------------------------------
++
++# psk_of <ssid> -- the PSK currently recorded for an SSID: empty for an open row;
++# returns 1 when $APS has no row for it.
++#
++# THE _k/_v NAMES ARE LOAD-BEARING. Shell functions share one namespace, so a
++# `while read -r s p` in here would overwrite a caller's $s: a caller that loops
++# over SSIDs and calls this on each would see every SSID after the first come
++# back EMPTY (reproduced on the PC). Every variable a helper touches here is
++# _-prefixed for that reason.
++psk_of() {
++    while IFS="$TAB" read -r _k _v; do
++        case "$_k" in ''|'#'*) continue;; esac
++        [ "$_k" = "$1" ] && { printf '%s' "${_v:-}"; return 0; }
++    done < "$APS"
++    return 1
++}
++
++# seed_psk_of <ssid> -- the PSK the shipped seed holds for that SSID; returns 1
++# if there is none.
++#
++# WHY handle_aps CONSULTS THE SEED. A publication that names an SSID $APS lacks
++# gets the seed's PSK for it rather than $PLACEHOLDER_PSK, so a lost $APS cannot
++# turn a seeded AP -- possibly the one DomA's own station is using -- into a
++# placeholder the moment hostapd restarts. doma-shadow-ap's merge brings seed
++# rows back at boot, but it leaves an existing row alone, placeholder or not, so
++# it cannot do this. The committed seed carries only the EXAMPLE-SSID
++# placeholder; this matters for a build whose seed names a real AP.
++seed_psk_of() {
++    [ -s "$SEED" ] || return 1
++    # `|| [ -n "$_sk" ]`: the seed is hand-edited, so do not drop the last line when
++    # it has no trailing newline
++    while IFS="$TAB" read -r _sk _sv || [ -n "${_sk:-}" ]; do
++        case "$_sk" in ''|'#'*) continue;; esac
++        [ "$_sk" = "$1" ] && { printf '%s' "${_sv:-}"; return 0; }
++    done < "$SEED"
++    return 1
++}
++
++# json_esc <string> -- escape a value for embedding in the JSON sent to DomD.
++#
++# NEEDED, NOT COSMETIC. A WPA passphrase is any 8..63 printable ASCII
++# characters, so it may legally contain \ or ". The connect message is parsed on
++# the far side by json.loads() (parse_line() in domd_wifi_agent.py), which
++# rejects or mis-decodes an unescaped one, and the failure would look like "the
++# password is wrong" rather than "the message was malformed". Only \ and " need
++# handling: control characters cannot appear in a passphrase, and DomD's agent
++# publishes no SSID that has one. The \ substitution must run FIRST or it would
++# double the backslashes " introduces.
++json_esc() {
++    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
++}
++
++# write_hostapd_conf -- regenerate $CONF from $APS.
++#
++# THIS IS A SECOND COPY of the generation loop in step 3 of doma-shadow-ap.sh,
++# and the two MUST be kept in sync: both skip the same rows (ssid_hostapd_safe,
++# psk_valid) and write the same stanzas. It is duplicated rather than factored
++# out on purpose: doma-shadow-ap is the path every boot depends on, and making
++# it source one would add a new way for that path to fail. If you change the
++# stanza format, change both and say so in the commit message.
++write_hostapd_conf() {
++    {
++        echo "interface=$AP_IF"
++        echo "bridge=$BR"
++        echo "driver=nl80211"
++        echo "ctrl_interface=$CONF_DIR/sockets"
++        echo "hw_mode=g"
++        echo "channel=6"
++        echo "ieee80211n=1"
++        # Emit `bridge=` in every BSS stanza (see step 3 of doma-shadow-ap.sh).
++        #   Primary sources (this apex is not a prebuilt, IT IS BUILT FROM THIS TREE:
++        #   the binaries at
++        #   device/google/cuttlefish/apex/com.google.cf.wpa_supplicant/Android.bp:28-29
++        #   are //external/wpa_supplicant_8/wpa_supplicant/wpa_supplicant:hostapd):
++        #     external/wpa_supplicant_8/hostapd/config_file.c:2240-2241
++        #         `bridge` is os_strlcpy(bss->bridge, ...), i.e. A PER-BSS FIELD
++        #     same file :871-906, hostapd_config_bss()
++        #         only os_zalloc + hostapd_config_defaults_bss + copying iface/vlan,
++        #         AND IT DOES NOT COPY bridge (nor is a default set anywhere in
++        #         src/ap/ap_config.c)
++        #     src/ap/hostapd.c:1510  conf->bridge[0] ? conf->bridge : NULL
++        #     src/drivers/driver_nl80211.c:9706  the `bridge &&` gate
++        #   => Written once at the top, every BSS after the first has no bridge, so a
++        #   station joining it never completes DHCP. Measured on the board,
++        #   2026-09-07: with the seed SSID sixth, association reached COMPLETED
++        #   / RSSI -30 but IP: null; moved back to the front, wlan0 got
++        #   192.168.10.134/24.
++        _first=1
++        _idx=0
++        while IFS="$TAB" read -r _ssid _psk; do
++            case "$_ssid" in ''|'#'*) continue;; esac
++            # log() writes to stdout, i.e. into $CONF.new here: use stderr.
++            if ! ssid_hostapd_safe "$_ssid"; then
++                log "conf: skip SSID hostapd would reject: $_ssid" >&2
++                continue
++            fi
++            if [ -n "${_psk:-}" ] && ! psk_valid "$_psk"; then
++                log "conf: skip $_ssid: PSK neither 8..63 bytes nor 64 hex" >&2
++                continue
++            fi
++            if [ "$_first" = 1 ]; then
++                _first=0
++            else
++                _idx=$((_idx+1))
++                echo "bss=${AP_IF}_$_idx"
++                echo "bridge=$BR"
++            fi
++            echo "ssid=$_ssid"
++            if [ -n "${_psk:-}" ]; then
++                echo "wpa=2"
++                echo "wpa_key_mgmt=WPA-PSK"
++                echo "rsn_pairwise=CCMP"
++                if psk_is_hex "$_psk"; then
++                    echo "wpa_psk=$_psk"
++                else
++                    echo "wpa_passphrase=$_psk"
++                fi
++            else
++                echo "wpa=0"
++            fi
++        done < "$APS"
++    } > "$CONF.new" || { log "WARNING: cannot write $CONF.new"; return 1; }
++    # SET OWNER AND MODE BEFORE THE mv. rename(2) preserves owner/mode, so this
++    #   removes (a) any instant where a file containing a wpa_passphrase exists as
++    #   root:root 0644, and (b) the "mv succeeded but chown failed, so hostapd cannot
++    #   read it" case.
++    #
++    #   Why the chown is needed: HOSTAPD DROPS PRIVILEGES ITSELF.
++    #   os_program_init() in external/wpa_supplicant_8/src/utils/os_unix.c does
++    #   setgroups({wifi, inet, keystore, log}) -> PR_SET_KEEPCAPS -> setuid, so even
++    #   though init.xenvm-hwsim.rc starts it with `user root` it runs as uid wifi.
++    #   At root:root it repeatedly exits 1 with
++    #   `Could not open configuration file ... for reading`. Measured 2026-09-07:
++    #   12 TIMES, 5.0 s APART (15:25:40 to 15:26:35, matching init's default
++    #   restart_period of 5 s), and after the chown, at 15:26:40, the same file
++    #   reached `wlan2: AP-ENABLED`.
++    #   NOTE that this message is printed for every fopen failure in
++    #   hostapd/config_file.c, SO IT CANNOT DISTINGUISH EACCES FROM ENOENT (that log
++    #   alone is not enough to pin the cause on permissions; what does pin it is the
++    #   A/B: after the chown the same path worked).
++    chown wifi:wifi "$CONF.new" 2>/dev/null || log "WARNING: chown $CONF.new failed"
++    chmod 0660 "$CONF.new" 2>/dev/null || log "WARNING: chmod $CONF.new failed"
++    mv "$CONF.new" "$CONF" || { log "WARNING: cannot replace $CONF"; return 1; }
++}
++
++# stations_present -- 0 if any station is associated with the shadow AP.
++# Used to avoid bouncing hostapd under a connected user; hostapd has no way to add or
++# remove a BSS without a restart, and SIGHUP does not apply bss= changes.
++#
++# hostapd_cli IS NOT IN THIS IMAGE (measured on the board: the apex's bin/hw
++#   holds hostapd and wpa_supplicant only, and no hostapd_cli or wpa_cli exists
++#   under /apex, /vendor or /system; the `binaries` at Android.bp:28-29 is the
++#   single hostapd). So two other methods are tried, cheapest first, and IF
++#   NEITHER CAN BE READ THE ANSWER IS "A STATION IS PRESENT" (i.e. do not
++#   restart -- fall to the safe side).
++#
++#   Why the safe side: with the seed PSK unchanged, `setprop ctl.restart` on the
++#   hostapd service under a connected station was measured on the board to leave
++#   DomA's Wi-Fi not coming back. Whether a restart with the same PSK can be
++#   survived is not established: dnsmasq has a MAC-pinned lease (43200 s), so
++#   the same IP is expected to return, but in that measurement it did not.
++#     1. $STA_CARRIER (/sys/class/net/wlan0/carrier) -- DomA's own station. THIS IS THE
++#        ONLY STATION THERE IS TO PROTECT (DomA's external connectivity is this one
++#        BSS). mac80211 raises carrier on a successful association. Primary source:
++#        netif_carrier_on(sdata->dev) at :3987, the end of ieee80211_set_associated()
++#        (:3908) in the guest kernel's net/mac80211/mlme.c. THIS IS NOT AN INFERENCE:
++#        it reads 1 whichever BSS the station is joined to.
++#     2. $IW (/system/bin/iw) -- really present in the image (system/bin/iw, 280,760 B).
++#        It station-dumps the AP-side netdev. A STATION ON A SECONDARY BSS DOES NOT
++#        SHOW UP in the wlan2 dump, so $AP_IF and the generated ${AP_IF}_N are
++#        enumerated from $NETDEV_DIR.
++#        THIS IS A BONUS THAT ONLY WORKS WHILE THE BOARD IS PERMISSIVE. Under
++#        enforcing the exec is denied, AND NO ALLOW CAN BE WRITTEN FOR IT: iw's label
++#        is iw_exec (system/sepolicy/private/file_contexts:292), but private/iw.te:2
++#        declares `type iw_exec, system_file_type, ...`, and iw_exec IS NOT IN the
++#        exclusion list (shell_exec / toolbox_exec / netutils_wrapper_exec, etc.) of
++#        domain.te's "vendor must not access files on /system" neverallow
++#        => writing the allow is a hard secilc failure and breaks the build (measured
++#        with /system/bin/ip; see the comment in sepolicy/doma_shadow_ap.te). There is
++#        no netutils-wrapper escape either (only ip6tables/iptables/ndc/tc/ip are
++#        wrapped).
++#        => LOSING IT IS HARMLESS: the decision is still reached from carrier in 1
++#        (reading sysfs_net is already allowed in the .te), and if neither can be read
++#        it falls back to "a station is present", i.e. no restart.
++#   An image that ships hostapd_cli could add it, but these two are sufficient.
++stations_present() {
++    _known=0
++    # 1. DomA's own station
++    if [ -r "$STA_CARRIER" ]; then
++        _known=1
++        [ "$(cat "$STA_CARRIER" 2>/dev/null)" = 1 ] && return 0
++    fi
++    # 2. Any other station on any AP-side netdev (wlan2 and wlan2_1..N)
++    if [ -x "$IW" ]; then
++        for _d in "$NETDEV_DIR/$AP_IF" "$NETDEV_DIR/$AP_IF"_*; do
++            [ -d "$_d" ] || continue
++            _sta=$("$IW" dev "${_d##*/}" station dump 2>/dev/null) || continue
++            _known=1
++            [ -n "$_sta" ] && return 0
++        done
++    fi
++    [ "$_known" = 1 ] && return 1
++    # 3. Neither is usable => fall to the safe side (a station is present). Log once.
++    if [ "${NODETECT_LOGGED:-0}" != 1 ]; then
++        NODETECT_LOGGED=1
++        log "stations_present: cannot detect a station (neither $STA_CARRIER nor $IW is usable) -- returning \"station present\" on the safe side; no aps-driven hostapd restart"
++    fi
++    return 0
++}
++
++# sta_is_up -- is DomA's station interface up, i.e. is the Settings Wi-Fi toggle on?
++#
++# WHY ONLY $REQ WAITS ON IT. Turning Wi-Fi off in the DomA Settings must also stop DomD
++# being asked to associate, and a PSK request is the only thing that asks while the
++# station is down (mirror_station already does nothing without carrier). aps
++# publications keep syncing $APS and hostapd.conf: no station can be dropped, and the
++# list is current the moment the toggle comes back on.
++#
++# FLAGS, NOT CARRIER. With the toggle off the framework takes wlan0 down -- measured on
++# RPi4 2026-09-24, flags 0x1003 -> 0x1002 within 1 s -- and carrier then reads -EINVAL
++# (net/core/net-sysfs.c: carrier_show() needs netif_running()). flags is printed "%#x"
++# and IFF_UP is bit 0, so the last hex digit is odd exactly when the interface is up;
++# `case`, because a test operand cannot be hex in mksh. Unreadable (wlan0 not created
++# yet) counts as up.
++sta_is_up() {
++    _fl=$(cat "$STA_FLAGS" 2>/dev/null) || return 0
++    case "$_fl" in
++        0x*[13579bdfBDF]) return 0;;
++        0x*)              return 1;;
++        *)                return 0;;
++    esac
++}
++
++# confirm_hostapd_running -- check that running IS SUSTAINED.
++#
++# WHY IT IS NEEDED (from primary sources):
++#   init's `NotifyStateChange("running")` is fired IN THE PARENT, RIGHT AFTER
++#   THE FORK (system/core/init/service.cpp:817, just after waiting for `setsid`
++#   to complete and before the `... started service` log). It IS UNRELATED to
++#   whether the child then `exit 1`s in config parsing after exec. When the
++#   child dies, the SIGCHLD reaping at :322 clears SVC_RUNNING and :428 fires
++#   `"restarting"`.
++#   => A `getprop init.svc.*` taken immediately after `setprop ctl.restart`
++#   returns IS ALWAYS running, even with an INVALID hostapd.conf. Taken as
++#   success, it would log "hostapd restarted via init (N SSID(s))" and reset
++#   `RESTART_PENDING` to 0 while hostapd crash-loops every 5 s and the shadow AP
++#   -- DomA's only way in -- is gone. That covers EVERY CASE THAT MAKES THE CONF
++#   INVALID, including a wrong owner or mode (the measured "12 times, 5.0 s
++#   apart" in write_hostapd_conf).
++#
++# init's `restart_period` defaults to 5 s, so sampling a 3 s window every 0.5 s
++# (6 samples) is guaranteed to catch a non-running state at least once during a
++# crash loop. The values can be overridden from the environment.
++# The hostapd init service, vendor.doma_shadow_hostapd in init.xenvm-hwsim.rc.
++#   `setprop ctl.restart` exits non-zero when init has no service of that name:
++#   init's control-message handler replies PROP_ERROR_HANDLE_CONTROL_MESSAGE,
++#   and bionic's __system_property_set() and toolbox's setprop turn that into a
++#   failed exit (system/core/init/init.cpp,
++#   bionic/libc/bionic/system_property_set.cpp,
++#   system/core/toolbox/setprop.cpp). init replies only to a vendor above API
++#   level Q (SelinuxGetVendorAndroidVersion() in property_service.cpp); this
++#   board's vendor has ro.vendor.build.version.sdk=37.
++HOSTAPD_SVC=${HOSTAPD_SVC:-vendor.doma_shadow_hostapd}
++
++kick_hostapd() {
++    setprop ctl.restart "$HOSTAPD_SVC"
++}
++
++# svc_is_running -- is the hostapd service running?
++#
++# THIS DOES NOT CONTRADICT the "do not add pidof" note in restart_hostapd. What that
++#   forbids is ANDing pidof into the success condition (which creates a false-negative
++#   window until the apex's hostapd execs, plus a window where an old pid is caught).
++#   Here it is a last resort used ONLY WHEN init.svc READS EMPTY -- a
++#   substitute, not an OR. For vendor.doma_shadow_hostapd the property is
++#   readable from this domain (vendor_default_prop; see the service's comment in
++#   init.xenvm-hwsim.rc), so after a ctl.restart it is not empty and the
++#   fallback is not taken. It stays for a HOSTAPD_SVC given another name.
++#   The pidof route is weak (it can catch the moment before init has finished killing
++#   the old process), but the way it errs is A FALSE WARNING; it never manufactures a
++#   false success. The real decision is confirm_hostapd_running's 3 s window, so if
++#   running is not sustained it ends in a WARNING anyway.
++svc_is_running() {
++    _st=$(getprop "init.svc.$HOSTAPD_SVC" 2>/dev/null)
++    if [ -n "$_st" ]; then
++        [ "$_st" = running ]
++        return $?
++    fi
++    pidof hostapd >/dev/null 2>&1
++}
++
++CONFIRM_SAMPLES=${CONFIRM_SAMPLES:-6}
++CONFIRM_SLEEP=${CONFIRM_SLEEP:-0.5}
++confirm_hostapd_running() {
++    _n=0
++    while [ "$_n" -lt "$CONFIRM_SAMPLES" ]; do
++        sleep "$CONFIRM_SLEEP"
++        svc_is_running || return 1
++        _n=$((_n+1))
++    done
++    return 0
++}
++
++# restart_hostapd -- make hostapd read the new $CONF.
++#
++# GO THROUGH init. HOSTAPD IN THIS IMAGE IS AN INIT SERVICE ($HOSTAPD_SVC),
++#   started in the foreground by its init.xenvm-hwsim.rc service (with neither
++#   -B nor -P), so no pid file exists to kill it by, and a second hostapd -B
++#   started here fails because wlan2 is in use: the new SSIDs would go into
++#   hostapd.conf and never make it into a beacon. This follows step 5 of
++#   doma-shadow-ap.sh (setprop ctl.* plus a wait), and consults init.svc.<name>
++#   rather than pidof alone, because with pidof alone there is a moment where
++#   the old pid is caught.
++restart_hostapd() {
++    # LOOK AT `init.svc.$HOSTAPD_SVC` ONLY. Do not AND in `pidof hostapd` (as the
++    #   svc_is_running comment says, pidof is a substitute for when init.svc cannot be
++    #   read, not an additional success condition).
++    #   `setprop ctl.*` DOES NOT RETURN UNTIL INIT HAS FINISHED HANDLING IT
++    #   (SendControlMessage() in property_service.cpp Releases the client's socket fd
++    #   and hands it to init, and init replies AFTER running
++    #   HandleControlMessage()). So by the time setprop returns, the old instance has
++    #   already been SIGKILLed and the state has been updated.
++    #   ANDing `pidof hostapd` in here would produce a false negative during the window
++    #   until the apex's hostapd has started and its process name is visible, and
++    #   conversely CREATE A WINDOW WHERE THE OLD PID IS CAUGHT.
++    kick_hostapd || {
++        log "WARNING: ctl.restart $HOSTAPD_SVC failed (the rc has no such service)"
++        RESTART_PENDING=1
++        return 1
++    }
++    # THIS WAIT STALLS THE MAIN LOOP FOR UP TO 10 s (the caller polls every 2 s). If
++    #   the hvc receive buffer overflows, one DomD publication can be lost. In practice
++    #   the apex's hostapd reaches running in under a second, so this normally exits in
++    #   less than 1 s.
++    #   Shortening it would mean restructuring to "fire, return, and look at init.svc on
++    #   the next tick", which moves where the success log comes from, so it is left as
++    #   is for now.
++    _i=0
++    while [ $_i -lt 100 ]; do        # up to 10 s; the apex's hostapd comes up in under a second
++        if svc_is_running; then
++            # Do not call this a success yet (see the confirm_hostapd_running comment).
++            if confirm_hostapd_running; then
++                RESTART_PENDING=0
++                log "hostapd restarted via init ($(grep -c '^ssid=' "$CONF") SSID(s))"
++                return 0
++            fi
++            RESTART_PENDING=1
++            log "WARNING: hostapd dies right after starting (init.svc does not sustain running). Check $CONF (is it owned wifi:wifi 0660? is wpa_passphrase 8..63 bytes?)"
++            return 1
++        fi
++        _i=$((_i+1)); sleep 0.1
++    done
++    # ON FAILURE, SET RESTART_PENDING, so flush_pending_restart retries on a
++    #   later tick. The hostapd service is neither critical nor updatable, so
++    #   repeated failures cannot reboot the device.
++    RESTART_PENDING=1
++    log "WARNING: hostapd restart failed (svc=$HOSTAPD_SVC init.svc=$(getprop "init.svc.$HOSTAPD_SVC")); see $CONF"
++    return 1
++}
++
++# --- handlers ------------------------------------------------------------------------
++
++# ssid_hostapd_safe <ssid> -- false for a name hostapd.conf cannot carry.
++#
++# ONE bad SSID makes hostapd reject the WHOLE config, and with it the shadow AP
++# and all of DomA's Wi-Fi: measured 2026-09-17, an AP beaconing 20 NUL bytes
++# left the shadow AP restarting every 5 s. hostapd takes `ssid=` byte for byte
++# (hostapd/config_file.c copies it with os_memcpy) and refuses more than 32
++# bytes; that SSID's escaped form, \x00 twenty times, is 80. A backslash means
++# the name is still escaped -- DomD's JSON escapes a quote or a backslash in an
++# SSID, and the sed in handle_aps does not undo that -- so it is refused as
++# well. Count BYTES: mksh's ${#s} counts characters under UTF-8.
++# doma-shadow-ap.sh carries the same function.
++ssid_hostapd_safe() {
++    case "$1" in ''|*\\*) return 1;; esac
++    [ "$(printf '%s' "$1" | wc -c)" -le 32 ]
++}
++
++# psk_is_hex <psk> -- a raw PSK: exactly 64 hex digits. hostapd.conf carries it
++# as wpa_psk=, and DomD's agent sends it to wpa_supplicant unquoted.
++psk_is_hex() {
++    case "$1" in ''|*[!0-9A-Fa-f]*) return 1;; esac
++    [ "${#1}" -eq 64 ]
++}
++
++# psk_valid <psk> -- is this a PSK both hostapd and DomD's wpa_supplicant
++# accept?
++#
++# Two forms exist. A passphrase is 8..63 BYTES (count bytes, as above). A raw
++# PSK is 64 hex digits (psk_is_hex): AAOS's Wi-Fi dialog LEGITIMATELY ACCEPTS
++# ONE and stores it unquoted
++# (packages/apps/Car/Settings/.../WifiUtil.java:285-288 puts it into
++# preSharedKey without quotes when `password.matches("[0-9A-Fa-f]{64}")`), and
++# hostapd takes it as wpa_psk=
++# (external/wpa_supplicant_8/hostapd/config_file.c:2923-2934), which is how both
++# generators write it.
++#
++# Anything else is refused BEFORE it reaches $APS or DomD.
++# config_file.c:2910-2916 rejects a wpa_passphrase outside 8..63, and one error
++# makes hostapd throw the WHOLE config away and exit 1; in $APS (on /data) that
++# would happen at every boot and take the shadow AP -- DomA's way in -- with it.
++# DomD's wpa_supplicant, for its part, prints a passphrase it refuses into its
++# log. $REQ is wifi:system 0770 and is writable by more than just the app, so A
++# GUARD IN THE APP ALONE IS NOT THE LAST LINE OF DEFENCE.
++psk_valid() {
++    psk_is_hex "$1" && return 0
++    _n=$(printf '%s' "$1" | wc -c)
++    [ "$_n" -ge 8 ] && [ "$_n" -le 63 ]
++}
++
++# iw_ssid <SSID as iw prints it> -- the SSID's real bytes; returns 1 for one
++# that has a control byte.
++#
++# `iw dev wlan0 link` prints the SSID through print_ssid_escaped()
++# (external/iw/util.c): each byte that is not printable ASCII, each backslash,
++# and a space at either end come out as \x and two lower-case hex digits, and
++# nothing else is escaped. $APS holds the real bytes -- DomD's agent publishes
++# SSIDs as UTF-8 text -- so iw's form of a name such as a Japanese one matches
++# no row. Undecoded, psk_of would miss it and the mirror would send DomD's
++# agent the escaped text with an empty PSK, which the agent would join as an
++# open network in place of the real one. Every backslash iw prints starts such an
++# escape, so each is rewritten as the octal \0NNN that printf's %b decodes, in
++# toybox's printf (the one mksh runs on the device) as in bash's, dash's and
++# busybox's. A control byte is refused rather than decoded: DomD's agent
++# publishes no SSID that has one, and a NUL or a newline would not survive
++# $(...).
++iw_ssid() {
++    _in=$1; _out=""
++    while :; do
++        case "$_in" in *\\x*) ;; *) break;; esac
++        _out=$_out${_in%%\\x*}
++        _in=${_in#*\\x}
++        case "$_in" in [0-9a-f][0-9a-f]*) ;; *) return 1;; esac
++        _c=$((0x${_in%"${_in#??}"}))
++        [ "$_c" -ge 32 ] && [ "$_c" -ne 127 ] || return 1
++        _in=${_in#??}
++        _out=$_out\\0$((_c / 64))$((_c / 8 % 8))$((_c % 8))
++    done
++    printf '%b' "$_out$_in"
++}
++
++# sta_link_ssid -- the SSID DomA's own station is associated with, decoded by
++# iw_ssid(); iw's own form if iw_ssid() refuses it (that matches no row of
++# $APS); empty when the station is not associated.
++sta_link_ssid() {
++    _raw=$("$IW" dev "$STA_IF" link 2>/dev/null | sed -n 's/^[[:space:]]*SSID: //p' | head -n 1)
++    [ -n "$_raw" ] || return 0
++    iw_ssid "$_raw" || printf '%s' "$_raw"
++}
++
++# current_sta_ssid -- the SSID DomA's own station is associated with, or empty.
++current_sta_ssid() {
++    if [ -n "${STA_LAST_SSID:-}" ]; then
++        printf '%s' "$STA_LAST_SSID"
++        return 0
++    fi
++    [ -x "$IW" ] || return 0
++    if [ -r "$STA_CARRIER" ] && [ "$(cat "$STA_CARRIER" 2>/dev/null)" != 1 ]; then
++        return 0
++    fi
++    sta_link_ssid
++}
++
++# in_ssid_list <ssid> <newline-separated list>
++in_ssid_list() {
++    _needle=$1
++    while IFS= read -r _hay; do
++        [ "$_hay" = "$_needle" ] && return 0
++    done <<EOF
++$2
++EOF
++    return 1
++}
++
++# handle_aps <json-line> -- make $APS mirror the SSIDs DomD can currently hear.
++#
++# Each publication REPLACES the list, so the picker shows what is actually in
++# range, and a row that stops being published does not stay in hostapd.conf.
++#
++# Two kinds of row survive a publication that does not mention them:
++#   * the SSID DomA's own station is associated with -- dropping it would delete
++#     the shadow AP DomA is connected to, taking down the link this session runs
++#     over;
++#   * seeded rows (/vendor/etc/doma-shadow-aps.conf), which must be joinable
++#     even before the first scan arrives.
++# Existing rows keep their order and their PSK, so the primary BSS does not move
++# and no learned credential is lost; only genuinely absent APs go away.
++handle_aps() {
++    # Extract every "ssid":"..." value. sed, not a JSON parser: toybox has none
++    # and the producer is one known program. An SSID with a quote or a backslash
++    # arrives escaped, and ssid_hostapd_safe refuses it below.
++    _ssids=$(printf '%s\n' "$1" \
++            | tr ',' '\n' | sed -n 's/.*"ssid"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
++    [ -n "$_ssids" ] || return 0
++    _added=0
++    _dropped=0
++    _sta=$(current_sta_ssid)
++    _tmp=$APS.sync.$$
++    # In a subshell: `:` is a special builtin, and mksh ends the function on a
++    #   failed redirection onto one before `||` runs (see doma-shadow-ap.sh's
++    #   seed merge).
++    if ! ( : > "$_tmp" ) 2>/dev/null; then
++        log "WARNING: aps: cannot write $_tmp"
++        return 0
++    fi
++
++    # 1. existing rows, in order, if still in range (or protected)
++    while IFS="$TAB" read -r _k _v || [ -n "${_k:-}" ]; do
++        case "$_k" in ''|'#'*) continue;; esac
++        if in_ssid_list "$_k" "$_ssids" \
++           || { [ -n "$_sta" ] && [ "$_k" = "$_sta" ]; } \
++           || seed_psk_of "$_k" >/dev/null 2>&1; then
++            printf '%s%s%s\n' "$_k" "$TAB" "${_v:-}" >> "$_tmp"
++        else
++            _dropped=$((_dropped+1))
++        fi
++    done < "$APS"
++
++    # 2. SSIDs in this publication that are not in the list yet
++    # DO NOT WRITE `for _new in $_ssids`. With the default IFS, AN SSID
++    #   CONTAINING A SPACE IS SPLIT into two rows, neither of them the real
++    #   name. A pipe would lose $_added in a subshell, hence the here-document.
++    #   AN SSID CONTAINING A COMMA is silently dropped by the tr above.
++    while IFS= read -r _new; do
++        [ -n "$_new" ] || continue
++        if ! ssid_hostapd_safe "$_new"; then
++            log "aps: skip SSID hostapd would reject (whole config would fail): $_new"
++            continue
++        fi
++        _seen=0
++        while IFS="$TAB" read -r _k2 _v2 || [ -n "${_k2:-}" ]; do
++            [ "$_k2" = "$_new" ] && { _seen=1; break; }
++        done < "$_tmp"
++        [ "$_seen" = 1 ] && continue
++        # If the seed holds a PSK for this SSID, use it rather than the
++        #   placeholder; see the seed_psk_of() comment.
++        if _seedpsk=$(seed_psk_of "$_new"); then
++            printf '%s%s%s\n' "$_new" "$TAB" "$_seedpsk" >> "$_tmp"
++            log "aps: registered $_new with the seed's PSK (not a placeholder)"
++        else
++            printf '%s%s%s\n' "$_new" "$TAB" "$PLACEHOLDER_PSK" >> "$_tmp"
++        fi
++        _added=$((_added+1))
++    done <<EOF
++$_ssids
++EOF
++
++    # 3. nothing to do unless the list actually changed
++    if cmp -s "$_tmp" "$APS" 2>/dev/null; then
++        rm -f "$_tmp"
++        return 0
++    fi
++    # By rename, as handle_psk does: this daemon runs on every boot, so init's
++    # SIGKILL at shutdown can land mid-write, and a truncated $APS loses every learned
++    # PSK. The temporary file is in the same directory, so it has the same label.
++    chmod 0660 "$_tmp" 2>/dev/null
++    if ! mv -f "$_tmp" "$APS"; then
++        log "WARNING: aps: could not update $APS"
++        rm -f "$_tmp"
++        return 0
++    fi
++    log "aps: synced to the current scan (+$_added -$_dropped, now $(grep -c . "$APS") row(s))"
++    write_hostapd_conf || return 0
++    # Read per message, so a setprop takes effect without restarting the relay.
++    #   The environment variable BOUNCE_ON_APS takes precedence if set.
++    _bounce=${BOUNCE_ON_APS:-$(getprop persist.vendor.doma.wifi_relay_bounce_on_aps 2>/dev/null)}
++    if [ "$_bounce" = false ]; then
++        log "aps: conf updated only (...wifi_relay_bounce_on_aps=false); it reaches the beacon at the next boot or on a PSK repair"
++    elif [ "$_bounce" != true ] && stations_present; then
++        RESTART_PENDING=1
++        log "aps: a station is associated -- deferring the hostapd restart (the conf is already updated; it will be applied once the station leaves)"
++    else
++        restart_hostapd
++    fi
++}
++
++# flush_pending_restart -- apply a deferred conf once the last station has gone.
++#
++# WITHOUT THIS A DEFERRAL CAN LAST FOREVER. A publication that arrives while the
++# user is connected defers the restart, and the next one finds nothing new:
++# handle_aps returns as soon as cmp finds $APS unchanged, before reaching any
++# restart, and handle_psk cannot fire for an SSID the user cannot see. Checked
++# from the main loop instead, so the pending conf is applied within one tick (<=
++# 2 s) of the station disconnecting.
++flush_pending_restart() {
++    [ "$RESTART_PENDING" = 1 ] || return 0
++    # NOT WHILE doma_shadow_ap IS ITSELF BRINGING hostapd UP. Both run at
++    # sys.boot_completed, and on the board a deferred restart that landed
++    # between the oneshot's `ctl.start` and its confirmation left the log saying
++    # "hostapd died right after start", the bridge up late and a second restart
++    # needed. The oneshot reports `stopped` once it has exited; defer one tick
++    # until then.
++    [ "$(getprop init.svc.doma_shadow_ap 2>/dev/null)" = running ] && return 0
++    stations_present && return 0
++    log "applying deferred hostapd conf (no station associated)"
++    restart_hostapd
++}
++
++# handle_psk <ssid> <psk> -- the user typed a passphrase; make it work.
++#
++# Order matters: hostapd must know the PSK BEFORE the app re-triggers the
++# connect, or the retry fails the same way. DomD is told in parallel so the real
++# association is under way while the local one completes.
++handle_psk() {
++    _s=$1; _p=$2
++    # A PSK psk_valid refuses goes nowhere, neither into $APS nor to DomD, and
++    #   the log names neither the value nor its length.
++    if [ -n "${_p:-}" ] && ! psk_valid "$_p"; then
++        log "WARNING: psk: PSK for $_s is not 8..63 bytes or 64 hex; dropped"
++        return 0
++    fi
++    cur=$(psk_of "$_s" 2>/dev/null) || cur=""
++    if [ "$cur" = "$_p" ]; then
++        log "psk: $_s already current; only forwarding to DomD"
++    else
++        # Rewrite just this SSID's row with awk, because the PSK may contain characters
++        # that would confuse sed's replacement.
++        #
++        # VALUES COME THROUGH ENVIRON, NOT -v. awk processes escape sequences in
++        # a -v assignment, so `-v p='a\\b'` reaches the program as `a\b`: a
++        # passphrase containing a backslash would be corrupted, and since the
++        # corrupted value would land in BOTH aps.conf and hostapd.conf, the
++        # local handshake would succeed while the real AP rejected it
++        # (reproduced on the PC). ENVIRON does no such processing.
++        RELAY_SSID=$_s RELAY_PSK=$_p awk -F'\t' 'BEGIN{OFS="\t"; s=ENVIRON["RELAY_SSID"]; p=ENVIRON["RELAY_PSK"]}
++            /^#/ || NF==0 { print; next }
++            $1==s { print s, p; seen=1; next }
++            { print }
++            END { if (!seen) print s, p }' "$APS" > "$APS.new" && mv "$APS.new" "$APS"
++        chmod 0660 "$APS" 2>/dev/null
++        # If generating the conf failed, do not touch hostapd. `ctl.restart` is a
++        #   SIGKILL, so dropping it while the old conf is still in place gains nothing
++        #   and merely loses DomA's only way in.
++        #   The connect forward below (handing the real PSK to DomD, the only route to
++        #   the real AP) MUST still run even if this fails. Do not return here.
++        if write_hostapd_conf; then
++            restart_hostapd
++        else
++            log "WARNING: could not update hostapd.conf, so hostapd is not restarted (the connect is still forwarded)"
++        fi
++    fi
++    # Do not write `A && log ... || log ...` (see log() at the top).
++    if printf '{"t":"connect","ssid":"%s","psk":"%s"}\n' "$(json_esc "$_s")" "$(json_esc "$_p")" >&3; then
++        log "psk: forwarded connect($_s) to DomD"
++        mirror_mark_write "$_s" "$_p"      # the mirror must not send this connect again
++    else
++        log "WARNING: could not write connect($_s) to $CHAN"
++    fi
++}
++
++# --- boot-time mirror ------------------------------------------------------------------
++# See the MIRROR_MARK block near the top for why this exists.
++mirror_mark_write() {
++    if printf '%s\t%s\t%s\n' "$BOOTID" "$1" "$2" > "$MIRROR_MARK.new" 2>/dev/null \
++        && mv "$MIRROR_MARK.new" "$MIRROR_MARK" 2>/dev/null; then
++        chmod 0600 "$MIRROR_MARK" 2>/dev/null
++    else
++        log "WARNING: cannot write $MIRROR_MARK (the mirror may forward again after a daemon restart)"
++    fi
++}
++
++# mirror_marked <ssid> <psk> -- was exactly this connect already forwarded this boot?
++mirror_marked() {
++    [ -r "$MIRROR_MARK" ] || return 1
++    _mb=""; _ms=""; _mp=""
++    IFS="$TAB" read -r _mb _ms _mp < "$MIRROR_MARK" || return 1
++    [ "$_mb" = "$BOOTID" ] && [ "$_ms" = "$1" ] && [ "$_mp" = "$2" ]
++}
++
++mirror_station() {
++    [ "$(getprop persist.vendor.doma.wifi_relay_mirror 2>/dev/null)" != false ] || return 0
++    [ -x "$IW" ] || return 0
++    # Gate on the carrier bit before spawning iw: in the doma_shadow_ap domain
++    # each iw exec logs ~8 avc denials (iw_exec execute/map,
++    # netlink_generic_socket create/setopt), and running it on every 2 s tick
++    # overran the audit rate limit on the board ("audit: rate limit exceeded").
++    # iw runs only while the station has carrier and the SSID is not yet known,
++    # i.e. once per association.
++    if [ -r "$STA_CARRIER" ] && [ "$(cat "$STA_CARRIER" 2>/dev/null)" != 1 ]; then
++        STA_LAST_SSID=""
++        return 0
++    fi
++    [ -n "$STA_LAST_SSID" ] && return 0
++    _ss=$(sta_link_ssid)
++    if [ -z "$_ss" ]; then
++        # Not associated: re-arm so the NEXT association is a fresh event (roaming to
++        # another shadow SSID, or the framework cycling Wi-Fi).
++        STA_LAST_SSID=""
++        return 0
++    fi
++    [ "$_ss" = "$STA_LAST_SSID" ] && return 0
++    STA_LAST_SSID=$_ss
++    # No row, no connect. The shadow AP beacons only what $APS lists, so there is
++    # no PSK to pair such a name with, and a connect with an empty one would make
++    # DomD's agent replace its real network with an open one of that name.
++    if ! _pk=$(psk_of "$_ss" 2>/dev/null); then
++        log "mirror: station on $_ss, which aps.conf has no row for; not forwarding"
++        return 0
++    fi
++    if [ "$_pk" = "$PLACEHOLDER_PSK" ]; then
++        log "mirror: station on $_ss but aps.conf holds only the placeholder PSK; leaving it to the psk repair path"
++        return 0
++    fi
++    if mirror_marked "$_ss" "$_pk"; then
++        log "mirror: station on $_ss; connect already forwarded this boot"
++        return 0
++    fi
++    # An empty $_pk is an open row of $APS.
++    if [ -n "$_pk" ]; then _how=given; else _how=none; fi
++    # Do not fold this into `A && log ... || log ...` (see log() at the top).
++    if printf '{"t":"connect","ssid":"%s","psk":"%s"}\n' "$(json_esc "$_ss")" "$(json_esc "$_pk")" >&3; then
++        log "mirror: station associated with $_ss -> forwarded connect($_ss) to DomD (psk $_how)"
++        mirror_mark_write "$_ss" "$_pk"
++    else
++        log "WARNING: mirror: could not write connect($_ss) to $CHAN"
++    fi
++}
++
++# --- main loop -----------------------------------------------------------------------
++# 3<> so the same descriptor reads the agent's publications and writes the connect
++# requests; virtio-serial is bidirectional on one node.
++# DO NOT HANG `|| log FATAL` OFF `exec`. `exec` is a POSIX special builtin ("*=exec"
++#   in mksh's external/mksh/src/funcs.c), and A FAILED REDIRECTION ONTO A SPECIAL
++#   BUILTIN MAKES MKSH TERMINATE THE WHOLE SCRIPT (iosetup() failure in exec.c ->
++#   errorfz() -> LERROR -> exit 1 for a non-interactive shell). In other words the
++#   right-hand side of `||` never runs, and A MISCONFIGURED CHAN TURNS INTO THE
++#   INSCRUTABLE SYMPTOM "restarting every 10 s without a single log line".
++#   init then logs only `process with updatable components 'doma_wifi_relay'
++#   exited 4 times in 4 minutes`. So TRY THE OPEN IN A SEPARATE PROCESS BEFORE
++#   THE exec:
++#   inside a subshell, even a special builtin's failure stays in the subshell.
++if ! ( exec 3<> "$CHAN" ) 2>/dev/null; then
++    log "FATAL: cannot open $CHAN read-write (check that it exists and whether it is an hvc or a vport node)"
++    exit 1
++fi
++exec 3<> "$CHAN"
++
++# RAW MODE. Without it BOTH directions break: DomD's publication and the connect
++# requests this script sends. Established on the board 2026-09-22.
++#
++#   $CHAN is a virtconsole port, so Linux attaches a TTY to the hvc node, and a TTY
++#   defaults to cooked with ECHO on:
++#     (1) ECHO   the JSON DomD writes becomes input to the TTY and is echoed straight
++#                back out to DomD. The agent then reads its own aps message, cut at
++#                whatever TTY buffer boundary it hit, and says so every time:
++#                  domd-wifi-agent: ignoring malformed line:
++#                    b'{"t": "aps", "v": [{"ssid": "<SSID-WPA3>", ... "dbm": -43},'
++#                The echo also occupies the line, so the agent's own writes back up:
++#                  domd-wifi-agent: channel write failed (timed out); reconnecting
++#                and OUR connect requests never reach it. The DomA side reports
++#                  psk: forwarded connect(<SSID-B>) to DomD
++#                while on the DomD side `wpa_cli list_networks` is empty and
++#                wpa_state stays INACTIVE -- i.e. the AP list is right and the guest
++#                still cannot get out.
++#     (2) onlcr  LF on output becomes CRLF, which dirties the newline framing of the
++#                newline-delimited JSON.
++#     (3) icrnl  CR on input becomes LF. Together with (2) a line splits twice.
++#     (4) icanon line editing is on, so ^C/^D/^U are interpreted as data. They do not
++#                appear in the JSON, but they can appear in a PSK.
++#
++#   Applied to fd 3, NOT to the path. `stty -F "$CHAN"` works too, but that opens the
++#   node a second time, and termios resets to the default on the last close -- which
++#   produces the confusing state where typing stty by hand fixes it and the service
++#   reopening the node breaks it again. Applied to fd 3 the setting lives as long as
++#   the fd does.
++#   NOT fatal. On a system without a working stty the JSON still flows (badly), and
++#   exiting here would take DomA's Wi-Fi away entirely. Warn and carry on.
++if stty raw -echo <&3 2>/dev/null; then
++    log "chan: $CHAN set to raw/-echo"
++else
++    log "WARNING: chan: $CHAN could not be set raw; expect 'ignoring malformed line' and 'channel write failed' on the DomD side, and connect requests may not arrive"
++fi
++
++# END WHATEVER THE ECHO LEFT ON THE OTHER SIDE. Between the `exec 3<>` above and the
++# stty, the TTY is still cooked with ECHO on, and the node has had no reader until
++# this script opened it, so DomD's publications have queued up and part of them is
++# echoed straight back. That fragment has no newline of its own: it waits in the
++# agent's receive buffer and corrupts the next line that arrives. Measured on RPi4
++# 2026-09-23 -- the session's one connect request reached DomD as
++#     domd-wifi-agent: ignoring malformed line: b'{{"t":"connect",...}'
++# DomD never associated, and DomA had Wi-Fi with no Internet. One newline ends
++# the fragment as a line of its own, which the agent drops, so the first real
++# request arrives clean. (The agent also recovers a message from behind such a
++# fragment; this keeps the channel clean for an agent that does not.)
++printf '\n' >&3 2>/dev/null || log "WARNING: chan: could not write the flushing newline to $CHAN"
++
++log "started (chan=$CHAN aps=$APS req=$REQ)"
++
++# Buffer that carries an incomplete line over. Details in the else branch below.
++LINEBUF=""
++# The last sta_is_up() answer, so the log line appears on a change only.
++WIFI_UP_LAST=""
++while :; do
++    # 2 s so a request file dropped by the app is picked up promptly; the agent
++    # publishes every 20 s so nothing is lost by not blocking on it.
++    line=""
++    if read -t 2 -r line <&3 2>/dev/null; then
++        # Re-attach the incomplete part from the previous pass at the front
++        line=$LINEBUF$line; LINEBUF=""
++        # DISPATCH ON THE PARSED VALUE, NOT A SUBSTRING. The producer is
++        # json.dumps() (main() in domd_wifi_agent.py), whose default separators
++        # are (', ', ': '), so the wire format is {"t": "aps", "v": [...]} --
++        # with a space after every colon -- and a pattern such as *'"t":"aps"'*
++        # never matches it. This sed and the ssid extraction in handle_aps both
++        # allow [[:space:]]* around the colon.
++        _t=$(printf '%s' "$line" \
++             | sed -n 's/.*"t"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p')
++        case "$_t" in
++            # NOT WHILE doma_shadow_ap IS STILL RUNNING. init starts this daemon right
++            # after it, and the publications DomD queued while nothing read $CHAN arrive
++            # at once: handle_aps would then write $APS and hostapd.conf under the
++            # oneshot's seed merge, and its restart would race the oneshot's ctl.start
++            # (the flush below defers for the same reason). The next publication
++            # is at most 20 s away.
++            aps)   if [ "$(getprop init.svc.doma_shadow_ap 2>/dev/null)" = running ]; then
++                       log "aps: doma_shadow_ap is still bringing the shadow AP up -- skipping this publication"
++                   else
++                       handle_aps "$line"
++                   fi;;
++            state) log "state: $line";;
++            '')    [ -z "$line" ] || log "ignoring: $(printf '%s' "$line" | cut -c1-120)";;
++            *)     log "ignoring type $_t";;
++        esac
++    else
++        # EVEN ON TIMEOUT, `read` LEAVES WHAT IT MANAGED TO READ IN THE VARIABLE (both
++        #   bash and mksh do). Discarding it here would LOSE A WHOLE PUBLICATION, with
++        #   the remainder surfacing on the next pass as `ignoring: <fragment>`. DomD on
++        #   the device emits one ~450 B line every 20 s, so this can happen any time a
++        #   line straddles the 2 s window.
++        #   Reproduced on the PC under mksh (not under bash): a publication cut
++        #   by the timeout surfaced as `ignoring: <fragment>` and lost its
++        #   SSIDs. => Carry it over and concatenate with the next read.
++        if [ -n "${line:-}" ]; then
++            LINEBUF=$LINEBUF$line
++            # Do not grow without bound for a broken producer that emits no newline
++            if [ ${#LINEBUF} -gt 65536 ]; then
++                log "WARNING: the incomplete line exceeded 64 KiB, discarding it (the producer is not emitting newlines)"
++                LINEBUF=""
++            fi
++        fi
++    fi
++
++    if sta_is_up; then _up=1; else _up=0; fi
++    if [ "$_up" != "$WIFI_UP_LAST" ]; then
++        if [ "$_up" = 1 ]; then
++            log "wifi: $STA_IF is up (Settings toggle on) -- relaying to DomD"
++        else
++            log "wifi: $STA_IF is down (Settings toggle off) -- holding PSK requests; the AP list keeps syncing"
++        fi
++        WIFI_UP_LAST=$_up
++    fi
++
++    # A request stays in place while the toggle is off, and one left from the previous
++    # boot waits for doma_shadow_ap to finish, as the publications above do: until then
++    # wlan0 may not exist, so sta_is_up cannot tell, and handle_psk's restart would race
++    # the oneshot's.
++    if [ "$_up" = 1 ] && [ -s "$REQ" ] && [ "$(getprop init.svc.doma_shadow_ap 2>/dev/null)" != running ]; then
++        # Move before reading so a request cannot be handled twice if hostapd's
++        # restart takes longer than the poll interval.
++        mv "$REQ" "$REQ.busy" 2>/dev/null || continue
++        while IFS="$TAB" read -r verb a b; do
++            case "$verb" in
++                psk) [ -n "${a:-}" ] && handle_psk "$a" "${b:-}";;
++                '')  ;;
++                *)   log "unknown request verb: $verb";;
++            esac
++        done < "$REQ.busy"
++        rm -f "$REQ.busy"
++    fi
++
++    mirror_station
++    flush_pending_restart
++done
+diff --git a/xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc b/xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc
+new file mode 100644
+index 0000000..91a1160
+--- /dev/null
++++ b/xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc
+@@ -0,0 +1,229 @@
++# SPDX-License-Identifier: Apache-2.0
++#
++# Shadow-AP Wi-Fi for AAOS: simulated radios in this guest, beaconing the SSIDs DomD
++# really sees. See /vendor/bin/doma-shadow-ap for the full rationale.
++#
++# STARTED AT sys.boot_completed. The service stays `disabled` so init's
++# class_start never touches it; the property trigger below is the only thing
++# that starts it.
++#
++# THE OWNER OF wlan0 IS SELECTED BEFORE ANYTHING IS TOUCHED, because taking
++# wlan0 from virt_wifi is one-way for a running system: doma-shadow-ap's first
++# act is to read persist.vendor.doma.shadow_ap (default true) and, if it is not
++# true, to `exec setup_wifi --interface=eth1`. Recovery on hardware is then
++#
++#     setprop persist.vendor.doma.shadow_ap false && reboot
++#
++# which costs a reboot and no SD rewrite, and lands on virt_wifi.
++#
++# CONSEQUENCE -- DomA's address. eth1 becomes a br-shadow port at boot, so the
++# .10.13 reservation DomD's dnsmasq pins to eth1's MAC is never answered; DomA
++# takes its lease on wlan0 instead. The Xen PV console is unaffected.
++#
++# DomD's dnsmasq reserves 192.168.10.15 for wlan0 (sodev-net.inc defines
++# XT_DOMA_WLAN0_{MAC,PERM_MAC,IP} and the dnsmasq bbappend ships the dhcp-host
++# line), but only for the MACs that line lists, and the station does not use the
++# hwsim perm_addr: CuttlefishWifiOverlay (inherited via
++# cuttlefish/shared/device.mk -> trout -> epam) sets
++# config_wifi_connected_mac_randomization_supported=true, so the station
++# associates with a per-SSID PERSISTENT RANDOMIZED MAC. XT_DOMA_WLAN0_MAC ships
++# empty (sodev-net.inc says why), so by default DomA takes an address from the
++# DHCP range; `adb connect 192.168.10.15:5555` works once XT_DOMA_WLAN0_MAC is
++# set to the MAC the station uses for that SSID (sodev-net.inc says how). adb
++# over vsock does not depend on any of this. Do not read wlan0's MAC while
++# disconnected -- the framework parks a fresh random address on the interface
++# then (ClientModeImpl CMD_DELAYED_MAC_RANDOMIZATION and the disconnect path),
++# so it looks like it rotates every time. Read it while associated.
++#
++# Manual control:
++#     stop doma_shadow_ap ; start doma_shadow_ap
++#     logcat -s doma-shadow-ap
++#
++# The AP list is read from /data/vendor/wifi/shadow/aps.conf (one
++# "<SSID>TAB<PSK>" per line, empty PSK = open); the shipped seed fills it on a
++# first boot and doma-wifi-relay keeps it in sync with DomD's scan.
++#
++# SELINUX. This board boots PERMISSIVE --
++# device/epam/aosp-xenvm-trout/xenvm_trout_arm64/BoardConfig.mk:31 adds
++# androidboot.selinux=permissive and :56 sets BOARD_KERNEL_CMDLINE =
++# enforcing=0, and androidboot.selinux=permissive really is present in the built
++# vendor-bootconfig.img (so the := on :23 does not clobber it, unlike the
++# bluetooth_checker entry). Denials are logged, not enforced, so
++# `start doma_shadow_ap` execs fine.
++#
++# The device tree ships sepolicy: ../sepolicy/{file_contexts,doma_shadow_ap.te},
++# wired up by BOARD_VENDOR_SEPOLICY_DIRS in BoardConfig.mk. Its purpose is
++# attribution rather than permission -- without an exec type the script keeps
++# the generic vendor_file label and every avc line names init, which leaves
++# audit2allow nothing to work with. The rule set is deliberately incomplete and
++# each rule cites a step of doma-shadow-ap.sh; finish it from real denials with
++#     adb shell dmesg | grep 'avc: .*doma_shadow_ap'
++# Read the .te header before adding anything. Bypassing init from a root shell
++# also works:
++#     sh /vendor/bin/doma-shadow-ap
++#
++service doma_shadow_ap /vendor/bin/doma-shadow-ap
++    user root
++    group root wakelock wifi net_admin net_raw
++    disabled
++    oneshot
++
++# The relay: the piece that makes an AP whose PSK is NOT in aps.conf connectable.
++#
++# WHY IT IS SEPARATE FROM doma_shadow_ap. doma_shadow_ap is oneshot -- it creates the
++# radios, writes hostapd.conf and starts hostapd, then exits. The relay is a long-lived
++# loop that reads DomD's virtio-serial channel and the request drop-box, so it cannot be
++# folded into a oneshot.
++#
++# IT FOLLOWS THE SETTINGS WI-FI TOGGLE. It starts at sys.boot_completed, right
++# after doma_shadow_ap (the actions after that block below), and asks DomD for
++# nothing while the toggle is off -- sta_is_up() in the script. The property is
++# the off switch: unset (the default) or true runs it, and
++#     setprop persist.vendor.doma.wifi_relay false
++# stops it. In the virt_wifi fallback it starts and then idles; see the script.
++# The companion app (DomaWifiRelay, /system_ext/priv-app) reads the SAME
++# property and the same toggle: `false` stops both halves at once, and any value
++# other than unset or true keeps the app idle and the relay from starting at the
++# next boot.
++service doma_wifi_relay /vendor/bin/doma-wifi-relay
++    user root
++    group root wakelock wifi net_admin net_raw
++    disabled
++
++on property:persist.vendor.doma.wifi_relay=false
++    stop doma_wifi_relay
++
++# ==========================================================================
++# hostapd, as its own service.
++# ==========================================================================
++# WHY IT IS NOT LAUNCHED BY doma_shadow_ap. That service is `oneshot`, so init
++# SIGKILLs its entire process group the moment the script exits -- measured on the
++# board, verbatim from dmesg:
++#     init: Service 'doma_shadow_ap' (pid 1567) exited with status 0 oneshot ...
++#     init: Sending SIGKILL to service 'doma_shadow_ap' (pid 1567) process group...
++# hostapd -B stays in that group and dies with it; as an init service it
++# survives, and init restarts it if it crashes.
++#
++# NOT oneshot, on purpose: this is a daemon. No -B either -- init wants it in the
++# foreground so it can supervise it.
++#
++# The binary lives in an apex, so this can only be started after apexd has mounted it.
++# doma_shadow_ap starts it, and doma_shadow_ap itself runs at sys.boot_completed, which
++# is well after that. `disabled` keeps init's class_start away from it.
++#
++# The config path is hardcoded here because init has no variables; it must stay in sync
++# with CONF_DIR/hostapd.conf in doma-shadow-ap.sh (/data/vendor/wifi/shadow).
++# THE `vendor.` PREFIX ON THE SERVICE NAME IS THERE SO THAT THE STATUS PROPERTY CAN
++#   BE READ (established from primary sources):
++#     init.svc.<name>          -> the `init.svc.` prefix at
++#                                 system/sepolicy/private/property_contexts:1019
++#                                 -> init_service_status_private_prop
++#                                 -> private/property.te:39 makes it a system_internal_prop
++#                                 -> public/te_macros:932-937
++#                                    `neverallow { domain -coredomain } $1:file no_rw_file_perms;`
++#                                 => NO ALLOW CAN BE WRITTEN FOR A VENDOR DOMAIN
++#                                    (writing one is a hard secilc failure and breaks
++#                                    the build, the same shape as /system/bin/iw).
++#                                 What domain.te:534 grants to all of domain is only the
++#                                 PUBLIC init_service_status_prop, which is a different
++#                                 type.
++#     init.svc.vendor.<name>   -> property_contexts:282 in the same file
++#                                 -> VENDOR_DEFAULT_PROP
++#                                 -> private/domain.te:511 has
++#                                    `get_prop({domain -coredomain -appdomain}, vendor_default_prop)`
++#                                 => READABLE WITHOUT ADDING ANY RULE.
++#   The relay's restart_hostapd() / confirm_hostapd_running() read this status to decide
++#   whether hostapd stays running, so if it cannot be read they wait 10 s under
++#   enforcing and then always treat it as a failure (safe, but the feature is dead).
++#   On the `setprop ctl.restart vendor.doma_shadow_hostapd` side the prefix
++#   changes nothing: it lands on ctl_default_prop all the same, because
++#   property_service.cpp:477 builds the legacy-check name
++#   `ctl.` + value = `ctl.vendor.doma_shadow_hostapd`, which matches the `ctl.` prefix
++#   at property_contexts:183 -> ctl_default_prop (a system_public_prop at
++#   public/property.te:218, so an allow can be written for it; `ctl_restart_prop` is
++#   a system_internal_prop at public/property.te:31, SO DO NOT WRITE IT AGAINST THAT
++#   ONE).
++#   Precedent: vendor.dlkm_loader in
++#   device/google/cuttlefish/shared/config/init.vendor.rc:105.
++service vendor.doma_shadow_hostapd /apex/com.google.cf.wpa_supplicant/bin/hw/hostapd /data/vendor/wifi/shadow/hostapd.conf
++    user root
++    group root wakelock wifi net_admin net_raw
++    disabled
++
++# The only thing that starts doma_shadow_ap. sys.boot_completed rather than
++# `on boot` because the script execs setup_wifi in the fallback case, and
++# setup_wifi renames eth1 (SIOCSIFNAME), so eth1 has to exist and still be
++# down. Nothing measured shows eth1 present as early as `on boot`, which fired
++# at about 13 s on this board (init.xenvm-buried-eth0.rc). At
++# sys.boot_completed eth1 is normally registered already (step 4 of
++# doma-shadow-ap.sh still waits for it), and EthernetService claims
++# interfaces only at about 200 s (the TIMING note in doma-shadow-ap.sh).
++on property:sys.boot_completed=1
++    # THIS IS WHAT LETS THE APP (DomaWifiRelay = android.uid.system) REACH its request
++    #   drop-box shadow/req. req itself is created 0770 wifi:system below, but REACHING
++    #   IT NEEDS x ON BOTH PARENT DIRECTORIES, and with both of them 0770 wifi:wifi the
++    #   result is EACCES. uid system cannot be put in the wifi group
++    #   (frameworks/base/data/etc/platform.xml has no <permission> granting
++    #   `gid="wifi"`; all it has are the two assign-permission lines).
++    #
++    #   MEASURED ON THE PC (2026-09-08, by recreating the same owner/mode under a
++    #   scratch directory):
++    #     both parents 0770                 -> Permission denied (cannot write a request)
++    #     o+x on /data/vendor/wifi only     -> STILL denied (both levels are needed)
++    #     both at 0771                      -> writable
++    #     in that state, cat hostapd.conf   -> denied (still 0660 wifi:wifi)
++    #     in that state, ls of shadow       -> denied (no r)
++    #   => o+x opens TRAVERSAL ONLY; it does not spread the PSK.
++    #
++    #   WHY THIS IS RE-APPLIED HERE (at sys.boot_completed): init's mkdir
++    #   RE-APPLIES mode/owner TO AN EXISTING DIRECTORY TOO (needs_chmod / lchown
++    #   in system/core/init/builtins.cpp:394-436), and cuttlefish's
++    #   shared/config/init.vendor.rc:85 issues
++    #   `mkdir /data/vendor/wifi 0770 wifi wifi` in its unconditional `on boot`
++    #   block, which always runs after post-fs-data, so the mkdir below would be
++    #   undone on every boot. This line runs on a later trigger than `on boot`,
++    #   so it settles the matter.
++    #   Precedent: cuttlefish's own shared/desktop/init.common.rc:33 also puts the same
++    #   directory at 0771.
++    #   GOING ENFORCING will additionally need 3 allows on the system_app side (verified
++    #   that no neverallow forbids them: the 4 system_app x data_file_type neverallows
++    #   are all about execute / entrypoint):
++    #     allow system_app vendor_data_file:dir search;
++    #     allow system_app hostapd_data_file:dir { search write add_name remove_name };
++    #     allow system_app hostapd_data_file:file { create open write getattr rename unlink };
++    chmod 0771 /data/vendor/wifi
++    chmod 0771 /data/vendor/wifi/shadow
++    start doma_shadow_ap
++
++# The relay, AFTER the block above: actions on one trigger run in the order they were
++# parsed (action_manager.cpp:79-83), so doma_shadow_ap is already running when the relay
++# starts, and the relay skips DomD's publications until the oneshot has exited. `=`
++# matches the property unset (action.cpp:199-206), which is the default. Both wait for
++# boot_completed because before it init counts every crash of a process with updatable
++# components, with no time window, towards sys.init.updatable_crashing
++# (service.cpp:374-413).
++on property:sys.boot_completed=1 && property:persist.vendor.doma.wifi_relay=
++    start doma_wifi_relay
++
++on property:sys.boot_completed=1 && property:persist.vendor.doma.wifi_relay=true
++    start doma_wifi_relay
++
++on post-fs-data
++    # hostapd's ctrl_interface and the AP list live here. Same owner/mode as the
++    # hostapd directories cuttlefish's init.vendor.rc creates for its own hwsim path.
++    # 0771 = o+x only (neither r nor w is granted). The reasoning and the
++    # measurements are in the sys.boot_completed block above. THIS LINE ALONE IS
++    # NOT ENOUGH: cuttlefish's init.vendor.rc:85 sets /data/vendor/wifi back to
++    # 0770 in its `on boot` block (init's mkdir fixes up the mode of an existing
++    # directory as well).
++    mkdir /data/vendor/wifi 0771 wifi wifi
++    mkdir /data/vendor/wifi/shadow 0771 wifi wifi
++    mkdir /data/vendor/wifi/shadow/sockets 0770 wifi wifi
++    # The relay's request drop-box. GROUP system, not wifi, and that is the whole point:
++    # DomaWifiRelay runs as android.uid.system (it needs NETWORK_SETTINGS and
++    # READ_WIFI_CREDENTIAL, which are signature permissions), so it is uid/gid system and
++    # cannot create a file in a 0770 wifi:wifi directory. Everything else under shadow/
++    # stays wifi:wifi so the passphrase file is not reachable more widely than
++    # it already is. doma-wifi-relay also chowns this directory itself as a
++    # fallback, for a /data where the directory exists with another owner.
++    mkdir /data/vendor/wifi/shadow/req 0770 wifi system
+diff --git a/xenvm_trout_rpi4_arm64/virtwifi.rc b/xenvm_trout_rpi4_arm64/virtwifi.rc
+new file mode 100644
+index 0000000..8fa40d8
+--- /dev/null
++++ b/xenvm_trout_rpi4_arm64/virtwifi.rc
+@@ -0,0 +1,8 @@
++# SPDX-License-Identifier: Apache-2.0
++#
++# Replaces device/google/trout/trout_arm64/wifi/virtwifi.rc: the product makefile lists
++# this copy before the trout inherit, and for one destination the first PRODUCT_COPY_FILES
++# entry wins. trout's trout-virtwifi-setup ran `cmd wifi set-wifi-enabled enabled` at
++# every boot, which also saves Wi-Fi ON, so the Settings toggle could neither start off
++# nor stay off across a reboot. Nothing is defined here: Wi-Fi starts as the user left
++# it, and off on a fresh /data (def_wifi_on=false).

@@ -287,8 +287,11 @@ fdt set /soc/serial@7e201000/bluetooth status "disabled"
 # -----------------------------------------------------------------------------
 # The Zephyr Dom0 has no block stack, so DomD owns the SD directly and serves
 # /dev/mmcblk0p3 (DomU rootfs) and p4 (DomA super) to the guests as virtio-blk.
-# Three things make that work, and only emmc2 needs marking here — the other two
-# already travel with the mailbox, because the overlay marks /soc/firmware:
+# Three things make that work, and of those three only emmc2 needs marking — the
+# other two already travel with the mailbox, because the overlay marks
+# /soc/firmware. (The Wi-Fi SDIO markers further down this section are a separate
+# decision; they are here for the same reason, that the SD/SDIO complex is what
+# the two Dom0 flavours disagree about.)
 #   emmc2 (/emmc2bus/mmc@7e340000, GIC SPI 126) — marked below, so Xen releases
 #     it and DomD's partial DT can claim SPI 126 without route_irq_to_guest
 #     returning -EBUSY;
@@ -303,18 +306,71 @@ fdt set /emmc2bus/mmc@7e340000 xen,passthrough
 
 # GIC SPI 126 IS SHARED. On BCM2711 three controllers sit on that one line:
 #   /emmc2bus/mmc@7e340000  emmc2  (the SD slot)      -> DomD, marked above
-#   /soc/mmcnr@7e300000     sdio   (the onboard WiFi) -> status="okay" by default
-#   /soc/mmc@7e300000       sdhci (the legacy SDHCI controller; NOT sdhost — sdhost is /soc/mmc@7e202000 on GIC SPI 120 and stays with Dom0)                    -> status="disabled"
-# Xen ignores `status` when deciding ownership, so both /soc nodes would be
-# assigned to the hardware domain and route SPI 126 there. DomD would then ask for
-# the same SPI and route_irq_to_guest() returns -EBUSY, aborting DomD construction
-# with no other diagnostic. Remove both from the host DT: the cockpit uses wired
-# GENET, so the onboard WiFi is not needed, and sdhost is an unused legacy path.
-# (This is the same coupling that made a DomD WiFi passthrough impossible — see
-# meta-xt-common/meta-xt-driver-domain/include/dt_config.inc.)
-echo "rm: /soc/mmcnr@7e300000 + /soc/mmc@7e300000 (share GIC SPI 126 with emmc2)"
-fdt rm /soc/mmcnr@7e300000
+#   /soc/mmcnr@7e300000     sdio   (the onboard WiFi) -> DomD, marked below
+#   /soc/mmc@7e300000       sdhci (the legacy SDHCI controller; NOT sdhost - sdhost is /soc/mmc@7e202000 on GIC SPI 120 and stays with Dom0)                    -> removed below
+# Xen ignores `status` when deciding ownership, so any /soc node left untouched
+# here is assigned to the hardware domain and routes SPI 126 there. DomD would
+# then ask for the same SPI, route_irq_to_guest() would return -EBUSY, and DomD
+# construction aborts with no other diagnostic. So each of the three has to be
+# dealt with explicitly.
+#
+# mmcnr is the onboard Wi-Fi SDIO controller and it goes to DomD, which needs it
+# to give DomA a network to browse from: brcmfmac is already in the DomD image,
+# and so is its Cypress firmware when the build accepts synaptics-killswitch
+# (README, *Wi-Fi firmware licence*), and neither has a device to bind to
+# otherwise. Two notes on why this is `fdt set`:
+#
+#   * It MUST be `fdt set`, not `fdt rm`. DomD's partial DT reaches this device
+#     with xen,path = "/soc/mmcnr@7e300000", and handle_passthrough_prop()
+#     resolves that path against the HOST DT (dt_find_node_by_path). Delete the
+#     node and the lookup returns NULL, which is -EINVAL and panics domain
+#     construction. `fdt set` is also what makes Xen release the SPI, which is
+#     the whole point.
+#
+#   * DomD then names SPI 126 twice, once via emmc2 and once via mmcnr, and that
+#     is legal. route_irq_to_guest() returns -EBUSY only for a different domain,
+#     a different virq on the same line, or a line Xen itself uses; same domain
+#     plus same virq falls through with retval 0, and dom0less passthrough always
+#     uses virq == irq. The requirement is that both partial-DT nodes declare the
+#     SAME trigger type, because irq_set_spi_type() accepts a repeat only when
+#     curr == new. Both use <0 126 4>. Linux is fine with it too: sdhci requests
+#     its IRQ with IRQF_SHARED.
+#
+# /soc/mmc@7e300000 is a second, status="disabled" description of the very same
+# Arasan controller mmcnr describes, so it has no user and is removed -- leaving
+# it would hand SPI 126 to the hardware domain and undo the two `fdt set`s above.
+echo "passthrough: /soc/mmcnr@7e300000 (onboard WiFi SDIO -> DomD, shares SPI 126)"
+fdt set /soc/mmcnr@7e300000 xen,passthrough
+echo "rm: /soc/mmc@7e300000 (disabled duplicate of mmcnr, would take SPI 126)"
 fdt rm /soc/mmc@7e300000
+
+# mmcnr's DMA engine. The Arasan SDHCI block mmcnr sits on has no usable internal
+# bus master, so its only route to DMA is the EXTERNAL legacy engine, which the
+# host wires up as dmas = <&dma-controller@7e007000 11> (DREQ 11). Without this
+# marker bcm2835-mmc.c cannot get a channel and falls back to PIO, which costs
+# about three times the interrupts for the same transfers (16105-16701 against
+# 4487-6533 over three repeats of a fixed 609 KB firmware load).
+#
+# THE NODE NAME IS dma-controller@7e007000, not dma@7e007000. Measured in the
+# shipped bcm2711-rpi-4-b.dtb. xen,path is resolved against the HOST DT with
+# dt_find_node_by_path(), so a wrong spelling returns NULL and panics domain
+# construction with -EINVAL.
+#
+# `fdt set`, never `fdt rm`, for the same reason as mmcnr above.
+#
+# The page 0xfe007000 is shared with dma40 (/scb/dma@7e007b00, HDMI audio), which
+# is NOT passed through; the two register windows do not overlap and the Zephyr
+# Dom0 has no driver for either, so DomD mapping the page is harmless. See the
+# long note on legacy_dma_bus in bcm2711-raspberrypi4-64-domd-vc4.dts.
+#
+# BOTH THIS AND THE mmcnr MARKER ABOVE STAY IN THE BOOT SCRIPT rather than moving
+# to the Xen host overlay where every other ownership decision lives: the overlay
+# is one dtbo applied by both Dom0 flavours, and these two devices are exactly the
+# flavour-specific case it cannot express. In the linux flavour Dom0 owns emmc2
+# and SPI 126, mmcnr is absent from DomD (domd-vc4.bb strips it together with its
+# DMA engine), and the whole SD/SDIO complex stays with Dom0.
+echo "passthrough: /soc/dma-controller@7e007000 (legacy DMA -> DomD, Wi-Fi SDIO DREQ 11)"
+fdt set /soc/dma-controller@7e007000 xen,passthrough
 
 # -----------------------------------------------------------------------------
 # Drop the host CMA reservation and any VideoCore framebuffer leftovers.
