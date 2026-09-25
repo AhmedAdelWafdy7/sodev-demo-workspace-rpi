@@ -100,6 +100,15 @@ variables:
   #   The -v4h recipe lives in the linux-dom0-poc layer (added to the domd
   #   component below, alongside the domd layer — exactly as the reference build does).
   XT_DOMD_IMAGE: "rpi5-image-xt-domd-v4h"
+  # Venus device-model options for the guests' virtio-gpu-gl (see the GPU parameter).
+  # This is the DEFAULT value = the Vulkan stack; --gpu=gl overrides it with the empty
+  # string, which is the pre-Venus configuration. Declared here so the component confs
+  # can reference %{XT_VENUS_GPU_OPTS} unconditionally.
+  XT_VENUS_GPU_OPTS: ",hostmem=256M,blob=true,venus=true"
+  # Whether the domd conf removes venus from virglrenderer's PACKAGECONFIG (see that
+  # line, and the GPU parameter). "" (default) = keep the venus backend the Vulkan
+  # stack needs; --gpu=gl sets "venus", which is the pre-Venus pure-GL virglrenderer.
+  XT_VIRGL_VENUS_REMOVE: ""
   # Informational/unused: the shipping DomU is built by the AGL bitbake
   # (agl-cluster-demo-flutter-guest); this workspace only harvests its kernel Image
   # (see build_target below). The full DomU gfx image (rpi5-image-domu-gfx) moved to
@@ -428,6 +437,14 @@ parameters:
                 - [RPI_SOC_FAMILY, "%{SOC_FAMILY}"]
                 - [XT_DOM_NAME, "dom0"]
                 - [DOM0_OS, "linux"]
+                # Board SKU. Needed here as well as in the domd component: in the
+                # linux flavour Dom0 runs the xl toolstack, so it is DOM0's copy of
+                # /etc/xen/doma.cfg that `xl create` reads, and meta-xt-rpi4's
+                # xt-xen-cfg-doma bbappend sizes DomA's `memory` from BOARD_RAM and
+                # the lane. Without this the recipe never sees 4g here, and a
+                # --ram=4g --dom0=linux build on the vulkan lane would give DomA the
+                # 8 GiB size, 2560 MiB, which the 4 GiB Venus-lane map has no room for.
+                - [BOARD_RAM, "%{BOARD_RAM}"]
                 # [fullmetavirt] meta-xt-domu is shared (DomU guest recipes + the
                 # Dom0-side xt-xen-cfg-domu). In build-dom0 the DomU guest apps must
                 # not be parsed: cluster-refgui inherits qt6-cmake from meta-qt6, only
@@ -445,6 +462,21 @@ parameters:
                 # component conf is the ExpansionError the DOMD_CAN_TYPE /
                 # XEN_DT_SCMI entries below document.
                 - [XT_DOMZ_CFG_INSTALL, "%{XT_DOMZ_CFG_INSTALL}"]
+                # [GPU gate] The lane, for what Dom0 builds in this flavour.
+                # Its libxl builds every guest, so it needs the toolstack
+                # patches xen-tools_4.22.bbappend gates on the 'venus'
+                # DISTRO_FEATURE, as the domd build's libxl does; and
+                # xt-xen-cfg-doma / -domu write the guest cfgs here, in the
+                # syntax of the qemu PREFERRED_VERSION_qemu names
+                # (XT_DM_QEMU_VERSION), which has to be the one the domd build
+                # makes.
+                - [DISTRO_FEATURES:append, "%{XT_DOM0_VENUS_FEATURE}"]
+                - [PREFERRED_VERSION_qemu, "%{XT_DOM0_QEMU_VERSION}"]
+                # [GPU gate] Substituted into the virtio-gpu-gl-pci line of
+                # domu.cfg/doma.cfg by xt-xen-cfg-domu / xt-xen-cfg-doma. "", which is
+                # what --gpu=gl sets it to, leaves the configs with none of the Venus
+                # options; the default lane substitutes hostmem/blob/venus options.
+                - [XT_VENUS_GPU_OPTS, "%{XT_VENUS_GPU_OPTS}"]
                 # [V4H-style DomA gate] meta-xt-doma is always in `layers` (like the
                 # V4H prod-devel-rcar4 yaml); ENABLE_ANDROID=no masks ALL its recipes
                 # instead (%{XT_DOMA_BBMASK} = " meta-xt-common/meta-xt-doma/"), the
@@ -600,18 +632,24 @@ parameters:
   # unchanged, so 4g is not needed just to boot — it is what makes a guest fit and
   # what stops the build silently over-committing:
   #   4g:  DomD 1024 (bank2 dropped, bank0 640) + Dom0 128..256 + Xen 80
-  #        = 1232..1360 MiB, leaving 2724 (zephyr) / 2596 (linux) for ONE guest.
-  #        DomU 1024 fits; DomA 2560 fits ALONE; the two together (3584) do not.
+  #        = 1232..1360 MiB, leaving 2724 (zephyr) / 2596 (linux) for ONE guest
+  #        in the gl lane; in the default Venus lane DomD is 1408 (bank0 1024)
+  #        and DomA 2176, leaving 164 / 36 MiB spare. DomU 1024 fits; DomA fits
+  #        ALONE (2560 in the gl lane); the two together do not.
   #        build.sh notes this and does not refuse -a with --ram=4g.
-  # Mechanism: this only sets BOARD_RAM in the domd conf. The boot scripts carry
-  # `setenv board_ram <value>` (substituted by the xt-rpi-u-boot-scr bbappend) and
-  # branch on it at run time with `fdt set /chosen/domD memory|xen,static-mem`, so
-  # the 4 GiB delta is a few lines in ONE file rather than a second overlay or a
-  # second script. NOTE: tools/check-memory-map.py does NOT validate these values --
-  # it models BCM2712 only and its BUDGET table has no rpi4 rows
+  # Mechanism: this sets BOARD_RAM in the domd conf, and in the dom0 conf of the
+  # linux flavour, whose Dom0 installs the doma.cfg `xl create` reads: DomA's size
+  # follows the SKU as well (meta-xt-rpi4's xt-xen-cfg-doma bbappend). The boot
+  # scripts carry `setenv board_ram <value>` (substituted by the xt-rpi-u-boot-scr
+  # bbappend) and branch on it at run time with
+  # `fdt set /chosen/domD memory|xen,static-mem`, so the 4 GiB delta is a few
+  # lines in ONE file rather than a second overlay or a second script.
+  # tools/check-rpi4-memory-map.py validates these values for both SKUs and both
+  # flavours (check 7 is the domain budget). The BCM2712 tool
+  # (tools/check-memory-map.py) does not validate them: it has no rpi4 rows
   # (meta-xt-rpi4/README.md).
   BOARD_RAM:
-    desc: "Target Raspberry Pi 4 SKU: 8g (default; all four domains up together) or 4g (DomD 1024 MiB; DomU or DomA, one at a time)"
+    desc: "Target Raspberry Pi 4 SKU: 8g (default; all four domains up together) or 4g (DomD 1408 MiB with GPU=vulkan, the default, or 1024 with gl; DomU or DomA, one at a time)"
     "8g":
       default: true
       overrides:
@@ -874,6 +912,240 @@ parameters:
                 items:
                   "zephyr-domz.bin": "%{ZEPHYR_DOMZ_DIR}/%{ZEPHYR_DOMZ_BUILD_DIR}/zephyr/zephyr.bin"
 
+  # Which graphics stack the guests get. vulkan (Venus: guest Vulkan over virtio-gpu)
+  # is the DEFAULT; gl rebuilds the pre-Venus OpenGL stack.
+  #
+  # WHAT THE SWITCH COSTS. Venus needs qemu >= 9.2 for the virtio-gpu-gl
+  # `venus=` property, so the vulkan lane selects the fork's 10.0.2-xt build
+  # instead of 7.0.0, and the six 7.0.0-only device-model patches are
+  # version-gated off in it. All six are accounted for: 0111 (DomA touch) is
+  # rebased as meta-xt-qemu's 0118 and 0110
+  # (virtio-pci ISR IOREQ range) as 0120; 0112 (vTPM GUEST_TPM_BASE guard) is moot
+  # because 10.0.2 has no hw/arm/xen_arm.c and no reference to that define at all, and
+  # 0113 (sched_attr redefinition) is fixed upstream in 10.0.2's own
+  # linux-user/syscall.c; 0101 (RESUME with no QMP monitor) and 0103 (deferred autostart
+  # vm_start) guard a pre-main-loop death whose code sites were reshaped in qemu 9/10
+  # (softmmu/vl.c -> system/vl.c) and which has not reproduced on 10.0.2 -- both guests'
+  # device models came up on every boot
+  # of the board verification. See meta-xt-driver-domain's qemu_%.bbappend for the
+  # per-patch statement and docs/VULKAN-VENUS.md for the whole procedure.
+  #
+  # "vulkan" is what the lines below describe; "gl" simply does not do them (and puts
+  # PREFERRED_VERSION_qemu back to 7.0.0). Three things change, the second in the domu
+  # build as well as the domd one, so the guest-side ICD gate matches the host-side one:
+  #   - PREFERRED_VERSION_qemu 7.0.0 -> 10.0.2 (meta-xt-qemu/qemu_10.0.2.bb, the
+  #     same fork on its v10.0.2-xt branch). moulin appends the override conf lines
+  #     after the base ones and bitbake takes the last assignment, so this wins.
+  #   - DISTRO_FEATURES += venus. This is the tree's OWN feature name (no upstream
+  #     recipe keys off it): it gates the Vulkan runtime installs in the image
+  #     recipes, the virglrenderer patches and PACKAGECONFIG this tree adds, and
+  #     DomD's gntdev dma-buf patch (kernel 0014). CONFIG_UDMABUF, which Venus
+  #     blob resources need, is already =y in the Raspberry Pi kernel's
+  #     bcm2711_defconfig -- measured in the generated .config, both lanes.
+  #   - XT_VENUS_GPU_OPTS, substituted into the virtio-gpu-gl-pci line of
+  #     domu.cfg / doma.cfg by xt-xen-cfg-domu / xt-xen-cfg-doma.
+  # The first two reach the Dom0 build of the linux flavour as well, through
+  # XT_DOM0_VENUS_FEATURE and XT_DOM0_QEMU_VERSION: that Dom0 runs the toolstack
+  # and installs the guest cfgs.
+  # mesa and weston are the same in both lanes: mesa already builds V3DV and
+  # weston 15 already builds its Vulkan renderer, because both key off 'vulkan',
+  # which is in wrynose's DISTRO_FEATURES_DEFAULTS and is not removed here (the
+  # mesa version pin in meta-xt-driver-domain applies to both lanes as well).
+  GPU:
+    desc: "Which graphics stack the guests get. vulkan (default): Venus (guest Vulkan over virtio-gpu) for DomA and DomU -- qemu 10.0.2-xt, virglrenderer's venus backend, the DomD/DomU Vulkan runtime and venus=true device-model options. gl: the pre-Venus OpenGL stack on qemu 7.0.0-xt. See docs/VULKAN-VENUS.md."
+    "gl":
+      overrides:
+        variables:
+          XT_DOM0_VENUS_FEATURE: ""
+          XT_DOM0_QEMU_VERSION: "7.0.0"
+          XT_VENUS_GPU_OPTS: ""
+          XT_VIRGL_VENUS_REMOVE: "venus"
+    "vulkan":
+      default: true
+      overrides:
+        variables:
+          # hostmem is the host-visible blob window, and this ONE value is
+          # substituted into BOTH guest configs -- so the real cost is 2x it with
+          # -u -a.
+          #
+          # The value went 4M -> 32M -> 128M -> 256M, and every step was measured
+          # on the board. The first two are recorded in the past tense on
+          # purpose: 4.22-0008 and -0009 in this series RAISED the ceiling they
+          # were bounded by, so their reasoning no longer describes this tree.
+          #
+          # 4M was the largest a stock guest could take. BEFORE 4.22-0008/0009 a
+          # Xen ARM guest's prefetchable PCI window was one 8 MiB slice (libxl's
+          # VIRTIO_PCI_HOST_PREFETCH_MEM_SIZE) of the 64 MiB
+          # GUEST_VIRTIO_PCI_PREFETCH_MEM_SIZE (xen/include/public/arch-arm.h),
+          # shared with the six 16 KiB virtio BARs. With the earlier 1G value the
+          # guest logged
+          #   pci 0000:00:04.0: BAR 4 [mem size 0x40000000 64bit pref]: can't assign; no space
+          # so virtio-gpu came up "-host_visible" and Mesa's venus refused to
+          # initialise ("one of required kernel params (4 or 9) is missing"). At 4M
+          # the BAR was assigned at 0x3a000000, virtio-gpu reported "+host_visible"
+          # and venus negotiated its protocol -- but 4 MiB of blob window is not
+          # enough to render into.
+          #
+          # 32M needed the hypervisor patches and was still too small: venus takes
+          # ~25 MiB of it for its own pools, and a 1920x1080 swapchain then failed
+          # with VK_ERROR_OUT_OF_DEVICE_MEMORY.
+          #
+          # 128M came with the hypervisor side. 4.22-0007 lets the device model put
+          # the blob into the guest's p2m (real memory, not emulated MMIO);
+          # 4.22-0008 moves the guest's prefetchable window to 0xc0000000 and grows
+          # it to 768 MiB, so a BAR this size has a hole to live in; 4.22-0009
+          # hands that window out in per-host slices. Measured on RPi5 with all
+          # three: DomU enumerates "Virtio-GPU Venus (V3D 7.1.10.2)", driverName
+          # venus, and Xen logs no undecodable aborts at all.
+          #
+          # 256M is what ships. 128M ran out in DomA once a full-Vulkan AAOS had its
+          # resident apps up: every process that renders with HWUI on Venus maps
+          # its own blocks into the window (103 MiB of 128 in use by SurfaceFlinger
+          # and five apps, measured on RPi4 on 2026-09-24), and a WebView playing
+          # video on top then failed vkAllocateMemory -- the app showed a white page
+          # or aborted. 4.22-0009 therefore hands the window out in
+          # 256 MiB slices (768 / 256 = three virtio-pci hosts; every guest here has
+          # one). The value must be a power of two no larger than that slice: it
+          # becomes the virtio-gpu BAR as it is, and a BAR larger than the slice is
+          # not assigned (the 1G case above).
+          #
+          # A LARGE mappable allocation is a dma-buf on a DRM driver, whose frame
+          # numbers a device model cannot read from its own mapping: qemu's 0116
+          # gets them from the DomD kernel's gntdev IMP_TO_GFNS ioctl (kernel 0014)
+          # and shares the buffer into the guest's physmap like any other blob.
+          # Only when both that and the pagemap route fail does qemu withdraw the
+          # window, and vkMapMemory then returns VK_ERROR_MEMORY_MAP_FAILED rather
+          # than the guest being killed. Raising this value does not change which
+          # route a buffer takes -- see docs/VULKAN-VENUS.md section 7a.
+          XT_VENUS_GPU_OPTS: ",hostmem=256M,blob=true,venus=true"
+          # The same lane for the linux flavour's Dom0 build (see its conf).
+          XT_DOM0_VENUS_FEATURE: " venus"
+          XT_DOM0_QEMU_VERSION: "10.0.2"
+          # Keep virglrenderer's venus backend. Without it the device model has
+          # no Venus renderer at all, whatever qemu supports; the gl lane sets
+          # this to "venus" (see PACKAGECONFIG:remove:pn-virglrenderer in the
+          # domd conf).
+          XT_VIRGL_VENUS_REMOVE: ""
+        components:
+          domd:
+            builder:
+              conf:
+                - [DISTRO_FEATURES:append, " venus"]
+                - [PREFERRED_VERSION_qemu, "10.0.2"]
+                # virglrenderer's RENDER SERVER, and it is not optional: qemu >= 9.2
+                # passes VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER
+                # unconditionally when venus=on (hw/display/virtio-gpu-virgl.c), so
+                # without the helper binary the venus context cannot be created and
+                # the guest's very first blob allocation fails --
+                # RESOURCE_CREATE_BLOB (0x10c) answered VIRTIO_GPU_RESP_ERR_UNSPEC
+                # (0x1200), then vkCreateInstance returns
+                # ERROR_OUT_OF_HOST_MEMORY. Found by running an arm64 Venus guest on
+                # a PC before touching hardware; oe-core defaults this PACKAGECONFIG
+                # off, and FILES:${PN} already covers ${libexecdir}/* so the binary
+                # needs no packaging change.
+                - ["PACKAGECONFIG:append:pn-virglrenderer", " render-server"]
+                # ...and minigbm_allocation, for the same reason one step further in. Also
+                # oe-core-default-off, also found by running a guest on a PC before hardware.
+                # Without it, vrend_pipe_resource_export_fd() (src/vrend/vrend_renderer.c) is
+                # compiled down to `return VIRGL_RESOURCE_FD_INVALID`, so NO gallium/GL resource
+                # can be exported as a dma-buf. Every resource a Vulkan context did not allocate
+                # itself then fails to reach the venus context:
+                #   proxy_context_attach_resource -> virgl_resource_export_fd -> INVALID
+                #   -> "exported res N to unexpected fd_type -1", attach silently aborted
+                #   -> vkGetMemoryResourcePropertiesMESA -> "invalid res_id N" -> context fatal
+                # which is how weston --renderer=vulkan and Android SurfaceFlinger's SkiaVk
+                # backend both died until this was turned on. Vulkan *applications* are
+                # unaffected -- they allocate their own buffers -- so this is specifically what a
+                # Vulkan-compositing guest needs. No new dependency: the recipe already DEPENDS
+                # on virtual/libgbm, and the proxy failure above is invisible below
+                # VIRGL_LOG_LEVEL=debug, which is why it took a while to find.
+                #
+                # REQUIRED, not optional. It is what defines
+                # ENABLE_MINIGBM_ALLOCATION in 1.2.0, and that is what compiles
+                # the GBM transfer helpers, vkr's gbm fallback and the export
+                # path above. (Upstream's newer form, which sets
+                # ENABLE_GBM_ALLOCATION from have_egl instead and marks this
+                # option DEPRECATED, is not carried; see the tiled-GBM section
+                # of virglrenderer_%.bbappend for why. So this option is the
+                # only thing that turns the GBM path on.)
+                - ["PACKAGECONFIG:append:pn-virglrenderer", " minigbm_allocation"]
+          domu:
+            builder:
+              conf:
+                # The guest side of the same lane. The domu component's own
+                # build_target is core-image-minimal (a kernel harvest), so this
+                # changes nothing there; it matters for the opt-in
+                # rpi5-image-domu-gfx debug image, whose guest Vulkan runtime
+                # (mesa-vulkan-drivers = the Venus ICD libvulkan_virtio.so) is
+                # gated on the same feature. The AGL cluster rootfs on SD p3 is
+                # built outside this tree and needs those packages adding there.
+                - [DISTRO_FEATURES:append, " venus"]
+
+  # meta-rpi-sodev-devel, the diagnostic/debug/prototype layer, in the DomD build.
+  #
+  # OFF by default and that is the point: the layer carries the Venus phase 0-3 gate
+  # (xt-venus-check/sodev-venus-gate.sh), the three Vulkan reproducers (xt-venus-diag),
+  # the VRAM/CMA tools, and the DIAGNOSTIC virglrenderer and Xen patches -- the
+  # command-stream dump with a live sanity assert, the log line per guest allocation
+  # >= 64 MiB, and the hypervisor patch that makes Xen's injected-abort paths print on a
+  # release build. None of that belongs in a shipping image, and the hypervisor one must
+  # not be in it: a product hypervisor is a release build.
+  #
+  # It has its own switch, off in both GPU lanes, so the default image is a
+  # product image -- which is also what this layer's own README and the tree's
+  # README say about it.
+  ENABLE_DEVEL:
+    desc: "Add meta-rpi-sodev-devel to the DomD build: the Venus phase 0-3 gate, the Vulkan reproducers, the VRAM tools and the diagnostic virglrenderer/Xen patches. Diagnostics only -- never part of a shipping image."
+    "no":
+      default: true
+    "yes":
+      overrides:
+        components:
+          domd:
+            builder:
+              # Path is relative to the domd build dir, like the sibling entries in the
+              # base list. moulin merges an override `layers` list by APPENDING to the
+              # base one, so the devel layer lands last -- which is also what decides the
+              # order of its bbappends against meta-xt-driver-domain's (same
+              # BBFILE_PRIORITY), i.e. its diagnostic patches apply after the product
+              # series. That order is the one verified at fuzz 0.
+              layers:
+                - "../../meta-rpi-sodev/meta-rpi-sodev-devel"
+  # Board note: what is verified on this board, and on which tree. Two different
+  # things, so they are recorded separately rather than as one "verified" claim.
+  #
+  # ON THIS TREE, with the default GPU=vulkan and MACHINE=raspberrypi4-64:
+  #   - the metadata parses with meta-xt-rpi4 in the layer set: 3373 .bb files,
+  #     5775 targets, 0 errors.
+  #   - xen and xen-tools compile and package for cortexa72 with 4.22-0007 / -0008 /
+  #     -0009 applied at fuzz 0, and qemu 10.0.2-xt configures, compiles and
+  #     packages. (Those runs had meta-xt-rpi5's xen_4.22.bbappend attached rather
+  #     than meta-xt-rpi4's -- the two are the same three SRC_URI lines under the
+  #     same 'venus' gate, and the patches themselves are board-independent.)
+  #   - xt-rpi-u-boot-scr's do_compile runs on raspberrypi4-64 with BOARD_RAM=4g:
+  #     the emitted boot.cmd has `setenv board_ram 4g` and `setenv venus_lane yes`,
+  #     no placeholder left, and mkimage turns it into a valid u-boot script image.
+  #     That is DomD's half of the 384 MiB transfer (bank0 640 -> 1024 MiB).
+  #   - DomA's half is verified one step short of that: DOMA_MEM_MiB expands to
+  #     2176 in the default (vulkan) lane and 2560 with --gpu=gl (bitbake-getvar, both
+  #     lanes). do_install's substitution itself has not been run for cortexa72,
+  #     but it is the SAME code in
+  #     meta-xt-doma, exercised in both lanes on the Pi 5, where the --gpu=gl
+  #     lane's installed doma.cfg carries none of the Venus options.
+  #
+  # Built from this tree in a build directory of its own (moulin gives both yamls
+  # the same build dir name and bitbake-layers only ever ADDS, so sharing one build
+  # dir leaves the other board's layers behind): the full
+  # `rpi5-image-xt-domd-v4h` assembly succeeds in BOTH lanes -- 6816 tasks with 0
+  # failures in the default Vulkan lane (qemu 10.0.2, vulkan-tools present) and 6089
+  # with 0 failures for --gpu=gl (qemu 7.0.0, vulkan-tools absent) -- producing
+  # libvulkan_broadcom.so + its ICD manifest, vulkaninfo, a virglrenderer with venus
+  # compiled in and a qemu-system-aarch64 carrying the venus/blob/hostmem
+  # properties.
+  #
+  # And it runs: the Pi 4 board verification of 2026-09-12 brought up DomU
+  # Vulkan and a full-Vulkan AAOS DomA on this configuration, and on the Pi 5
+  # DomA was verified compositing with Vulkan (SkiaVk) on 2026-09-24.
 components:
   # =========================================================================
   # Dom0 / DomD — RPi5 base, copied verbatim from external/meta-xt-prod-devel-rpi5/rpi5.yaml.
@@ -928,8 +1200,11 @@ components:
         - [XT_DEVICE_TREES, "%{XT_XEN_DTBO_NAME}"]
         - [DOM0_OS, "%{DOM0_OS}"]
         # Board SKU for the boot script's `setenv board_ram` (see the BOARD_RAM
-        # parameter). Only the domd component needs it: xt-rpi-u-boot-scr is built
-        # there and nothing else varies with the SKU.
+        # parameter). The DomD build is the one that produces boot.scr. It also
+        # builds the DomD copy of doma.cfg, whose `memory` meta-xt-rpi4's
+        # xt-xen-cfg-doma bbappend sizes from BOARD_RAM, and which is what `xl create`
+        # reads in the zephyr flavour. The dom0-linux component sets BOARD_RAM as
+        # well, because there the doma.cfg that matters is Dom0's.
         - [BOARD_RAM, "%{BOARD_RAM}"]
         # aaos-guest-binaries derives the DomA kernel/ramdisk from the AOSP product out
         # tree, whose directory name is the PRODUCT_DEVICE. Pass it rather than let the
@@ -1007,14 +1282,14 @@ components:
         # "Bus 'pcie.0' not found") and no DomU/DomA virtio surface is created.
         # Same class of mis-resolve as the xen-tools 4.17 issue above.
         - [PREFERRED_VERSION_qemu, "7.0.0"]
-        # Remove the venus (Vulkan/V3DV) backend from virglrenderer to match a pure-GL
-        # configuration. The known-working image did not link libvulkan = venus was disabled.
-        # This demo's guests (AGL flutter cluster / AAOS) use only GLES-on-virgl and do not
-        # use the Vulkan path, so venus is not needed — cancel the venus that poky's vulkan
-        # DISTRO_FEATURE enables, to get the same pure-GL virglrenderer as the known-working
-        # image. (Note: this line is NOT a fix for the V3D-D0 rendering hang #316/#319 = a
-        # separate issue.)
-        - ["PACKAGECONFIG:remove:pn-virglrenderer", "venus"]
+        # Remove the venus (Vulkan/V3DV) backend from virglrenderer in the
+        # --gpu=gl lane only: XT_VIRGL_VENUS_REMOVE is "venus" there and empty
+        # in the default Vulkan lane (see the GPU parameter). That lane's guests
+        # use only GLES-on-virgl, so it gets the same pure-GL virglrenderer as
+        # the pre-Venus known-working image, which did not link libvulkan.
+        # (Note: this line is NOT a fix for the V3D-D0 rendering hang #316/#319
+        # = a separate issue.)
+        - ["PACKAGECONFIG:remove:pn-virglrenderer", "%{XT_VIRGL_VENUS_REMOVE}"]
         # wrynose upgrade (Phase 3a): the self-built mesa 24.2.7 / libdrm 2.4.123 /
         # wayland-protocols 1.37 recipes and their PREFERRED_VERSION pins are
         # removed. wrynose oe-core ships mesa 26.0.5 / libdrm 2.4.131 /
@@ -1061,8 +1336,8 @@ components:
         # boot.cmd.xen.{zephyr,linux}-dom0.in, where cma=192M actually lives), NOT
         # in the DOMD_BOOTARGS below -- which is inert here (see the
         # DOMD_ROOTFS_DEV note in the variables block). Edit the .in template to
-        # change the real value. NOTE: tools/check-memory-map.py does not print an
-        # authoritative bank list for this board -- it models BCM2712 only.
+        # change the real value. tools/check-rpi4-memory-map.py prints the
+        # authoritative bank list for this board; the BCM2712 tool does not.
         # Avoid swiotlb=force / iommu.passthrough=1 — those broke
         # v3d clock probe in 2026-05-06 testing.
         # 5/7 verbose: drop `quiet`, raise loglevel + ignore_loglevel +
@@ -1086,6 +1361,11 @@ components:
         # into the DomD rootfs. Set in the dom0(linux) conf as well —
         # meta-xt-domz is in both layer sets.
         - [XT_DOMZ_CFG_INSTALL, "%{XT_DOMZ_CFG_INSTALL}"]
+        # [GPU gate] Substituted into the virtio-gpu-gl-pci line of
+        # domu.cfg/doma.cfg by xt-xen-cfg-domu / xt-xen-cfg-doma. "", which is what
+        # --gpu=gl sets it to, leaves the configs with none of the Venus options;
+        # the default lane substitutes the hostmem/blob/venus options.
+        - [XT_VENUS_GPU_OPTS, "%{XT_VENUS_GPU_OPTS}"]
         - [BBMASK:append, "%{XT_DOMA_BBMASK}"]
       build_target: "%{XT_DOMD_IMAGE}"
       layers:

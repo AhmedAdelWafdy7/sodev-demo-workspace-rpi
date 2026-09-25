@@ -52,8 +52,10 @@ UBOOT_BOOT_SCRIPT_SOURCE ?= "boot.cmd"
 # scripts were checked against. Note DOMD_IMAGE = "Image" (uncompressed) where RPi5 uses
 # Image.gz, and that the DomD kernel/DTB load high (0xa4000000 / 0xa0000000) because
 # BCM2711's low memory is carved up between Xen, Dom0 and DomD's static-mem banks.
-# No checker validates the boot scripts on this board either: tools/check-memory-map.py
-# models BCM2712 only (meta-xt-rpi4/README.md).
+# tools/check-rpi4-memory-map.py validates the boot scripts on this board: the banks,
+# their sum against `memory`, containment in real DRAM, the module load addresses and
+# the whole domain budget, in both flavours and both SKUs. It does not model Xen's
+# allocate_memory_11(), so Dom0's bank[0] address is still an observation.
 
 # XEN_OVERLAYS is likewise not consumed by any task here; it is kept because it is the
 # shape upstream's templated path expects, and because it documents which overlays the

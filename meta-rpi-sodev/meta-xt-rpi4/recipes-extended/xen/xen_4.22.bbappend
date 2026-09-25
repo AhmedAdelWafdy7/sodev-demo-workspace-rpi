@@ -1,5 +1,7 @@
 # ============================================================================
-# The rpi4 hypervisor series is the 32 patches listed in SRC_URI below.
+# The rpi4 hypervisor series is the 32 patches listed in SRC_URI below, plus the
+# two the Vulkan lane adds further down: 34 fetched by default, 32 with
+# --gpu=gl.
 # It does NOT include 4.22-0002-route-msi-ranges (see the REMOVED note further
 # down). The rpi5 bbappend takes that one and not the rpi4-only 4.22-0011/0012,
 # which only a mini-UART console needs.
@@ -83,13 +85,60 @@
 # xen_git.bbappend, which retarget XEN_URL/XEN_REV) attach only to xen_git.bb,
 # so once PREFERRED_VERSION_xen selects 4.22.0+stable they become inert.
 
+#
+# --- [Venus] the two hypervisor patches the Vulkan lane adds ---
+#
+# Both are gated on the venus DISTRO_FEATURE (same idiom as the DomD kernel
+# bbappend), so the `--gpu=gl` lane's hypervisor is the pre-Venus series, with
+# none of the Venus additions. (Vulkan is the default lane, so the gated
+# patches are what a plain build gets; `--gpu=gl` is the one that drops them.)
+# That matters for 4.22-0008 in particular: it changes the guest memory map,
+# which is ABI, and there is no reason to move it for a build that never maps a
+# host-visible blob.
+#
+#   4.22-0007  let a device model share its own memory into its guest.
+#              xsm_map_gmfn_foreign() is written for the opposite direction (a
+#              control domain mapping a guest page into itself), so it denies the
+#              device model sharing a virtio-gpu host-visible blob into the guest
+#              -- the blob window then stays trapping MMIO, and on arm64 Xen
+#              cannot even decode the SIMD stores Mesa's venus does to it, so the
+#              guest's Vulkan client dies at its first ring write.
+#
+#              REBASING THIS PATCH NEEDS CARE, and a context refresh is NOT
+#              enough. On 4.21 the page owner came from get_pg_owner(), which
+#              resolves DOMID_SELF -- the domid the device model actually passes
+#              -- to the caller. 4.22 replaced it with
+#              rcu_lock_remote_domain_by_id(), which refuses the caller both ways
+#              (DOMID_SELF is DOMID_FIRST_RESERVED itself -- both 0x7FF0 -- so no
+#              domain can have that id and it is -ESRCH; the real
+#              domid trips that function's own "== current->domain" test and is
+#              -EPERM), both BEFORE the relaxation this patch adds. So the patch
+#              now resolves DOMID_SELF itself. A version that only refreshes the
+#              context applies with zero fuzz, compiles, builds an image, and
+#              never executes -- see docs/VULKAN-VENUS.md.
+#
+#   4.22-0008  move the guest virtio-pci prefetchable window to 0xc0000000 and
+#              grow it to 768 MB. Its old home (64 MB below RAM) could not hold a
+#              BAR bigger than 32 MB, and 32 MB is too small for a virtio-gpu
+#              host-visible blob plus a 1920x1080 swapchain -- measured on RPi5.
+#              0x10000000 is NOT usable: it is exactly GUEST_VPCI_ECAM_BASE/SIZE,
+#              and blob pages enter the guest p2m as real memory so they never
+#              fault and the ECAM MMIO handler never runs -- a guest with a
+#              passthrough PCI device would read blob contents instead of config
+#              space. Shared with the toolstack (libxl derives the guest DT and
+#              the device-model's xenstore keys from the same constants), hence
+#              the xen-common dir; the toolstack bbappend lists it too, and
+#              libxl asserts the coupling at compile time.
+
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 # 0002-0024 + 4.22-000{1,3,4,5} are the same files the xen-tools toolstack bbappend
 # uses and live in a shared dir (meta-xt-common/recipes-extended/xen-common/files)
-# that both this hypervisor bbappend and the xen-tools bbappend point at;
-# 4.22-0006 and 4.22-0013, hypervisor-only, live there too so the two boards carry
-# one copy rather than two. Only the hypervisor-only 0025, the rpi4-only
-# 4.22-0011/0012 and the Kconfig .cfg fragments remain in ./files here.
+# that both this hypervisor bbappend and the xen-tools bbappend point at; the Venus
+# lane adds 4.22-0008 to both from there as well, and keeps the hypervisor-only
+# 4.22-0007 there too so the two boards carry one copy rather than two;
+# 4.22-0006 and 4.22-0013, also hypervisor-only, live there for the same reason.
+# Only the hypervisor-only 0025, the rpi4-only 4.22-0011/0012 and the Kconfig .cfg
+# fragments remain in ./files here.
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../../meta-xt-common/recipes-extended/xen-common/files:"
 
 # --- Xen patch series ---
@@ -132,6 +181,11 @@ SRC_URI:append = " \
     file://4.22-0012-arm-carve-the-fallback-vpl011-out-of-the-extended-re.patch \
     file://4.22-0013-xen-arm-Fix-evaluation-of-parameters-for-SMCCC-calls.patch \
 "
+
+# [Venus] gated so a --gpu=gl build's hypervisor carries no additions from us.
+SRC_URI:append = " ${@bb.utils.contains('DISTRO_FEATURES', 'venus', \
+    'file://4.22-0007-arm-let-a-device-model-share-its-own-memory-into-its-.patch \
+     file://4.22-0008-arm-move-the-guest-virtio-pci-prefetch-window.patch', '', d)}"
 
 # --- hypervisor Kconfig fragments ---
 # xen-hyp-config.cfg: EXPERT/UNSUPPORTED/STATIC_MEMORY (+XSM). CONFIG_TEE and

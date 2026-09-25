@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Cross-check the Raspberry Pi 4 memory map against the files that define it.
+
+The Pi 5 has tools/check-memory-map.py; this is the Pi 4's, and it exists because
+the Pi 4's map is the tighter one and had no automated check behind it at all --
+rpi4-sodev.yaml claimed the Pi 5 tool covered both SKUs, which it never did (its
+--ram takes only 16g and 8g, and its DRAM tables are BCM2712's).
+
+Derived from, never duplicated:
+  * bcm2711-raspberrypi4-64-xen.dtso  -- the 8 GiB DomD banks and `memory`
+  * boot.cmd.xen.{zephyr,linux}-dom0.in
+      - the `board_ram=4g` override block (DomD 1024)
+      - the `venus_lane=yes` sub-block inside it (DomD 1408; the Vulkan lane)
+      - every fatload destination
+  * meta-xt-rpi4/.../xt-xen-cfg-doma_%.bbappend  -- DomA's size per lane
+  * boot.cmd.xen.{zephyr,linux}-dom0.in          -- Dom0's size, from the live
+      xen,xen-bootargs (both files also mention other dom0_mem values in comments)
+  * meta-xt-domu/.../files/domu.cfg              -- DomU's size
+
+What it checks, and why each one can actually go wrong:
+
+  1. banks do not overlap each other -- a hand-edited static-mem cell list is easy
+     to get wrong, and Xen's assign_static_memory_11() does not diagnose it;
+  2. `memory = <hi lo>` (KiB) equals the sum of that lane's banks -- the two are
+     edited together by hand and Xen believes `memory`;
+  3. every bank lies inside real DRAM for the 4 GiB SKU -- a bank in a hole boots
+     to a hang, not to an error;
+  4. no fatload destination lands inside a static-mem bank -- Xen copies modules
+     out before the domain runs, but a clobbered source is silent;
+  5. the 4g block is byte-identical in the two Dom0 flavours -- they are separate
+     files and the block's own comment requires it;
+  6. the Venus override grows ONLY bank@0x40000000 -- bank@0x08000000+384 MiB is
+     the only VideoCore-visible window and carries vc4's CMA and DomD's ZONE_DMA;
+  7. the domain budget fits 3956 MiB for every (SKU, Dom0 flavour, lane), and the
+     Venus transfer is neutral: DomD gains exactly what DomA gives up;
+  8. DomA's size in the bbappend agrees with what the boot script's echo claims.
+
+Usage: tools/check-rpi4-memory-map.py [--strict-budget]
+Exit status is non-zero if any check fails. --strict-budget additionally fails the
+one over-commitment that is intended: DomU and DomA together on the 4 GiB SKU.
+"""
+
+import os
+import re
+import sys
+
+MiB = 1024 * 1024
+GiB = 1024 * MiB
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RPI4 = os.path.join(ROOT, "meta-rpi-sodev", "meta-xt-rpi4")
+XEN_DTSO = os.path.join(RPI4, "recipes-kernel", "linux", "files",
+                        "bcm2711-raspberrypi4-64-xen.dtso")
+BOOTCMDS = {
+    "zephyr": os.path.join(RPI4, "recipes-bsp", "xt-rpi-u-boot-scr", "files",
+                           "raspberrypi4-64", "boot.cmd.xen.zephyr-dom0.in"),
+    "linux": os.path.join(RPI4, "recipes-bsp", "xt-rpi-u-boot-scr", "files",
+                          "raspberrypi4-64", "boot.cmd.xen.linux-dom0.in"),
+}
+DOMA_BBAPPEND = os.path.join(RPI4, "recipes-extended", "xt-xen-cfg-doma",
+                             "xt-xen-cfg-doma_%.bbappend")
+
+# What the firmware reports with gpu_mem=76, from the BOARD_RAM block of
+# rpi4-sodev.yaml (which in turn recorded it from the board). The 4 GiB SKU has no
+# range above 4 GiB at all, which is the whole reason the 4g map exists.
+#
+# CAREFUL: these are (lo, hi_exclusive) pairs, NOT the (base, size) pairs that
+# `banks` uses everywhere else in this file. They are named DRAM_RANGES for that
+# reason -- rewriting them as (base, size) without changing the containment test
+# would make it pass for banks that are NOT in DRAM, which is the direction that
+# hides a fault. The self-check below is what catches such an edit: the ranges must
+# sum to USABLE_MiB, which they do not if read the other way.
+DRAM_RANGES = {
+    "4g": [(0x00000000, 0x3B400000), (0x40000000, 0xFC000000)],
+    "8g": [(0x00000000, 0x3B400000), (0x40000000, 0xFC000000),
+           (0x100000000, 0x200000000)],
+}
+USABLE_MiB = {"4g": 3956, "8g": 8052}
+for _sku, _r in DRAM_RANGES.items():
+    _sum = sum(hi - lo for lo, hi in _r) // MiB
+    if _sum != USABLE_MiB[_sku]:
+        raise SystemExit("ERROR: DRAM_RANGES[%r] sums to %d MiB but USABLE_MiB says "
+                         "%d -- the pairs are (lo, hi_exclusive); if they were just "
+                         "changed to (base, size) that is the bug"
+                         % (_sku, _sum, USABLE_MiB[_sku]))
+
+# Measured, not assumed: 3956 - assigned - `xl info` free_memory came to 78/79/80
+# across three DomD sizes on the 4 GiB board, so use the worst.
+XEN_OVERHEAD_MiB = 80
+# Dom0 differs by flavour, and both values are placement levers for
+# allocate_memory_11() rather than requirements. DERIVED, not duplicated -- this
+# file's whole premise is that it re-reads the sources, and hard-coding these
+# two here would be the same drift the rest of it exists to prevent.
+DOMU_CFG = os.path.join(ROOT, "meta-rpi-sodev", "meta-xt-common", "meta-xt-domu",
+                        "recipes-extended", "xt-xen-cfg-domu", "files", "domu.cfg")
+
+# A module's load slot. The address is parsed; the size is not knowable here, so a
+# flat slot is assumed. Over-reserving can only cause a false alarm, never hide a
+# real overlap. The largest real module is the ~27 MiB DomD Image.
+MODULE_SLOT_BYTES = 32 * MiB
+
+PASS = FAIL = 0
+
+
+def ok(msg):
+    global PASS
+    PASS += 1
+    print("  ok   %s" % msg)
+
+
+def bad(msg):
+    global FAIL
+    FAIL += 1
+    print("  FAIL %s" % msg)
+
+
+def hdr(msg):
+    print("\n== %s ==" % msg)
+
+
+def read(path):
+    with open(path) as f:
+        return f.read()
+
+
+def cells_to_banks(text):
+    """<0x0 0x40000000 0x0 0x28000000 ...> -> [(base, size), ...] (2 cells each)."""
+    words = [int(w, 16) for w in re.findall(r"0x[0-9a-fA-F]+", text)]
+    if len(words) % 4:
+        raise SystemExit("ERROR: %d cells is not a whole number of banks" % len(words))
+    banks = []
+    for i in range(0, len(words), 4):
+        base = (words[i] << 32) | words[i + 1]
+        size = (words[i + 2] << 32) | words[i + 3]
+        banks.append((base, size))
+    return banks
+
+
+def parse_dtso():
+    """The 8 GiB DomD map: (banks, memory_kib) from the host overlay."""
+    s = read(XEN_DTSO)
+    m = re.search(r"memory\s*=\s*<([^>]*)>", s)
+    sm = re.search(r"xen,static-mem\s*=\s*<([^>]*)>", s, re.S)
+    if not m or not sm:
+        raise SystemExit("ERROR: no memory/xen,static-mem in %s" % XEN_DTSO)
+    c = [int(w, 16) for w in re.findall(r"0x[0-9a-fA-F]+", m.group(1))]
+    if len(c) != 2:
+        raise SystemExit("ERROR: dtso memory is not 2 cells")
+    return cells_to_banks(sm.group(1)), (c[0] << 32) | c[1]
+
+
+def extract_4g_block(path):
+    """The whole `if test board_ram = 4g` block, comments included."""
+    s = read(path)
+    m = re.search(r'^if test "\$\{board_ram\}" = "4g" ; then\n(.*?)^fi$',
+                  s, re.M | re.S)
+    if not m:
+        raise SystemExit("ERROR: no board_ram=4g block in %s" % path)
+    return m.group(0)
+
+
+def parse_lane(block, venus):
+    """(banks, memory_kib) for the 4g base lane or its venus override."""
+    # The venus override is the inner `if test venus_lane = yes` block; the base
+    # lane is what precedes it.
+    inner = re.search(r'^\s+if test "\$\{venus_lane\}" = "yes" ; then\n(.*?)^\s+fi$',
+                      block, re.M | re.S)
+    if not inner:
+        raise SystemExit("ERROR: no venus_lane sub-block in the 4g block")
+    text = inner.group(1) if venus else block[:inner.start()]
+    mem = re.findall(r"fdt set /chosen/domD memory <([^>]*)>", text)
+    sm = re.findall(r"fdt set /chosen/domD xen,static-mem <([^>]*)>", text)
+    if len(mem) != 1 or len(sm) != 1:
+        raise SystemExit("ERROR: expected one memory and one static-mem line, got "
+                         "%d/%d (venus=%s)" % (len(mem), len(sm), venus))
+    c = [int(w, 16) for w in re.findall(r"0x[0-9a-fA-F]+", mem[0])]
+    return cells_to_banks(sm[0]), (c[0] << 32) | c[1]
+
+
+def parse_fatloads(path):
+    return [int(m, 16) for m in
+            re.findall(r"^fatload\s+mmc\s+\d+\s+(0x[0-9a-fA-F]+)", read(path), re.M)]
+
+
+def parse_doma_mem():
+    """{(sku, lane): MiB} from the bbappend's inline-python expression.
+
+    Reading the two numbers out of a conditional expression is order-dependent, and
+    a rewrite as `'2560' if not(...) else '2176'` would be read backwards -- which
+    the "the transfer is neutral" check below could not catch, because -384/+384 sums
+    to zero just as well as +384/-384. So pin the shape rather than just the digits:
+    the expression must be `'<venus 4g value>' if <condition> else '<other>'`, the
+    condition must name both the 4 GiB SKU and the VENUS_LANE gate (the same
+    two-valued variable the sibling xt-rpi-u-boot-scr.bbappend uses), and the value
+    the condition selects must be the SMALLER one -- the Venus lane gives memory
+    away.
+    """
+    s = read(DOMA_BBAPPEND)
+    m = re.search(r"DOMA_MEM_MiB:raspberrypi4-64\s*=\s*\"(.*)\"", s)
+    if not m:
+        raise SystemExit("ERROR: no DOMA_MEM_MiB in %s" % DOMA_BBAPPEND)
+    expr = m.group(1)
+    shape = re.match(r"^\$\{@'(\d+)' if (.+) else '(\d+)'\}$", expr.strip())
+    if not shape:
+        raise SystemExit("ERROR: DOMA_MEM_MiB is not of the form "
+                         "\"${@'N' if <cond> else 'M'}\"; this checker reads it "
+                         "positionally and would misread anything else:\n  %s" % expr)
+    venus_4g, cond, other = int(shape.group(1)), shape.group(2), int(shape.group(3))
+    for want in ("'4g'", "VENUS_LANE"):
+        if want not in cond:
+            raise SystemExit("ERROR: the DOMA_MEM_MiB condition does not mention %s, "
+                             "so it is not the (4 GiB SKU and Venus lane) gate this "
+                             "checker assumes:\n  %s" % (want, cond))
+    if venus_4g > other:
+        raise SystemExit("ERROR: the condition selects %d MiB, which is LARGER than "
+                         "the %d MiB it falls back to -- the Venus lane is supposed "
+                         "to give memory to DomD, so this reads inverted:\n  %s"
+                         % (venus_4g, other, expr))
+    return {("4g", "venus"): venus_4g, ("4g", "base"): other,
+            ("8g", "venus"): other, ("8g", "base"): other}
+
+
+def parse_dom0_mem():
+    """{flavour: MiB} from each boot script's live dom0_mem, not from a comment.
+
+    The Zephyr flavour writes the value into xen,xen-bootargs literally; the Linux
+    one writes ${dom0mem} and sets it with `setenv dom0mem 256M`. Both files also
+    MENTION other values in comments (1024M, 512M) while reasoning about
+    allocate_memory_11(), so a naive grep for dom0_mem= picks the wrong one --
+    hence the two shapes below and the "exactly one" requirement.
+    """
+    out = {}
+    for flavour, path in BOOTCMDS.items():
+        s = read(path)
+        args = re.findall(r'fdt set /chosen xen,xen-bootargs "([^"]*)"', s)
+        if len(args) != 1:
+            raise SystemExit("ERROR: %s has %d xen,xen-bootargs lines, expected 1"
+                             % (path, len(args)))
+        m = re.search(r"dom0_mem=(\$\{(\w+)\}|(\d+)M)", args[0])
+        if not m:
+            raise SystemExit("ERROR: no dom0_mem in %s's xen,xen-bootargs" % path)
+        if m.group(3):
+            out[flavour] = int(m.group(3))
+            continue
+        var = m.group(2)
+        sets = re.findall(r"^setenv\s+%s\s+(\d+)M\s*$" % re.escape(var), s, re.M)
+        if len(sets) != 1:
+            raise SystemExit("ERROR: %s sets ${%s} %d times, expected 1"
+                             % (path, var, len(sets)))
+        out[flavour] = int(sets[0])
+    return out
+
+
+def parse_domu_mem():
+    """DomU's size in MiB from domu.cfg -- libxl's `memory` is already MiB."""
+    s = read(DOMU_CFG)
+    m = re.findall(r"^memory\s*=\s*(\d+)\s*$", s, re.M)
+    if len(m) != 1:
+        raise SystemExit("ERROR: %s has %d `memory =` lines, expected 1"
+                         % (DOMU_CFG, len(m)))
+    return int(m[0])
+
+
+def check_banks(banks, memory_kib, sku, label):
+    s = sorted(banks)
+    overlap = False
+    for (b0, s0), (b1, s1) in zip(s, s[1:]):
+        if b0 + s0 > b1:
+            bad("%s: banks overlap: 0x%x+0x%x and 0x%x+0x%x" % (label, b0, s0, b1, s1))
+            overlap = True
+    if not overlap:
+        ok("%s: %d banks, no overlap" % (label, len(banks)))
+
+    total = sum(sz for _, sz in banks)
+    if total != memory_kib * 1024:
+        bad("%s: memory = %d KiB (%d MiB) but the banks sum to %d MiB"
+            % (label, memory_kib, memory_kib // 1024, total // MiB))
+    else:
+        ok("%s: memory = %d MiB matches the banks" % (label, total // MiB))
+
+    outside = [(b, sz) for b, sz in banks
+               if not any(lo <= b and b + sz <= hi for lo, hi in DRAM_RANGES[sku])]
+    if outside:
+        for b, sz in outside:
+            bad("%s: bank 0x%x+0x%x is not inside %s DRAM" % (label, b, sz, sku))
+    else:
+        ok("%s: every bank is inside real %s DRAM" % (label, sku))
+
+
+def check_modules(banks, path, label):
+    clashes = []
+    for addr in parse_fatloads(path):
+        for b, sz in banks:
+            if b <= addr < b + sz or b <= addr + MODULE_SLOT_BYTES - 1 < b + sz:
+                clashes.append((addr, b, sz))
+    if clashes:
+        for addr, b, sz in clashes:
+            bad("%s: fatload to 0x%x lands in static-mem bank 0x%x+0x%x"
+                % (label, addr, b, sz))
+    else:
+        ok("%s: no fatload destination lands in a static-mem bank" % label)
+
+
+def main():
+    strict = "--strict-budget" in sys.argv[1:]
+    dom0_mem = parse_dom0_mem()
+    domu_mem = parse_domu_mem()
+    print("Raspberry Pi 4 memory map cross-check")
+    print("  overlay   : %s" % os.path.relpath(XEN_DTSO, ROOT))
+    for f, p in BOOTCMDS.items():
+        print("  boot.cmd  : %s (%s, dom0_mem=%d MiB)"
+              % (os.path.relpath(p, ROOT), f, dom0_mem[f]))
+    print("  domu.cfg  : %s (DomU %d MiB)"
+          % (os.path.relpath(DOMU_CFG, ROOT), domu_mem))
+
+    # --- the two boot scripts must agree on the 4g block --------------------
+    hdr("the 4g block is the same in both Dom0 flavours")
+    blocks = {f: extract_4g_block(p) for f, p in BOOTCMDS.items()}
+    if blocks["zephyr"] == blocks["linux"]:
+        ok("byte-identical (%d bytes)" % len(blocks["zephyr"]))
+    else:
+        bad("the zephyr and linux flavours' 4g blocks differ")
+
+    block = blocks["zephyr"]
+    domd = {
+        ("8g", "base"): parse_dtso(),
+        # The 8 GiB map is deliberately identical in both lanes: Venus's ~100 MiB is
+        # noise against DomD's 1920 MiB there. Same input on purpose, so the bank
+        # checks for ("8g", "venus") re-run the same assertions -- they are counted,
+        # but they are not additional coverage. What IS checked for 8g is the budget
+        # with DomA's own per-lane size, and the transfer-neutrality below.
+        ("8g", "venus"): parse_dtso(),
+        ("4g", "base"): parse_lane(block, venus=False),
+        ("4g", "venus"): parse_lane(block, venus=True),
+    }
+
+    # --- banks, sums, DRAM containment, module clashes ----------------------
+    for (sku, lane), (banks, mem_kib) in sorted(domd.items()):
+        hdr("DomD banks: %s / %s lane" % (sku, lane))
+        check_banks(banks, mem_kib, sku, "DomD %s/%s" % (sku, lane))
+        for f, p in BOOTCMDS.items():
+            check_modules(banks, p, "DomD %s/%s vs %s modules" % (sku, lane, f))
+
+    # --- the Venus override must not touch the VideoCore window -------------
+    hdr("the Venus override only grows the high bank")
+    base = dict(domd[("4g", "base")][0])
+    venus = dict(domd[("4g", "venus")][0])
+    LOW = 0x08000000
+    if base.get(LOW) is None or venus.get(LOW) is None:
+        bad("no bank at 0x%x in one of the 4g lanes -- the VideoCore/ZONE_DMA "
+            "window must exist in both" % LOW)
+    elif base[LOW] != venus[LOW]:
+        bad("the Venus lane changes bank@0x%x from %d to %d MiB; it carries vc4's "
+            "CMA and DomD's ZONE_DMA and must not move"
+            % (LOW, base[LOW] // MiB, venus[LOW] // MiB))
+    else:
+        ok("bank@0x%x is %d MiB in both lanes" % (LOW, base[LOW] // MiB))
+    changed = {b for b in set(base) | set(venus) if base.get(b) != venus.get(b)}
+    if changed == {0x40000000}:
+        ok("only bank@0x40000000 differs: %d -> %d MiB"
+           % (base[0x40000000] // MiB, venus[0x40000000] // MiB))
+    else:
+        bad("the Venus lane changes banks %s; only 0x40000000 should differ"
+            % ", ".join("0x%x" % b for b in sorted(changed)))
+
+    # --- the budget ---------------------------------------------------------
+    doma = parse_doma_mem()
+    for sku in ("8g", "4g"):
+        for lane in ("base", "venus"):
+            hdr("budget: %s / %s lane" % (sku, lane))
+            domd_mib = domd[(sku, lane)][1] // 1024
+            for flavour, dom0 in sorted(dom0_mem.items()):
+                fixed = XEN_OVERHEAD_MiB + dom0 + domd_mib
+                room = USABLE_MiB[sku] - fixed
+                print("       %s dom0: Xen %d + Dom0 %d + DomD %d = %d MiB, "
+                      "%d MiB left for guests"
+                      % (flavour, XEN_OVERHEAD_MiB, dom0, domd_mib, fixed, room))
+                for guest, size in (("DomU", domu_mem),
+                                    ("DomA", doma[(sku, lane)]),
+                                    ("both", domu_mem + doma[(sku, lane)])):
+                    fits = size <= room
+                    if fits:
+                        ok("%s/%s/%s: %s (%d MiB) fits, %d MiB spare"
+                           % (sku, lane, flavour, guest, size, room - size))
+                    elif sku == "4g" and guest == "both" and not strict:
+                        # Documented and intended: the 4 GiB SKU runs one guest at a
+                        # time. --strict-budget turns it into a failure for anyone who
+                        # wants the stronger invariant.
+                        print("       (expected) %s/%s/%s: both guests (%d MiB) do "
+                              "NOT fit in %d MiB -- that needs the 8 GiB SKU"
+                              % (sku, lane, flavour, size, room))
+                    else:
+                        bad("%s/%s/%s: %s (%d MiB) exceeds the %d MiB left"
+                            % (sku, lane, flavour, guest, size, room))
+
+    # --- the Venus transfer must be neutral --------------------------------
+    hdr("the Venus transfer is a redistribution, not a new commitment")
+    for sku in ("8g", "4g"):
+        d_delta = domd[(sku, "venus")][1] // 1024 - domd[(sku, "base")][1] // 1024
+        a_delta = doma[(sku, "venus")] - doma[(sku, "base")]
+        if d_delta + a_delta == 0:
+            ok("%s: DomD %+d MiB, DomA %+d MiB, total unchanged" % (sku, d_delta, a_delta))
+        else:
+            bad("%s: DomD %+d MiB but DomA %+d MiB -- the total moves by %+d MiB"
+                % (sku, d_delta, a_delta, d_delta + a_delta))
+
+    # --- the boot script's own echo must not lie ---------------------------
+    hdr("the boot script's messages match the values")
+    for lane, venus in (("base", False), ("venus", True)):
+        banks, mem_kib = domd[("4g", lane)]
+        mib = mem_kib // 1024
+        echoes = re.findall(r'echo "([^"]*)"', block)
+        # \b so that 1024 does not match "10240" or "1024x768"; the echo says
+        # "DomD 1408 MiB", so require the unit too.
+        want = re.compile(r"\b%d MiB\b" % mib)
+        hit = [e for e in echoes if want.search(e) and
+               (("venus_lane=yes" in e) == venus)]
+        if hit:
+            ok("4g/%s: an echo mentions %d MiB (%r)" % (lane, mib, hit[0][:60]))
+        else:
+            bad("4g/%s: no echo mentions DomD %d MiB -- the message would mislead "
+                "whoever reads the console" % (lane, mib))
+    a = doma[("4g", "venus")]
+    a_re = re.compile(r"\b%d\b" % a)
+    if any(a_re.search(e) for e in re.findall(r'echo "([^"]*)"', block)):
+        ok("4g/venus: an echo mentions DomA %d MiB, matching the bbappend" % a)
+    else:
+        bad("4g/venus: the bbappend says DomA %d MiB but no echo mentions it" % a)
+
+    print("\n%d ok, %d failure(s)" % (PASS, FAIL))
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

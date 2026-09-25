@@ -47,6 +47,34 @@ overlay.
   empty 8 MiB partition where DomU's rootfs would be, so the DomA nested GPT still lands
   on p4, which is the partition `doma.cfg` opens.
 
+  **The Vulkan lane redistributes this SKU**, because a host-visible blob window is
+  device-model memory in DomD and none of it is reclaimable. With `--gpu=vulkan` (the
+  default), 384 MiB moves from DomA to DomD: **DomD 1408 MiB (bank0 1024 MiB) and DomA
+  2176 MiB**, total unchanged.
+  The direction follows from the asymmetry -- if DomD runs out, weston loses DRM master and
+  both guests' device models die with it, whereas AAOS at 2176 is still 6% above the
+  2048 MiB upstream sizes it at. Sized well above `hostmem` (the hard ceiling on what the
+  device model can pin, 128 MiB) rather than to the ~76-106 MiB estimate: the estimate's
+  biggest term is the one nobody has measured, and the board verification then showed the
+  device model's own footprint under full-Vulkan AAOS needing the rest -- DomD's
+  MemAvailable bottomed at ~460 MiB with 1408. The 8 GiB SKU is untouched: DomD has 1920 MiB there
+  and the delta is noise. Both halves read the lane through the same two-valued
+  `VENUS_LANE` variable -- `xt-rpi-u-boot-scr.bbappend` substitutes it into the boot
+  script, `xt-xen-cfg-doma`'s bbappend tests it in `DOMA_MEM_MiB` -- and
+  `tools/check-rpi4-memory-map.py` re-derives both lanes from those two files so the
+  numbers cannot drift apart (48 assertions, and it fails if the transfer stops summing to
+  zero or if the condition is ever inverted).
+
+  `--gpu=vulkan` selects qemu 10.0.2-xt, which version-gates off the six 7.0.0-only
+  device-model patches. `0111` (virtio-tablet `BTN_TOUCH`) is among them, and Android
+  classifies an ABS_X/ABS_Y device as a touchscreen only when it also reports `BTN_TOUCH`;
+  that fix is rebased for 10.0.2 as `meta-xt-qemu`'s `0118`, so the Vulkan lane keeps the touch
+  this SKU's hardware run verified. `0110` is rebased too (as `0120`), `0112` and `0113`
+  do not apply to 10.0.2 at all, and `0101`/`0103` guard a failure that does not
+  reproduce on it -- the per-patch evidence is in `meta-xt-driver-domain`'s
+  `qemu_%.bbappend`. `--gpu=gl` rebuilds the 7.0.0-xt device model with all six.
+  See `docs/VULKAN-VENUS.md`.
+
 ## Where BCM2711 forced a different design
 
 * **DMA reach decides domain layout.** `/soc` has `dma-ranges` limited to the low
@@ -127,8 +155,7 @@ automotive-grade-linux/Android_device_sodev_xenvm-cf  ->  device/sodev/xenvm-cf
   xenvm_trout_rpi4_arm64/BoardConfig.mk    includes the upstream board config, then
                                            TARGET_CPU_VARIANT := cortex-a72
   init.xenvm-buried-eth0.rc                the minradio interface fix the product
-  overlay/…/SettingsProvider/…/defaults.xml  installs (both leave when the rc is
-                                           upstreamed as an opt-in)
+  overlay/…/SettingsProvider/…/defaults.xml  installs
 ```
 
 The AOSP manifest names it with `groups="notdefault,rpi4"`, so only a checkout that asks
@@ -136,6 +163,13 @@ for the group fetches it: `XT_DOMA_SOURCE_GROUP: "default,rpi4"` in `rpi4-sodev.
 makes `repo init` do that (repo *replaces* the group set, so `default` has to be named
 too). Measured on the pinned revision: 1087 projects with the group, 1086 without, the
 device being the difference — a Pi 5 or a V4H checkout is unaffected.
+
+The DomA features also have a device half, in that repository. Until the
+manifest pins a revision of it that contains them, each rpi4 commit here that
+changes the device carries the repository's matching commit as
+`meta-xt-common/meta-xt-doma/aosp-patches/device/sodev/xenvm-cf/000N-*.patch`,
+numbered in order, and `apply-aosp-patches.sh` applies the series after the AOSP
+fetch; the Pi 5 checkout has no such project and skips it.
 
 `meta-xt-common/meta-xt-doma/stage-aosp-device.sh` no longer copies anything for this
 board; `build.sh` still runs it between `ninja fetch-doma` and `ninja doma`, where it
@@ -250,9 +284,13 @@ The Yocto-built DomD host services need no equivalent: meta-raspberrypi's own
   says so in its header. It has to be regenerated before anyone tries the libxl route on
   this board — which is also where the missing interrupt-type information in
   `irqs=[...]` would bite.
-* **`tools/check-memory-map.py` models BCM2712 only.** The boot scripts and several
-  recipes here describe invariants that such a checker would enforce mechanically;
-  extending it to BCM2711 is worthwhile follow-up work and has not been done.
+* **This board has its own checker: `tools/check-rpi4-memory-map.py`.** The BCM2712
+  tool (`tools/check-memory-map.py`) has no rpi4 rows, so the invariants the boot
+  scripts and recipes here describe are enforced by the rpi4 tool instead: banks and
+  their sum, containment in real DRAM, module load addresses, the two flavours
+  agreeing, the Venus override touching only `bank@0x40000000`, and the domain budget
+  for both SKUs. Neither tool models Xen's `allocate_memory_11()`, so Dom0's bank[0]
+  address remains an observation read off the console.
 
 ## Layout
 

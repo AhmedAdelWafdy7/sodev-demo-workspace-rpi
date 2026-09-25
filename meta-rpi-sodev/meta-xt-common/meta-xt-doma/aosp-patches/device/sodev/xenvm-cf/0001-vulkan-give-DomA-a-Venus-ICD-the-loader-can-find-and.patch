@@ -1,0 +1,246 @@
+From cbbba499a8507ab75a3bef8697b9c8279bca7452 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 25 Sep 2026 09:34:37 +0900
+Subject: [PATCH] vulkan: give DomA a Venus ICD the loader can find, and
+ composite on it
+
+Before this change the guest ran on the Venus device line and composited
+with GL, and the reason was not visible from either side. Measured on
+the built image, and on that image booted as DomA on a PC against the
+same device line:
+
+  obj/MESON_MESA3D/.../intro-buildoptions.json
+                                       vulkan-drivers = []
+  install/usr/local/lib/               libEGL, libGLESv2, libgbm_mesa;
+                                       no libvulkan_*
+  apex/com.google.cf.vulkan/lib64/hw/  vulkan.pastel.so, vulkan.ranchu.so
+  ro.hardware.vulkan                   empty
+  pm list features | grep vulkan       empty
+
+So there was no Venus ICD in the image, nothing told the loader to look
+for one, and nothing asked SurfaceFlinger for Vulkan. The device-line
+difference was real -- the guest DRM driver reports +resource_blob
++host_visible on the Venus lane and -resource_blob -host_visible without
+it -- but every frame was still drawn by GL, and the resulting deltas
+sat at run-to-run noise on the PC (totalFrames +1.6%, averageFPS
++2.0%), which reads as "Venus does nothing" rather than as a switch
+nobody threw.
+
+Six settings, and each one is load-bearing on its own.
+
+BOARD_MESA3D_VULKAN_DRIVERS := virtio puts -Dvulkan-drivers=virtio on
+the meson line and makes Mesa's Android.mk define a vulkan.virtio module
+whose install path is /vendor/lib64/hw/vulkan.virtio.so. BoardConfig.mk
+also records a build-system trap: the MESON_MESA3D rule does not list
+this variable among its prerequisites, and a stale tree ships a 0-byte
+ICD while the build still passes, so obj/MESON_MESA3D* has to be
+removed before a rebuild is relied on.
+
+PRODUCT_PACKAGES += vulkan.virtio installs it. Defining a module is not
+installing it, and the gap is silent: a build with the board config
+alone produced libvulkan_virtio.so (9.3 MB) under
+obj/MESON_MESA3D/install and listed vulkan.virtio in module-info.json
+with the correct install path, while /vendor/lib64/hw/ carried no
+vulkan.*.so at all.
+
+ro.hardware.vulkan=virtio is what makes the loader look for a driver by
+that name at all.
+
+TARGET_VULKAN_SUPPORT := false stops com.google.cf.vulkan from being
+installed. This is the part that is easy to miss: that APEX's .rc sets
+ro.vulkan.apex, and driver.cpp:208-221 then resolves the named APEX's
+exported linker namespace and searches ONLY it, so an ICD in /vendor is
+invisible while the property is set. The alternative -- ship the Venus
+ICD inside a vendor APEX with everything it links against -- is the
+much larger change. The guard covers only that APEX and SwiftShader's
+execmem/use_vulkan_pastel config; the minigbm gralloc and both
+hwcomposer APEXes sit outside it and are unchanged.
+
+TARGET_VULKAN_SUPPORT is assigned ABOVE the inherit, the opposite of
+the PRODUCT_* assignments below it. cuttlefish and trout both write it
+with ?=, and inherit-product only pushes a marker where it appears --
+the real include happens later, in node_fns.mk -- so an assignment here
+pre-empts both. The comment at the top of the product makefile now
+spells that out with the source line numbers, because it is easy to
+get backwards.
+
+debug.renderengine.backend=skiavkthreaded and debug.hwui.renderer=skiavk
+are what actually move compositing onto Vulkan.
+
+The android.hardware.vulkan.* feature XMLs are deliberately NOT
+re-declared here. The dropped APEX shipped level-1, version-1_3 and
+compute-0, which describe gfxstream rather than Venus over V3D;
+re-stating them would assert a level nobody has measured on this board.
+RenderEngine and HWUI reach the loader directly and do not consult
+them, so compositing does not wait on them. They should follow a
+vulkaninfo run on hardware.
+
+README.md is left as it was here and in the four commits after this
+one, so its Contents table and Status describe the device before the
+feature files; the last commit of the series rewrites both.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
+---
+ aosp_xenvm_trout_rpi4_arm64.mk        | 92 +++++++++++++++++++++++++--
+ xenvm_trout_rpi4_arm64/BoardConfig.mk | 32 ++++++++--
+ 2 files changed, 114 insertions(+), 10 deletions(-)
+
+diff --git a/aosp_xenvm_trout_rpi4_arm64.mk b/aosp_xenvm_trout_rpi4_arm64.mk
+index f2dd37b..7b335c8 100644
+--- a/aosp_xenvm_trout_rpi4_arm64.mk
++++ b/aosp_xenvm_trout_rpi4_arm64.mk
+@@ -2,19 +2,99 @@
+ #
+ # Raspberry Pi 4 variant of aosp_xenvm_trout_arm64.
+ #
+-# Everything about the guest is inherited from the upstream product; only the identity
+-# is different, so that this variant gets its own PRODUCT_DEVICE (and therefore its own
+-# BoardConfig.mk and its own out/target/product/ tree). The board-specific part is in
+-# xenvm_trout_rpi4_arm64/BoardConfig.mk.
++# The guest is inherited from the upstream product and given an identity of
++# its own, so that this variant gets its own PRODUCT_DEVICE (and therefore its
++# own BoardConfig.mk and its own out/target/product/ tree). The board-specific
++# part is in xenvm_trout_rpi4_arm64/BoardConfig.mk; what this product adds to
++# the inherited guest follows below, each block saying why it is needed.
+ #
+-# The inherit has to come first: the upstream makefile ends with its own PRODUCT_NAME /
+-# PRODUCT_DEVICE / PRODUCT_MODEL assignments, so ours have to be written after it to win.
++# The inherit has to come first for PRODUCT_* : the upstream makefile ends with its own
++# PRODUCT_NAME / PRODUCT_DEVICE / PRODUCT_MODEL assignments, so ours have to be written
++# after it to win. The block below is the exact opposite and has to come BEFORE, for a
++# reason worth spelling out because it is easy to get backwards:
++#
++#   $(call inherit-product) does not include anything at the point it appears. It only
++#   pushes an $(INHERIT_TAG)<path> marker onto every product variable
++#   (build/make/core/product.mk:532-546); the real include happens later in
++#   build/make/core/node_fns.mk:183-207, where _import-node does `include <parent>` at
++#   :190 and only then recurses into that parent's own inherits at :201. Evaluation
++#   order is therefore leaf -> epam -> trout -> cuttlefish. Anything a parent guards
++#   with ?= or ifndef can be pre-empted by assigning it here, above the inherit.
++
++# ---------------------------------------------------------------------------
++# Vulkan: hand the loader a Venus ICD it can actually find.
++#
++# This has to be above the inherit, and it is not a style choice. cuttlefish's
++# shared/device.mk:46 and trout's aosp_trout_common.mk:97 both write
++# TARGET_VULKAN_SUPPORT ?= true, and evaluation order is leaf -> epam -> trout
++# -> cuttlefish (see the note at the top of this file), so an assignment here
++# pre-empts both.
++#
++# WHY DROP IT. com.google.cf.vulkan is the APEX that carries gfxstream's
++# vulkan.ranchu and SwiftShader's vulkan.pastel, and its own .rc sets
++# ro.vulkan.apex=com.google.cf.vulkan. That property is not a hint:
++# frameworks/native/vulkan/libvulkan/driver.cpp:208-221 resolves the named
++# APEX's exported linker namespace and passes it to LoadDriver, so the loader
++# searches ONLY that namespace. A Venus ICD installed at
++# /vendor/lib64/hw/vulkan.virtio.so is therefore invisible while the property
++# is set, and the failure is the namespace one -- the APEX namespace has no
++# libui.so -- not a missing file. The two ways out are to ship the Venus ICD
++# inside a vendor APEX with everything it links against, or to stop using the
++# APEX driver path; this is the second, and it is much the smaller change.
++#
++# What false removes is narrow, and the scope is measured, not assumed:
++# `grep -rn TARGET_VULKAN_SUPPORT device/google/trout device/google/cuttlefish
++# device/epam` finds exactly two `ifeq` sites in the tree, both in cuttlefish.
++# They are PRODUCT_PACKAGES += com.google.cf.vulkan
++# (cuttlefish/shared/graphics/device_vendor.mk:45) and SwiftShader's
++# PRODUCT_REQUIRES_INSECURE_EXECMEM_FOR_SWIFTSHADER plus
++# soong_config_set cvd use_vulkan_pastel
++# (cuttlefish/shared/swiftshader/device_vendor.mk:17). trout only assigns
++# the variable, never tests it, and epam does not mention it. The minigbm
++# gralloc (com.google.cf.gralloc) and both hwcomposer APEXes are outside the
++# guard and are unaffected.
++#
++# NOT DONE HERE, deliberately: the android.hardware.vulkan.* feature XMLs. The
++# dropped APEX shipped level-1, version-1_3 and compute-0 as prebuilts. Those
++# levels describe gfxstream, not Venus over V3D, and re-declaring them would be
++# asserting a capability nobody measured on this board. SurfaceFlinger's
++# RenderEngine and HWUI do not consult them -- they go through the loader -- so
++# Vulkan compositing does not wait on this. Declare them from a vulkaninfo run
++# on the board, one level at a time.
++TARGET_VULKAN_SUPPORT := false
++
+ $(call inherit-product, device/epam/aosp-xenvm-trout/aosp_xenvm_trout_arm64.mk)
+ 
+ PRODUCT_NAME := aosp_xenvm_trout_rpi4_arm64
+ PRODUCT_DEVICE := xenvm_trout_rpi4_arm64
+ PRODUCT_MODEL := xenvm arm64 trout (Raspberry Pi 4)
+ 
++# Install the ICD. BOARD_MESA3D_VULKAN_DRIVERS makes Mesa's Android.mk DEFINE
++# the module -- android/Android.mk:203-205 expands it to vulkan.virtio with an
++# install path of /vendor/lib64/hw/vulkan.virtio.so -- but a defined module that
++# no product asks for is never installed. Measured on a full build with the
++# board config alone: meson produced libvulkan_virtio.so (9.3 MB) in
++# obj/MESON_MESA3D/install, module-info.json listed vulkan.virtio with the right
++# install path, and /vendor/lib64/hw/ carried no vulkan.*.so at all.
++PRODUCT_PACKAGES += \
++    vulkan.virtio
++
++# Vulkan, guest side. ro.hardware.vulkan is what makes the loader look for
++# vulkan.<name>.so at all -- with it empty, as it was before this change, the
++# loader searches for nothing and pm list features reports no Vulkan.
++# BOARD_MESA3D_VULKAN_DRIVERS in this device's BoardConfig.mk is what builds
++# the matching ICD.
++PRODUCT_VENDOR_PROPERTIES += \
++    ro.hardware.vulkan=virtio
++
++# What actually turns Vulkan compositing on. Without these two the guest runs
++# on the Venus device line and still composites with GL, which is measurable
++# only as run-to-run noise -- so their absence looks like "Venus does nothing"
++# rather than like a missing switch.
++PRODUCT_VENDOR_PROPERTIES += \
++    debug.renderengine.backend=skiavkthreaded \
++    debug.hwui.renderer=skiavk
++
+ # Start the interface rename that minradio's data call depends on. cuttlefish already
+ # ships the service and a trigger for it, but trout sets ro.vendor.disable_rename_eth0
+ # so that trigger never fires; overriding that is deliberate and argued in the .rc.
+diff --git a/xenvm_trout_rpi4_arm64/BoardConfig.mk b/xenvm_trout_rpi4_arm64/BoardConfig.mk
+index 9893b87..3443306 100644
+--- a/xenvm_trout_rpi4_arm64/BoardConfig.mk
++++ b/xenvm_trout_rpi4_arm64/BoardConfig.mk
+@@ -2,10 +2,11 @@
+ #
+ # Board configuration for the Raspberry Pi 4 variant of the xenvm-trout AAOS guest.
+ #
+-# The upstream board config is included wholesale and only the ISA baseline is changed
+-# after it, so this file stays a delta rather than a fork: partition sizes, bootconfig,
+-# sepolicy dirs, kernel cmdline and the mesa3d/virgl selection all keep coming from
+-# device/epam/aosp-xenvm-trout.
++# The upstream board config is included wholesale, and everything after it adds
++# to it: the ISA baseline, then one section for each DomA feature that needs a
++# board variable. This file stays a delta rather than a fork -- partition sizes,
++# bootconfig, the kernel cmdline, epam's sepolicy dirs and the Gallium (virgl)
++# driver selection all keep coming from device/epam/aosp-xenvm-trout.
+ include device/epam/aosp-xenvm-trout/xenvm_trout_arm64/BoardConfig.mk
+ 
+ # --- Raspberry Pi 4 (BCM2711) ISA baseline ---------------------------------------
+@@ -49,3 +50,26 @@ include device/epam/aosp-xenvm-trout/xenvm_trout_arm64/BoardConfig.mk
+ # raspberrypi4-64 and are therefore already safe.
+ TARGET_ARCH_VARIANT := armv8-a
+ TARGET_CPU_VARIANT := cortex-a72
++
++# ---------------------------------------------------------------------------
++# Build the Venus ICD.
++#
++# The included board config sets BOARD_MESA3D_USES_MESON_BUILD and
++# GALLIUM_DRIVERS := virgl and stops there, so the product's Mesa was built
++# with -Dvulkan-drivers= and nothing after it: measured in
++# obj/MESON_MESA3D/.../intro-buildoptions.json as vulkan-drivers = [], and the
++# install tree carries libEGL/libGLESv2/libgbm_mesa and no libvulkan_*.so at
++# all. Naming the driver here is what puts -Dvulkan-drivers=virtio on the meson
++# line (vendor/epam/mesa3d_upstream/android/mesa3d_cross.mk:92) and what makes
++# android/Android.mk:203-205 emit the vulkan.virtio module into
++# /vendor/lib64/hw/.
++#
++# One build-system trap worth knowing before touching this: the MESON_MESA3D
++# .build.timestamp rule does rm -rf / cp -r / meson setup / ninja wholesale, and
++# its prerequisites do not include this variable, so a change here is not
++# guaranteed to retrigger it by make semantics alone. Worse,
++# mesa3d_cross.mk's vulkan_target touches an empty .so when the real one is
++# absent and Android.mk's mesa3d-lib sets LOCAL_CHECK_ELF_FILES := false, so a
++# stale tree ships a 0-byte ICD and the build still passes. Remove
++# obj/MESON_MESA3D* before relying on a rebuild.
++BOARD_MESA3D_VULKAN_DRIVERS := virtio

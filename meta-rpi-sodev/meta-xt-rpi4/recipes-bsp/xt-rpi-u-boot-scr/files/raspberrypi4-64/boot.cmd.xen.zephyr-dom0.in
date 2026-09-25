@@ -103,11 +103,52 @@
 #          choice is which one is started.
 # Xen's 80 MiB is measured, not assumed: `xl info` across three DomD sizes on the
 # 4 GiB board gave 78/79/80 MiB of overhead (frametable + xenheap + image).
-# Nothing re-derives the two configurations from THIS file and the host overlay on
-# this board: tools/check-memory-map.py models BCM2712 only
-# (meta-xt-rpi4/README.md), so this file and the overlay can drift apart silently.
-# Keep them in step by hand.
+# tools/check-rpi4-memory-map.py re-derives both configurations from THIS file and
+# the host overlay -- banks, their sum against `memory`, containment in real DRAM,
+# module load addresses, the two flavours agreeing, and the whole domain budget --
+# so the numbers here and there cannot drift apart. It does NOT model
+# allocate_memory_11(); Dom0's bank[0] placement below is reasoned, not checked.
 setenv board_ram BOARD_RAM_PLACEHOLDER
+
+# -----------------------------------------------------------------------------
+# VENUS LANE — is this build the Vulkan (Venus) one?
+# -----------------------------------------------------------------------------
+# `setenv venus_lane` below is SUBSTITUTED AT BUILD TIME by the same bbappend, from
+# whether 'venus' is in DISTRO_FEATURES (moulin --GPU vulkan, i.e. build.sh's default).
+# It is deliberately a SEPARATE axis from board_ram: the delta it causes is not a
+# property of the SKU but of what runs on it.
+#
+# WHY IT CHANGES THE MAP. Venus costs memory in DomD, not in the guest: the
+# host-visible blob window is device-model memory in a PCI BAR, so the guest's own
+# allocation is untouched. And none of it is reclaimable -- the device model's
+# pagemap-sourced blob pages are mlock()ed and the dma-buf ones are pinned by the
+# gntdev import, whereas most of DomD's "in use" today is page cache, which is.
+# Estimated from the RPi5 blob inventory scaled to DomA's 1920x720: the venus ring
+# and shmem pools ~9 MiB, the 16 MiB vn_device_memory suballocation pool, four
+# swapchain images at ~5.3 MiB = ~21 MiB, so ~46 MiB of blobs, plus the
+# virgl_render_server and V3DV working set (~30-60 MiB, never measured on this
+# board) -- call it 76-106 MiB, with a hard ceiling of `hostmem` (128 MiB) plus the
+# server.
+#
+# On the 8 GiB SKU that is noise against DomD's 1920 MiB. On the 4 GiB SKU it is
+# not: DomD 1024 was measured to leave 244 MiB MemFree with DomU's device model
+# running, and 1024 was chosen over the 896 that also worked precisely to keep that
+# 244 MiB for DomA's device model, which is bigger (vsock, virtio-serial with six
+# virtconsoles, a second NIC) and has never been measured here. Venus would spend
+# exactly that reserve.
+#
+# So on 4g + Venus, move 384 MiB from DomA to DomD: DomD 1408, DomA 2176. The total
+# is unchanged (80 + 128 + 1408 + 2176 = 3792 of 3956, the same 164 MiB spare), so
+# this is a redistribution and not a new commitment. The blob window is 128 MiB, and
+# the transfer is three times that rather than the
+# estimate because it is `hostmem`, the hard upper bound on what the device model
+# can pin -- sizing to the bound keeps the reserve even if the estimate is wrong,
+# and the biggest term in it is the one nobody has measured. The asymmetry decides
+# the direction: if DomD runs out, weston loses DRM master and BOTH guests' device
+# models die with it, while 384 MiB less guest RAM is imperceptible and AAOS at
+# 2176 is still above the 2048 MiB upstream sizes it at. DomA's side of the
+# transfer is in meta-xt-rpi4's xt-xen-cfg-doma bbappend, gated the same way.
+setenv venus_lane VENUS_LANE_PLACEHOLDER
 
 fdt addr ${fdt_addr}
 # NOTE: `fdt resize`'s argument is parsed with hextoul() (u-boot cmd/fdt.c:778),
@@ -180,9 +221,10 @@ fdt apply 0x2200000
 # Dom0's bank[0] placement is NOT affected: shrinking bank0 only frees memory at
 # 0x68000000-0x80000000, which is above the 1 GiB lowmem_bitsize window
 # allocate_memory_11() searches. The low map (modules below 0x08000000, DomD bank1
-# 0x08000000-0x20000000, the free hole at 0x20000000) is untouched, which is why
-# bank[0] stays where it was measured. Nothing verifies that automatically here:
-# tools/check-memory-map.py models BCM2712 only (meta-xt-rpi4/README.md).
+# 0x08000000-0x20000000, the free hole at 0x20000000) is untouched. NOT machine-
+# checked: tools/check-rpi4-memory-map.py verifies the banks and the budget but
+# does not model allocate_memory_11(), so bank[0] at 0x20000000 rests on this
+# reasoning plus the hardware observation recorded above.
 #
 # The `if test` below is safe to rely on: cmd/Makefile:180 is
 # `obj-$(CONFIG_HUSH_PARSER) += test.o`, and this u-boot has CONFIG_HUSH_PARSER=y
@@ -190,13 +232,27 @@ fdt apply 0x2200000
 # CONFIG_CMD_TEST to forget. That matters because a missing `test` would make the
 # condition fail and silently select the 8 GiB map on a 4 GiB board.
 #
-# Nothing checks that the two flavours agree on this override -- tools/check-memory-map.py
-# models BCM2712 only -- so keep the two boot.cmd files byte-identical in this block
-# by hand.
+# tools/check-rpi4-memory-map.py re-derives this override for BOTH flavours and
+# fails if they differ, so keep the two boot.cmd files byte-identical in this block.
+# It also checks that the Venus sub-block grows only bank@0x40000000 and that what
+# DomD gains DomA gives up.
 if test "${board_ram}" = "4g" ; then
     echo "board_ram=4g: DomD 1024 MiB (bank2 dropped, bank0 640 MiB)"
     fdt set /chosen/domD memory <0x0 0x100000>
     fdt set /chosen/domD xen,static-mem <0x0 0x40000000 0x0 0x28000000 0x0 0x08000000 0x0 0x18000000>
+    # 4g + Venus: +384 MiB for the device model's pinned blob memory, taken from
+    # DomA (see the venus_lane block above). ONLY bank0 grows -- bank1 at
+    # 0x08000000+384 MiB must not move or shrink, it is the only VideoCore-visible
+    # window and it carries vc4's CMA and DomD's ZONE_DMA. bank0 ends at
+    # 0x80000000, exactly where the 8g map's dropped bank2 started,
+    # and far above the 1 GiB lowmem window allocate_memory_11() scans for Dom0's
+    # bank[0] at 0x20000000 -- so Dom0's placement, the module load addresses
+    # (0xa0000000 DTB, 0xa4000000 kernel) and the whole low map are unaffected.
+    if test "${venus_lane}" = "yes" ; then
+        echo "venus_lane=yes: DomD 1408 MiB (bank0 1024 MiB); DomA drops to 2176"
+        fdt set /chosen/domD memory <0x0 0x160000>
+        fdt set /chosen/domD xen,static-mem <0x0 0x40000000 0x0 0x40000000 0x0 0x08000000 0x0 0x18000000>
+    fi
 fi
 
 # dom0_mem is NOT board-dependent in this flavour: 128M is chosen for its
@@ -308,9 +364,9 @@ fdt rm /framebuffer@3f800000
 #     which on its own is reason enough not to shrink dom0_mem.
 #     Dom0's size is a PLACEMENT LEVER on this board, not a memory requirement.
 #     Nothing models this scan for BCM2711 and nothing fails the build if
-#     rpi_4b.overlay's sram0 base disagrees with it: tools/check-zephyr-patches.sh
-#     does not exist in this repo, and tools/check-memory-map.py models BCM2712
-#     only. The Zephyr board patch says the same thing
+#     rpi_4b.overlay's sram0 base disagrees with it: tools/check-rpi4-memory-map.py
+#     checks this board's banks and budget but not allocate_memory_11(), and the
+#     BCM2712 tool has no rpi4 rows. The Zephyr board patch says the same thing
 #     (0019-boards-rpi_4b-zephyr-dom0-board.patch) -- read BANK[0] off the Xen
 #     console on the first boot; a mismatch is total UART silence.
 fdt set /chosen xen,xen-bootargs "console=dtuart dtuart=/soc/serial@7e201000 dom0_mem=128M dom0_max_vcpus=1 xsm=dummy gnttab_max_frames=512 bootscrub=off loglvl=all guest_loglvl=all sync_console"

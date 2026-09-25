@@ -38,10 +38,27 @@ DOM0_OS ??= "zephyr"
 # Board RAM size: 8g (default) or 4g. rpi4-sodev.yaml injects it from the BOARD_RAM
 # moulin parameter (build.sh --ram=8g|4g). The boot scripts carry
 # `setenv board_ram BOARD_RAM_PLACEHOLDER` and branch on the resulting env var at
-# run time, so the whole 4 GiB delta lives in ONE file.
-# No checker validates either value on this board: tools/check-memory-map.py models
-# BCM2712 only (meta-xt-rpi4/README.md).
+# run time, so the whole 4 GiB delta lives in ONE file that
+# tools/check-rpi4-memory-map.py validates for both values.
 BOARD_RAM ??= "8g"
+
+# Is this the Vulkan (Venus) lane? Read straight from DISTRO_FEATURES rather than
+# taking a new moulin variable: 'venus' is already what --GPU vulkan adds in the
+# domd conf, so there is nothing to keep in sync and no *-sodev.yaml drift. The
+# boot script uses it only on the 4 GiB SKU, to move 384 MiB from DomA to DomD for
+# the device model's pinned blob memory -- the rationale is in the boot script next
+# to the value. DomA's side of the same transfer is meta-xt-rpi4's
+# xt-xen-cfg-doma bbappend, which reads VENUS_LANE the same way on purpose.
+#
+# This substitution is rpi4-only. meta-xt-rpi5's boot scripts have no venus
+# branch (the Pi 5 moves no memory for the lane on either SKU) and meta-xt-rpi5
+# has no bbappend doing this, so `git grep VENUS_LANE_PLACEHOLDER` must stay
+# confined to this layer.
+# Adding a venus branch to an rpi5 boot script therefore needs the placeholder
+# check to be added there too -- without it `venus_lane` stays the literal
+# placeholder, matches neither `test` branch, and the board silently takes the
+# non-Venus map: the exact failure the bbfatal below exists to prevent.
+VENUS_LANE = "${@bb.utils.contains('DISTRO_FEATURES', 'venus', 'yes', 'no', d)}"
 
 do_compile:raspberrypi4-64() {
     case "${BOARD_RAM}" in
@@ -64,6 +81,15 @@ do_compile:raspberrypi4-64() {
     fi
     sed -i "s/^setenv board_ram BOARD_RAM_PLACEHOLDER\$/setenv board_ram ${BOARD_RAM}/" \
         ${WORKDIR}/${UBOOT_BOOT_SCRIPT_SOURCE}
+    # Same treatment for the Venus axis, and the same reason to fail loudly: an
+    # un-substituted `venus_lane` matches neither branch, so the Venus lane would
+    # silently get the non-Venus DomD size and DomD would be the domain that runs
+    # out -- which takes weston's DRM master and both guests' device models with it.
+    if ! grep -q '^setenv venus_lane VENUS_LANE_PLACEHOLDER$' ${WORKDIR}/${UBOOT_BOOT_SCRIPT_SOURCE}; then
+        bbfatal "VENUS_LANE_PLACEHOLDER not found in ${BOOTCMD_SRC}"
+    fi
+    sed -i "s/^setenv venus_lane VENUS_LANE_PLACEHOLDER\$/setenv venus_lane ${VENUS_LANE}/" \
+        ${WORKDIR}/${UBOOT_BOOT_SCRIPT_SOURCE}
     rm -f ${B}/${UBOOT_BOOT_SCRIPT}
     cd ${B} && mkimage -A ${UBOOT_ARCH} -T script -C none -n "Boot script" \
         -d "${WORKDIR}/${UBOOT_BOOT_SCRIPT_SOURCE}" ${UBOOT_BOOT_SCRIPT}
@@ -72,4 +98,4 @@ do_compile:raspberrypi4-64() {
 # The boot script is flavour-dependent, so DOM0_OS must be part of the task hash;
 # otherwise building zephyr then linux against one sstate cache reuses the wrong
 # boot.scr.
-do_compile[vardeps] += "DOM0_OS BOARD_RAM"
+do_compile[vardeps] += "DOM0_OS BOARD_RAM VENUS_LANE"
