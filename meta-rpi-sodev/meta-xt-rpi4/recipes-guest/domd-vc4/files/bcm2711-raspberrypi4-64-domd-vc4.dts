@@ -74,8 +74,8 @@
  *
  * That is modelled with four intermediate simple-bus wrappers, each carrying
  * only the dma-ranges its children need (MMIO stays identity via `ranges;`):
- *     soc_bus                ->  <0x0 0xc8000000  0x0 0x08000000  0x0 0x18000000>
- *                                bus 0xc8000000 == phys 0x08000000, 384 MiB
+ *     soc_bus                ->  <0x0 0xc6000000  0x0 0x06000000  0x0 0x1a000000>
+ *                                bus 0xc6000000 == phys 0x06000000, 416 MiB
  *     emmc2_bus              ->  <0x0 0x0  0x0 0x0  0x0 0xfc000000>
  *                                identity, as the firmware-fixed host DT has it
  *     legacy_dma_bus         ->  <0x0 0x7c000000  0x0 0xfc000000  0x0 0x03800000>,
@@ -83,8 +83,11 @@
  *                                the host /soc pair verbatim: peripherals as the
  *                                VideoCore sees them, plus the DRAM alias
  *     scb_bus   / v3d_bus    ->  identity
- * 0x08000000+0x18000000 is exactly DomD static-mem bank1 from
- * bcm2711-raspberrypi4-64-xen.dtso, i.e. the only DomD RAM the VideoCore can see.
+ * 0x06000000+0x1a000000 covers DomD static-mem bank1 on both SKUs, the only DomD
+ * RAM the VideoCore can see: it IS bank1 on the 4 GiB map (set by the boot
+ * script's board_ram block) and contains the 8 GiB map's 0x08000000+384 MiB
+ * (bcm2711-raspberrypi4-64-xen.dtso). Only the start moved down; the end, and
+ * with it the tree minimum in (a) below, is still 0x20000000.
  * legacy_dma_bus is a bus of its own rather than a second dma-ranges entry on
  * soc_bus because of_dma_get_max_cpu_address() takes the MAXIMUM of cpu_addr+size
  * WITHIN a node but the MINIMUM ACROSS nodes: this bus's own maximum is
@@ -278,7 +281,8 @@
 		 * soc_bus — every /soc device DomD owns.
 		 *
 		 * dma-ranges gives the VideoCore bus alias (phys + 0xc0000000)
-		 * bounded to DomD static-mem bank1 (0x08000000 + 384 MiB), the
+		 * bounded to DomD static-mem bank1 (0x06000000 + 416 MiB on the
+		 * 4 GiB map; the 8 GiB map's bank1 is the top 384 MiB of it), the
 		 * only DomD RAM below the 1 GiB VideoCore DMA limit. This is the
 		 * RPi4 equivalent of the RPi5 "mbox-bus" fix, but it now also
 		 * covers HVS (display fetch) and — via emmc2_bus — the SD
@@ -290,7 +294,7 @@
 			#address-cells = <0x2>;
 			#size-cells = <0x2>;
 			ranges;
-			dma-ranges = <0x0 0xc8000000 0x0 0x08000000 0x0 0x18000000>;
+			dma-ranges = <0x0 0xc6000000 0x0 0x06000000 0x0 0x1a000000>;
 
 			/* ---- VideoCore mailbox + firmware interface ---- */
 			mailbox: mailbox@fe00b880 {
@@ -566,10 +570,30 @@
 			 * at +0x1f00 size 0x400, which spills over into
 			 * 0xfef02000 -- two pages, not one), 0xfef04000
 			 * (cec + ddc0's bsc) and the shared 0xfef20000 (hd).
-			 * `dmas`/`dma-names` for HDMI audio are dropped on
-			 * purpose — the equivalent of the vc4-kms-v3d overlay's
-			 * `noaudio` override; DomD's cockpit has no HDMI audio,
-			 * so vc4 registers no HDMI sound card.
+			 * `dmas`/`dma-names` carry HDMI audio: DomA (AAOS) plays
+			 * out of HDMI through qemu's virtio-snd, which opens
+			 * DomD's vc4hdmi ALSA card, so the 40-bit DMA controller
+			 * the host routes them to is passed through (dma40 on
+			 * scb_bus).
+			 *
+			 * Why this is the load-bearing property:
+			 * vc4_hdmi_audio_init() (drivers/gpu/drm/vc4/vc4_hdmi.c:2263)
+			 *     if (!of_find_property(dev->of_node, "dmas", &len) || !len) {
+			 *             dev_warn(dev, "'dmas' DT property is missing or
+			 *                      empty, no HDMI audio\n");
+			 *             return 0;
+			 *     }
+			 * returns 0, so vc4 probes fine and DISPLAY WORKS; only the
+			 * ASoC card is silently not registered, with one dev_warn.
+			 *
+			 * The DREQ numbers and flag bits are the host DTB's values,
+			 * verbatim: bcm2711-rpi-4-b.dtb has dmas = <&dma40 0x41fa000a>
+			 * on HDMI0 and 0x41fa0011 on HDMI1. Written in the same
+			 * decomposed form as meta-xt-rpi5's bcm2712-raspberrypi5-hdmi.dtso,
+			 * which evaluates bit-for-bit to those constants:
+			 *     10|(1<<30)|(1<<24)|(10<<16)|(15<<20) == 0x41fa000a
+			 * (bit30 = 40-bit addressing; bit24 and the two nibble fields
+			 * are the burst/panic thresholds).
 			 */
 			hdmi0: hdmi@fef00700 {
 				compatible = "brcm,bcm2711-hdmi0";
@@ -611,6 +635,8 @@
 						  "wakeup", "hpd-connected",
 						  "hpd-removed";
 				wifi-2.4ghz-coexistence;
+				dmas = <&dma40 (10|(1<<30)|(1<<24)|(10<<16)|(15<<20))>;
+				dma-names = "audio-rx";
 				xen,path = "/soc/hdmi@7ef00700";
 				xen,force-assign-without-iommu;
 				xen,reg = <0x0 0xfef01000 0x0 0x2000 0x0 0xfef01000>,
@@ -649,6 +675,8 @@
 						  "wakeup", "hpd-connected",
 						  "hpd-removed";
 				wifi-2.4ghz-coexistence;
+				dmas = <&dma40 (17|(1<<30)|(1<<24)|(10<<16)|(15<<20))>;
+				dma-names = "audio-rx";
 				xen,path = "/soc/hdmi@7ef05700";
 				xen,force-assign-without-iommu;
 				/*
@@ -1063,7 +1091,8 @@
 		};
 
 		/* ==============================================================
-		 * scb_bus — identity DMA over 16 GiB, matching the host /scb.
+		 * scb_bus — the host /scb dma-ranges verbatim: the VideoCore
+		 * peripheral alias window, then identity DMA over 16 GiB.
 		 * Hosts the PCIe root complex (VL805 USB3), GENET and dma40.
 		 *
 		 * CORRECTED(2026-07-26): this used to declare 3 GiB
@@ -1087,18 +1116,67 @@
 			#address-cells = <0x2>;
 			#size-cells = <0x2>;
 			ranges;
-			dma-ranges = <0x0 0x0 0x0 0x0 0x4 0x0>;
+			/*
+			 * THE PERIPHERAL WINDOW IS WHAT MAKES HDMI AUDIO AUDIBLE.
+			 * vc4_hdmi's MAI FIFO is a SLAVE register, not a buffer:
+			 *   vc4_hdmi.c:2277-2286
+			 *     index = of_property_match_string(..., "reg-names", "hd");
+			 *     iomem = platform_get_resource(pdev, IORESOURCE_MEM, index);
+			 *     vc4_hdmi->audio.dma_data.addr = iomem->start + mai_data->offset;
+			 *   = 0xfef20000 (hd, see hdmi0) + 0x1c (HDMI_MAI_DATA,
+			 *     vc4_hdmi_regs.h:250) = 0xfef2001c.  hdmi1 uses +0x3c (:343).
+			 * bcm2835-dma.c:1032 maps that against dma40's own device, i.e.
+			 * against THIS bus:
+			 *     dst = dma_map_resource(chan->device->dev, c->cfg.dst_addr, ...)
+			 * and the translation walks dma_range_map and returns the FIRST
+			 * match. With only the memory entry, 0xfef2001c falls inside the
+			 * 16 GiB identity window and comes back unchanged instead of
+			 * becoming the VC peripheral alias 0x4_7ef2001c. Nothing reports an
+			 * error: the controller writes audio frames to an address that is
+			 * not the FIFO, hw_ptr never advances, and there is no xrun and no
+			 * dmesg line to find.
+			 *
+			 * WHY THE ALIAS HOLDS UNDER XEN. (1) 0xfef20000 is the same inside
+			 * DomD as on the host -- hdmi0's xen,reg maps
+			 * <0x0 0xfef20000 0x0 0x1000 0x0 0xfef20000>, host_pbase ==
+			 * guest_gbase -- so the value this window translates is the real
+			 * register address. (2) 0x4_7ef2001c is a bus-master access by dma40
+			 * to a PERIPHERAL alias, not to guest RAM. BCM2711 has no IOMMU
+			 * (every assignment here uses xen,force-assign-without-iommu and
+			 * dma40 declares no `iommus`), so Xen does not interpose on device
+			 * DMA and the SoC fabric decodes the alias exactly as for host Linux.
+			 *
+			 * ORDER IS LOAD-BEARING: the 16 GiB memory entry would SHADOW a
+			 * peripheral entry placed after it. Upstream has the same order
+			 * (arch/arm/boot/dts/broadcom/bcm2711-rpi-ds.dtsi:123-124).
+			 * RAM never lies in 0xfc000000-0xff7fffff, so PCIe, GENET and every
+			 * DMA buffer still take the identity entry, and this bus's maximum
+			 * CPU address is unchanged (the low-CMA placement soc_bus pins is
+			 * not disturbed).
+			 *
+			 * v3d_bus keeps the memory-only form: V3D has its own MMU and
+			 * upstream /v3dbus declares the identity window only.
+			 *
+			 * Verified on hardware 2026-09-23 (Xen 4.22, DomD with dma40): a 440 Hz
+			 * tone played in DomA reached the panel through vc4hdmi0. Before
+			 * that the window had had no hardware check, and HDMI audio had never
+			 * been audible on the Pi 4.
+			 */
+			dma-ranges = <0x4 0x7c000000 0x0 0xfc000000 0x0 0x03800000>,
+				     <0x0 0x0        0x0 0x0        0x4 0x0>;
 
 			/*
 			 * ---- 40-bit DMA controller (dma40) ----
-			 * Hardware H.264 decode needs it: vchiq_arm.c:219 looks the
-			 * controller up by compatible ("brcm,bcm2711-dma") and FAILS ITS
-			 * PROBE without it (measured 2026-09-23 on this board:
-			 *   bcm2835_vchiq fe00b840.mailbox: 40-bit DMA controller not found
-			 *   probe with driver bcm2835_vchiq failed with error -22
-			 * ), so bcm2835-codec never appears as /dev/video10, qemu's
-			 * virtio-media cannot open it, and xl create of DomA fails as a
-			 * whole.
+			 * Two DomA features need it:
+			 *  - HDMI audio: both HDMI nodes point their audio-rx DREQ here.
+			 *  - hardware H.264 decode: vchiq_arm.c:219 looks the controller
+			 *    up by compatible ("brcm,bcm2711-dma") and FAILS ITS PROBE
+			 *    without it (measured 2026-09-23 on this board:
+			 *      bcm2835_vchiq fe00b840.mailbox: 40-bit DMA controller not found
+			 *      probe with driver bcm2835_vchiq failed with error -22
+			 *    ), so bcm2835-codec never appears as /dev/video10, qemu's
+			 *    virtio-media cannot open it, and xl create of DomA fails as a
+			 *    whole.
 			 *
 			 * The host has TWO DMA controllers and DomD takes both, for
 			 * different users:
@@ -1107,10 +1185,10 @@
 			 *   /scb/dma@7e007b00   brcm,bcm2711-dma   mask 0x7000 this node
 			 *
 			 * `#dma-cells = <1>` is a DREQ number, not a channel index
-			 * (Documentation/devicetree/bindings/dma/brcm,bcm2835-dma.yaml);
-			 * requests are served out of the channel pool that
-			 * brcm,dma-channel-mask names -- 0x7000 = channels 12/13/14.
-			 * Keep the mask at the host value: narrowing it would
+			 * (Documentation/devicetree/bindings/dma/brcm,bcm2835-dma.yaml),
+			 * so DREQ 10 (HDMI0) and 17 (HDMI1) are served out of the channel
+			 * pool that brcm,dma-channel-mask names -- 0x7000 = channels
+			 * 12/13/14. Keep the mask at the host value: narrowing it would
 			 * starve the pool, widening it would claim the legacy engine's
 			 * channels.
 			 *
@@ -1124,14 +1202,16 @@
 			 * Xen host overlay marks /scb/dma@7e007b00 xen,passthrough so they are
 			 * not given to the hardware domain first.
 			 *
-			 * WHY scb_bus AND NOT soc_bus: the host DT has this controller under
-			 * /scb, and vchiq keeps its struct device (g_dma_dev in vchiq_core.c,
-			 * which it hands to dma_unmap_sg() and dma_free_coherent()), so the
-			 * node sits where its DMA window is the host's: scb_bus's identity
-			 * window over the full 16 GiB, which holds every DomD static-mem
-			 * bank; soc_bus would clamp it to the VideoCore alias window.
+			 * WHY scb_bus AND NOT soc_bus: the audio buffer is allocated and
+			 * DMA-mapped against the DMA CONTROLLER's struct device, not the HDMI
+			 * card's (sound/soc/soc-generic-dmaengine-pcm.c: dmaengine_dma_dev()
+			 * at :28, snd_pcm_set_managed_buffer() at :259). scb_bus reaches the
+			 * full 16 GiB, so every DomD static-mem bank is inside it; soc_bus
+			 * would clamp it to the VideoCore alias window, and with no IOMMU a
+			 * buffer above that window transfers garbage rather than failing.
+			 * It also matches the host DT, where this controller is under /scb.
 			 *
-			 * OUTSIDE THE SD-STRIP BLOCK ON PURPOSE: both Dom0 flavours give vchiq
+			 * OUTSIDE THE SD-STRIP BLOCK ON PURPOSE: both Dom0 flavours give HDMI
 			 * to DomD, so both need the controller.
 			 */
 			dma40: dma@fe007b00 {
@@ -1582,8 +1662,9 @@
 		 * DRAM through the alias above. Of DomD's three static-mem banks
 		 * (bcm2711-raspberrypi4-64-xen.dtso: 0x40000000+0x40000000,
 		 * 0x08000000+0x18000000, 0x80000000+0x20000000) ONLY bank1 is inside
-		 * it, and DomD's `cma=` reservation (256 MiB) takes
-		 * part of that 384 MiB for vc4. Everything else is bounced by swiotlb
+		 * it, and DomD's `cma=` reservation takes most of it for vc4 and
+		 * the decoder (256 of 384 MiB on 8 GiB, 336 of 416 MiB on 4 GiB,
+		 * where swiotlb is cut to 16 MiB). Everything else is bounced by swiotlb
 		 * (CONFIG_SWIOTLB=y, and SWIOTLB_XEN is def_bool y on ARM64+XEN), so
 		 * the win over PIO is a memcpy trade, not a free ride -- and it is a
 		 * win in INTERRUPTS, not in CPU time: a fixed 609 KB firmware load
@@ -1599,7 +1680,7 @@
 		 * arm64_dma_phys_limit 0x20000000 and lands vc4's CMA inside bank1
 		 * automatically (see the header note). This bus's own maximum is
 		 * 0xff7fffff -- HIGHER -- so the tree minimum does not move and CMA
-		 * placement is unchanged. Editing soc_bus's dma-ranges instead WOULD
+		 * placement is unchanged. Raising soc_bus's upper bound instead WOULD
 		 * move it, and would break scanout.
 		 *
 		 * ---- Page 0xfe007000 is shared with dma40 -----------------------

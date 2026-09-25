@@ -10,9 +10,11 @@ rpi4-sodev.yaml claimed the Pi 5 tool covered both SKUs, which it never did (its
 Derived from, never duplicated:
   * bcm2711-raspberrypi4-64-xen.dtso  -- the 8 GiB DomD banks and `memory`
   * boot.cmd.xen.{zephyr,linux}-dom0.in
-      - the `board_ram=4g` override block (DomD 1024)
-      - the `venus_lane=yes` sub-block inside it (DomD 1408; the Vulkan lane)
-      - every fatload destination
+      - the `board_ram=4g` override block (DomD 1056)
+      - the `venus_lane=yes` sub-block inside it (DomD 1440; the Vulkan lane)
+      - every fatload destination, including the indented `if fatload` ones
+      - DomD's `cma=`/`swiotlb=` (the `domd_cma` variable, per SKU)
+  * bcm2711-raspberrypi4-64-domd-vc4.dts       -- soc_bus's VideoCore window
   * meta-xt-rpi4/.../xt-xen-cfg-doma_%.bbappend  -- DomA's size per lane
   * boot.cmd.xen.{zephyr,linux}-dom0.in          -- Dom0's size, from the live
       xen,xen-bootargs (both files also mention other dom0_mem values in comments)
@@ -32,14 +34,22 @@ What it checks, and why each one can actually go wrong:
      out before the domain runs, but a clobbered source is silent;
   5. the 4g block is byte-identical in the two Dom0 flavours -- they are separate
      files and the block's own comment requires it;
-  6. the Venus override grows ONLY bank@0x40000000 -- bank@0x08000000+384 MiB is
-     the only VideoCore-visible window and carries vc4's CMA and DomD's ZONE_DMA;
-  7. the domain budget fits 3956 MiB for every (SKU, Dom0 flavour, lane), and the
-     Venus transfer is neutral: DomD gains exactly what DomA gives up;
+  6. the Venus override grows ONLY bank@0x40000000 -- the low bank is the only
+     VideoCore-visible window and carries DomD's CMA and ZONE_DMA;
+  7. the domain budget fits 3956 MiB for every (SKU, Dom0 flavour, lane) -- DomZ
+     only on 8 GiB, build.sh refuses it on 4 GiB -- and the
+     Venus transfer does not grow the total: DomA gives up at least what DomD gains;
   8. DomA's size in the bbappend agrees with what the boot script's echo claims;
-  9. in both board yamls XT_DOMA_HWDEC is false on the gl lane, and true on
+  9. DomD's low bank lies inside soc_bus's dma-ranges in the DomD DT -- outside it
+     the VideoCore cannot reach DomD's CMA;
+ 10. CMA + swiotlb + 64 MiB of ordinary ZONE_DMA fit in the low bank, per SKU --
+     the decoder's buffers and the order-10 GFP_DMA fallback both live there;
+ 11. DomA is at most 2048 MiB in the 4 GiB Venus lane -- above that the guest gets
+     a second, small memory zone and AOSP's extra_free_kbytes.sh miscomputes
+     watermark_scale_factor (see the bbappend);
+ 12. in both board yamls XT_DOMA_HWDEC is false on the gl lane, and true on
      the vulkan lane with the zephyr Dom0 -- the guest's decoder needs the
-     qemu 10.0.2 device model and, on 4 GiB, the venus lane's 1408 MiB DomD.
+     qemu 10.0.2 device model and, on 4 GiB, the venus lane's 1440 MiB DomD.
 
 Usage: tools/check-rpi4-memory-map.py [--strict-budget]
 Exit status is non-zero if any check fails. --strict-budget additionally fails the
@@ -92,6 +102,13 @@ for _sku, _r in DRAM_RANGES.items():
 
 # Measured, not assumed: 3956 - assigned - `xl info` free_memory came to 78/79/80
 # across three DomD sizes on the 4 GiB board, so use the worst.
+#
+# Those runs had DomU (1 vCPU, 1024 MiB) as the guest, so the 80 includes
+# DomU's libxl paging pool, 4 KiB x (256 x vCPUs + MiB + 128) = 5.5 MiB.
+# DomA's (2 vCPUs) is 12.5 MiB at 2560 and 10.5 MiB at 2048, 7 and 5 MiB more
+# than this budget counts, so a DomA spare below that is not a margin it can
+# promise. build.sh warns about the one combination that has one: the 4 GiB
+# gl lane with a linux Dom0.
 XEN_OVERHEAD_MiB = 80
 # Dom0 differs by flavour, and both values are placement levers for
 # allocate_memory_11() rather than requirements. DERIVED, not duplicated -- this
@@ -99,6 +116,12 @@ XEN_OVERHEAD_MiB = 80
 # two here would be the same drift the rest of it exists to prevent.
 DOMU_CFG = os.path.join(ROOT, "meta-rpi-sodev", "meta-xt-common", "meta-xt-domu",
                         "recipes-extended", "xt-xen-cfg-domu", "files", "domu.cfg")
+
+# DomZ is a 16 MiB Zephyr guest, and the size is NOT a tunable: Zephyr uses a static
+# memory map, so the cfg's `memory` has to match the xenvm board's memory@40000000
+# node. Parsed rather than hard-coded, for the same reason as the two above.
+DOMZ_CFG = os.path.join(ROOT, "meta-rpi-sodev", "meta-xt-common", "meta-xt-domz",
+                        "recipes-guests", "domz", "files", "domz.cfg")
 
 # Both board yamls, for the one cross-check that is not about memory: the guest's
 # hardware-decode build has to be gated on the SAME lane as the memory transfer.
@@ -189,7 +212,62 @@ def parse_lane(block, venus):
 
 def parse_fatloads(path):
     return [int(m, 16) for m in
-            re.findall(r"^fatload\s+mmc\s+\d+\s+(0x[0-9a-fA-F]+)", read(path), re.M)]
+            re.findall(r"^\s*(?:if\s+)?fatload\s+mmc\s+\d+\s+(0x[0-9a-fA-F]+)",
+                       read(path), re.M)]
+
+
+# Ordinary (non-CMA) ZONE_DMA left in DomD's low bank: the CMA failure mode measured
+# on 2026-09-15 fell back to order-10 GFP_DMA allocations there, and 64 MiB is what
+# the 8 GiB map has always left.
+ZONE_DMA_RESERVE_MiB = 64
+# Linux's default swiotlb when no `swiotlb=` is given (IO_TLB_DEFAULT_SIZE).
+SWIOTLB_DEFAULT_MiB = 64
+DOMD_DTS = os.path.join(RPI4, "recipes-guest", "domd-vc4", "files",
+                        "bcm2711-raspberrypi4-64-domd-vc4.dts")
+
+
+def parse_soc_window():
+    """(phys, size) of soc_bus's dma-ranges in the DomD DT."""
+    m = re.search(r"soc_bus: soc-bus \{.*?dma-ranges = <([^>]*)>;", read(DOMD_DTS), re.S)
+    if not m:
+        raise SystemExit("ERROR: no soc_bus dma-ranges in %s" % DOMD_DTS)
+    c = [int(w, 16) for w in m.group(1).split()]
+    if len(c) != 6:
+        raise SystemExit("ERROR: soc_bus dma-ranges is not one <child parent size> "
+                         "triple of 2-cell values: %s" % m.group(1))
+    return (c[2] << 32) | c[3], (c[4] << 32) | c[5]
+
+
+def parse_domd_cma(block):
+    """{"8g": (cma MiB, swiotlb MiB), "4g": (...)} from the `domd_cma` variable:
+    the default set just before the 4g block, and the override inside it."""
+    def one(v):
+        c = re.search(r"\bcma=(\d+)M\b", v)
+        if not c:
+            raise SystemExit("ERROR: domd_cma %r has no cma=<n>M" % v)
+        t = re.search(r"\bswiotlb=(\d+)\b", v)
+        return int(c.group(1)), (int(t.group(1)) * 2048 // MiB if t else SWIOTLB_DEFAULT_MiB)
+    out = {}
+    for f, p in BOOTCMDS.items():
+        s = read(p)
+        d = re.findall(r'^setenv domd_cma "?([^"\n]*)"?$', s, re.M)
+        if len(d) != 1:
+            raise SystemExit("ERROR: %s must set the domd_cma default exactly once at "
+                             "top level, found %d" % (p, len(d)))
+        # The default is outside the 4g block, so check 5 does not compare
+        # it; the 8 GiB rows below take the first flavour's, and the other
+        # has to match.
+        v = one(d[0])
+        if out.setdefault("8g", v) != v:
+            bad("%s sets the domd_cma default to cma=%dM, swiotlb %d MiB; "
+                "the other flavour to cma=%dM, swiotlb %d MiB"
+                % ((f,) + v + out["8g"]))
+    inner = re.findall(r'^\s+setenv domd_cma "?([^"\n]*)"?$', block, re.M)
+    if len(inner) != 1:
+        raise SystemExit("ERROR: the 4g block must override domd_cma exactly once, "
+                         "found %d" % len(inner))
+    out["4g"] = one(inner[0])
+    return out
 
 
 def parse_doma_mem():
@@ -269,6 +347,14 @@ def parse_domu_mem():
         raise SystemExit("ERROR: %s has %d `memory =` lines, expected 1"
                          % (DOMU_CFG, len(m)))
     return int(m[0])
+
+
+def parse_domz_mem():
+    """DomZ's `memory =` from its xl config, in MiB."""
+    m = re.search(r"^memory\s*=\s*(\d+)\s*$", read(DOMZ_CFG), re.M)
+    if not m:
+        raise SystemExit("could not read `memory =` from %s" % DOMZ_CFG)
+    return int(m.group(1))
 
 
 def parse_hwdec_gate(path):
@@ -358,6 +444,7 @@ def main():
     strict = "--strict-budget" in sys.argv[1:]
     dom0_mem = parse_dom0_mem()
     domu_mem = parse_domu_mem()
+    domz_mem = parse_domz_mem()
     print("Raspberry Pi 4 memory map cross-check")
     print("  overlay   : %s" % os.path.relpath(XEN_DTSO, ROOT))
     for f, p in BOOTCMDS.items():
@@ -365,6 +452,8 @@ def main():
               % (os.path.relpath(p, ROOT), f, dom0_mem[f]))
     print("  domu.cfg  : %s (DomU %d MiB)"
           % (os.path.relpath(DOMU_CFG, ROOT), domu_mem))
+    print("  domz.cfg  : %s (DomZ %d MiB)"
+          % (os.path.relpath(DOMZ_CFG, ROOT), domz_mem))
 
     # --- the two boot scripts must agree on the 4g block --------------------
     hdr("the 4g block is the same in both Dom0 flavours")
@@ -398,8 +487,9 @@ def main():
     hdr("the Venus override only grows the high bank")
     base = dict(domd[("4g", "base")][0])
     venus = dict(domd[("4g", "venus")][0])
-    LOW = 0x08000000
-    if base.get(LOW) is None or venus.get(LOW) is None:
+    lows = {b for b in set(base) | set(venus) if b < GiB}
+    LOW = min(lows) if lows else 0
+    if len(lows) != 1 or base.get(LOW) is None or venus.get(LOW) is None:
         bad("no bank at 0x%x in one of the 4g lanes -- the VideoCore/ZONE_DMA "
             "window must exist in both" % LOW)
     elif base[LOW] != venus[LOW]:
@@ -428,9 +518,20 @@ def main():
                 print("       %s dom0: Xen %d + Dom0 %d + DomD %d = %d MiB, "
                       "%d MiB left for guests"
                       % (flavour, XEN_OVERHEAD_MiB, dom0, domd_mib, fixed, room))
+                # DomZ is a fixed 16 MiB when build.sh is given -z, and it is
+                # additive: it runs alongside whichever guest is up, so every
+                # combination below is also checked with it.
                 for guest, size in (("DomU", domu_mem),
                                     ("DomA", doma[(sku, lane)]),
+                                    ("DomA+DomZ", doma[(sku, lane)] + domz_mem),
+                                    ("DomU+DomZ", domu_mem + domz_mem),
                                     ("both", domu_mem + doma[(sku, lane)])):
+                    if sku == "4g" and "DomZ" in guest:
+                        # build.sh refuses -z on the 4 GiB RPi4, so these are not
+                        # images anyone can build.
+                        print("       (not built) %s/%s/%s: %s -- build.sh refuses -z "
+                              "on 4g" % (sku, lane, flavour, guest))
+                        continue
                     fits = size <= room
                     if fits:
                         ok("%s/%s/%s: %s (%d MiB) fits, %d MiB spare"
@@ -451,11 +552,56 @@ def main():
     for sku in ("8g", "4g"):
         d_delta = domd[(sku, "venus")][1] // 1024 - domd[(sku, "base")][1] // 1024
         a_delta = doma[(sku, "venus")] - doma[(sku, "base")]
-        if d_delta + a_delta == 0:
-            ok("%s: DomD %+d MiB, DomA %+d MiB, total unchanged" % (sku, d_delta, a_delta))
+        if d_delta + a_delta <= 0:
+            ok("%s: DomD %+d MiB, DomA %+d MiB, total %+d MiB"
+               % (sku, d_delta, a_delta, d_delta + a_delta))
         else:
-            bad("%s: DomD %+d MiB but DomA %+d MiB -- the total moves by %+d MiB"
+            bad("%s: DomD %+d MiB but DomA only %+d MiB -- the total grows by %+d MiB"
                 % (sku, d_delta, a_delta, d_delta + a_delta))
+
+    # --- DomA must keep one memory zone on the 4 GiB Venus lane -------------
+    hdr("DomA fits in GUEST_RAM0 on the 4 GiB Venus lane")
+    if doma[("4g", "venus")] <= 2048:
+        ok("4g/venus: DomA %d MiB <= 2048 MiB, so the guest has ZONE_DMA32 only"
+           % doma[("4g", "venus")])
+    else:
+        bad("4g/venus: DomA %d MiB puts %d MiB above 4 GiB as a separate small zone; "
+            "AOSP's extra_free_kbytes.sh then writes a huge watermark_scale_factor"
+            % (doma[("4g", "venus")], doma[("4g", "venus")] - 2048))
+
+    # --- the low bank must be inside the VideoCore window -------------------
+    hdr("DomD's low bank is inside soc_bus's VideoCore window")
+    win = parse_soc_window()
+    print("       soc_bus dma-ranges: phys 0x%x + %d MiB" % (win[0], win[1] // MiB))
+    for (sku, lane), (banks, _) in sorted(domd.items()):
+        low = [(b, sz) for b, sz in banks if b < GiB]
+        if len(low) == 1 and win[0] <= low[0][0] and low[0][0] + low[0][1] <= win[0] + win[1]:
+            ok("%s/%s: bank 0x%x+%d MiB is inside the window"
+               % (sku, lane, low[0][0], low[0][1] // MiB))
+        else:
+            bad("%s/%s: low bank(s) %s are not exactly one bank inside the window"
+                % (sku, lane, ["0x%x+%dM" % (b, sz // MiB) for b, sz in low]))
+
+    # --- CMA + swiotlb + ZONE_DMA fit the low bank ---------------------------
+    hdr("DomD's CMA, swiotlb and ZONE_DMA fit the low bank")
+    cma = parse_domd_cma(block)
+    for f, p in BOOTCMDS.items():
+        if re.search(r'module@0 bootargs "[^"]*\$\{domd_cma\}', read(p)):
+            ok("%s: DomD bootargs take ${domd_cma}" % f)
+        else:
+            bad("%s: DomD bootargs do not use ${domd_cma}, so the per-SKU value is "
+                "not what DomD boots with" % f)
+    for (sku, lane), (banks, _) in sorted(domd.items()):
+        low = [sz for b, sz in banks if b < GiB]
+        c_mib, t_mib = cma["4g" if sku == "4g" else "8g"]
+        need = c_mib + t_mib + ZONE_DMA_RESERVE_MiB
+        if low and need <= low[0] // MiB:
+            ok("%s/%s: CMA %d + swiotlb %d + ZONE_DMA %d = %d MiB <= bank %d MiB"
+               % (sku, lane, c_mib, t_mib, ZONE_DMA_RESERVE_MiB, need, low[0] // MiB))
+        else:
+            bad("%s/%s: CMA %d + swiotlb %d + ZONE_DMA %d = %d MiB does not fit the "
+                "low bank (%s MiB)" % (sku, lane, c_mib, t_mib, ZONE_DMA_RESERVE_MiB,
+                                       need, low[0] // MiB if low else "none"))
 
     # --- the boot script's own echo must not lie ---------------------------
     hdr("the boot script's messages match the values")
@@ -464,7 +610,7 @@ def main():
         mib = mem_kib // 1024
         echoes = re.findall(r'echo "([^"]*)"', block)
         # \b so that 1024 does not match "10240" or "1024x768"; the echo says
-        # "DomD 1408 MiB", so require the unit too.
+        # "DomD 1440 MiB", so require the unit too.
         want = re.compile(r"\b%d MiB\b" % mib)
         hit = [e for e in echoes if want.search(e) and
                (("venus_lane=yes" in e) == venus)]
@@ -483,11 +629,11 @@ def main():
     # --- the hardware-decode gate must ride the venus lane -----------------
     #
     # This is the one check here that is not about addresses. It belongs in this file
-    # because of what it prevents: the 4 GiB DomD expansion to 1408 MiB is gated on
+    # because of what it prevents: the 4 GiB DomD growth to 1440 MiB is gated on
     # venus_lane, and hardware decode is what NEEDS that expansion (a 1024 MiB DomD
     # thrashes its page cache during 1080p playback). If XT_DOMA_HWDEC were ever
     # switched on for the gl lane, the guest would ask for a decoder that lane has no
-    # device model for, AND it would do so with DomD at 1024 MiB. Widening the memory
+    # device model for, and with DomD at only 1056 MiB. Widening the memory
     # gate instead would be the wrong fix: it would give the gl lane a DT that its
     # device model does not match.
     #

@@ -39,6 +39,8 @@
 #                           block, so nothing is loaded here.)
 #   0xe0000000-0xfc000000  module: DomU image (dom0less path, off by default)
 #   0x100000000+           8 GiB SKU only: Xen heap / xl-created DomU + DomA
+#   4 GiB SKU: DomD bank1 is 0x06000000-0x20000000 and there is no bank2 -- see the
+#   board_ram block below.
 #
 # Why Dom0's bank[0] lands at 0x20000000 by itself. Xen's rpi4 platform sets
 # .dma_bitsize = 30 (xen/arch/arm/platforms/brcm-raspberry-pi.c), and
@@ -120,12 +122,14 @@
 # which does not fit 3956 MiB. Dom0+DomD alone DOES fit a 4 GiB board, so
 # `board_ram=4g` is not about making the base boot work — it is about leaving room
 # for a guest and about not silently over-committing:
-#     4g:  DomD 1024 + Dom0 128..256 + Xen 80 = 1232 MiB (zephyr) / 1360 (linux),
-#          leaving 2724 / 2596 MiB for ONE xl-created guest.
-#          DomU (1024) fits.  DomA (2560) fits ALONE.  The two TOGETHER (3584) do
-#          not — that needs the 8 GiB SKU. build.sh says so and does not refuse the
-#          build, because DomA's p4 requires DomU's p3 on the SD either way; the
-#          choice is which one is started.
+#     4g:  DomD 1056 + Dom0 128..256 + Xen 80 = 1264 MiB (zephyr) / 1392
+#          (linux), leaving 2692 / 2564 MiB for ONE xl-created guest in the gl
+#          lane (the Venus lane below gives DomD 384 MiB more and DomA 512 MiB
+#          less).
+#          DomU (1024) fits.  DomA (2560) fits ALONE, with 4 MiB to spare on the
+#          linux Dom0, which has not been booted (build.sh warns).  The two
+#          TOGETHER (3584) do not -- that needs the 8 GiB SKU. build.sh refuses
+#          -u together with -a, and -z, on this SKU.
 # Xen's 80 MiB is measured, not assumed: `xl info` across three DomD sizes on the
 # 4 GiB board gave 78/79/80 MiB of overhead (frametable + xenheap + image).
 # tools/check-rpi4-memory-map.py re-derives both configurations from THIS file and
@@ -152,28 +156,34 @@ setenv board_ram BOARD_RAM_PLACEHOLDER
 # and shmem pools ~9 MiB, the 16 MiB vn_device_memory suballocation pool, four
 # swapchain images at ~5.3 MiB = ~21 MiB, so ~46 MiB of blobs, plus the
 # virgl_render_server and V3DV working set (~30-60 MiB, never measured on this
-# board) -- call it 76-106 MiB, with a hard ceiling of `hostmem` (128 MiB) plus the
+# board) -- call it 76-106 MiB, with a hard ceiling of `hostmem` (256 MiB) plus the
 # server.
 #
 # On the 8 GiB SKU that is noise against DomD's 1920 MiB. On the 4 GiB SKU it is
-# not: DomD 1024 was measured to leave 244 MiB MemFree with DomU's device model
-# running, and 1024 was chosen over the 896 that also worked precisely to keep that
+# not: DomD at 1024 MiB (the earlier map's bank0 640 over a 384 MiB bank1) was
+# measured to leave 244 MiB MemFree with DomU's device model running, and bank0 640
+# was chosen over 512 (the 896 row below) precisely to keep that
 # 244 MiB for DomA's device model, which is bigger (vsock, virtio-serial with six
 # virtconsoles, a second NIC) and has never been measured here. Venus would spend
 # exactly that reserve.
 #
-# So on 4g + Venus, move 384 MiB from DomA to DomD: DomD 1408, DomA 2176. The total
-# is unchanged (80 + 256 + 1408 + 2176 = 3920 of 3956, the same 36 MiB spare -- this
-# is the linux flavour; the Zephyr script's Dom0 is 128 and its spare is 164), so
-# this is a redistribution and not a new commitment. The blob window is 128 MiB, and
-# the transfer is three times that rather than the
-# estimate because it is `hostmem`, the hard upper bound on what the device model
-# can pin -- sizing to the bound keeps the reserve even if the estimate is wrong,
-# and the biggest term in it is the one nobody has measured. The asymmetry decides
-# the direction: if DomD runs out, weston loses DRM master and BOTH guests' device
-# models die with it, while 384 MiB less guest RAM is imperceptible and AAOS at
-# 2176 is still above the 2048 MiB upstream sizes it at. DomA's side of the
-# transfer is in meta-xt-rpi4's xt-xen-cfg-doma bbappend, gated the same way.
+# So on 4g + Venus, move 384 MiB from DomA to DomD: DomD 1440 (1056 + 384), DomA
+# 2048. DomA gives up 512 rather than 384 because the other 128 MiB keep its RAM in
+# one memory zone (see meta-xt-rpi4's xt-xen-cfg-doma bbappend), so the total goes
+# DOWN (80 + 256 + 1440 + 2048 = 3824 of 3956, 132 MiB spare -- this is the linux
+# flavour; the Zephyr script's Dom0 is 128 and its spare is 260): a redistribution,
+# not a new commitment. The blob window was 128 MiB, and
+# the transfer was sized at three times that rather than to the estimate because it
+# was `hostmem`, the hard upper bound on what the device model can pin -- sizing to
+# the bound kept the reserve even if the estimate was wrong. The window is 256 MiB
+# now, so the transfer is 1.5 times it and the reserve rests on measurement instead:
+# with full-Vulkan AAOS and a video playing in a WebView, 126 MiB of the window in
+# use, DomD kept ~505 MiB available (2026-09-24). The asymmetry decides the
+# direction: if DomD runs out, weston loses DRM master and BOTH guests' device
+# models die with it, while less guest RAM is imperceptible: AAOS at 2048 MiB is
+# what upstream sizes it at, and it used 1420 MB with 1080p30 playing (2026-09-23).
+# DomA's side of the transfer is in meta-xt-rpi4's xt-xen-cfg-doma bbappend, gated
+# the same way.
 setenv venus_lane VENUS_LANE_PLACEHOLDER
 
 fdt addr ${fdt_addr}
@@ -204,18 +214,20 @@ fdt apply 0x2200000
 # -----------------------------------------------------------------------------
 # 4 GiB SKU: shrink DomD so the map fits 3956 MiB of DRAM.
 # -----------------------------------------------------------------------------
-# DomD = 1024 MiB in two banks. bank1 (0x08000000+384 MiB) is UNCHANGED and that is
-# load-bearing: it is the low, VideoCore-visible window that carries vc4's CMA and
-# sets DomD's ZONE_DMA (of_dma_get_max_cpu_address() takes the MINIMUM dma-ranges
-# limit, and the partial DT's mbox-bus/emmc2-bus cap it at 0x20000000). Moving it
-# would push CMA out of the 0xc0000000 bus-alias range. bank2 is dropped and bank0
-# shrinks 1024 -> 640 MiB.
+# DomD = 1056 MiB in two banks. bank1 is the low, VideoCore-visible window that
+# carries DomD's CMA and sets its ZONE_DMA (of_dma_get_max_cpu_address() takes the
+# MINIMUM dma-ranges limit, and the DomD DT's soc_bus caps it at 0x20000000); it
+# has to stay below 1 GiB, inside the 0xc0000000 bus alias. On this SKU it starts
+# at 0x06000000 rather than 0x08000000, 416 MiB instead of 384 -- see the block
+# below. bank2 is dropped and bank0 shrinks 1024 -> 640 MiB.
 #
-# WHY 1024 AND NOT 1408. On a 4 GiB board every guest an xl toolstack creates comes
+# WHY BANK0 IS 640 MiB AND NOT 1024.
+# On a 4 GiB board every guest an xl toolstack creates comes
 # out of the SAME 3956 MiB, so DomD's static allocation is the direct budget
 # competitor of DomU/DomA. The value is MEASURED, not guessed: DomD was booted at
-# three sizes on this board with an identical workload (weston + one qemu
-# compositing the AGL cluster on HDMI-A-1) [2026-08-04].
+# three sizes on this board (bank0 1024, 640 and 512 MiB over a 384 MiB bank1)
+# with an identical workload (weston + one qemu compositing the AGL cluster on
+# HDMI-A-1) [2026-08-04].
 #
 #   DomD assigned | Xen free_memory | DomD MemFree/Avail | in use | fps (commit/paint)
 #   --------------+-----------------+--------------------+--------+-------------------
@@ -228,13 +240,14 @@ fdt apply 0x2200000
 # composited. "in use" barely moves because most of the difference is reclaimable
 # page cache; the hard floor is ~630 MiB, of which CMA 128 + V3D GEM BOs ~207
 # (Shmem) + qemu ~101 + weston ~34. Those rows were measured with cma=128M; DomD
-# now reserves 256M (see the DomD bootargs), which raises that floor by 128 MiB.
+# now reserves 336M on this SKU (see the DomD bootargs), which raises that floor by
+# 208 MiB.
 #
 # Those same runs pin Xen's own overhead, which the older comments guessed at
 # "~64 MiB":  3956 - (Dom0 + DomD + DomU) - free_memory = 80 / 79 / 78 MiB across
 # the three rows. Use 80.
 #
-# 1024 is chosen over the 896 the measurement also allows, deliberately: the
+# Bank0 640 (the 1024 row) is chosen over 512 (the 896 row), deliberately: the
 # workload above is DomU's device model, and DomA's is BIGGER (doma.cfg adds vsock,
 # virtio-serial with SIX virtconsoles and a second NIC on top of the same
 # virtio-gpu-gl 1920x720). That delta has never been measured on this board, and
@@ -244,13 +257,14 @@ fdt apply 0x2200000
 # guest actually running, and DomA takes the 128 MiB out of its own allocation
 # (2560 MiB, still 25% above the 2048 MiB upstream sizes AAOS at).
 #
-# The 384 MiB this frees is what makes a 3-domain 4 GiB cockpit arithmetically
-# possible at all:  80 (Xen) + 128 (Zephyr Dom0) + 1024 (DomD) = 1232, leaving
-# 2724 MiB for ONE xl-created guest. DomU (1024) and DomA still cannot coexist
-# here -- that needs the 8 GiB SKU.
+# The 384 MiB that bank0 at 640 frees over 1024 is what makes a 3-domain 4 GiB
+# cockpit arithmetically possible at all: 80 (Xen) + 128 (Zephyr Dom0) + 1056
+# (DomD, bank1 being 416 MiB on this SKU) = 1264, leaving 2692 MiB for ONE
+# xl-created guest. DomU (1024) and DomA still cannot coexist here -- that
+# needs the 8 GiB SKU.
 #
 # Do NOT shrink bank1 to buy more: it is the only VideoCore-reachable window, and
-# DomD's CMA (256 MiB) plus the V3D scanout buffers live in it.
+# DomD's CMA (336 MiB on this SKU) plus the V3D scanout buffers live in it.
 #
 # bank0 at 640 MiB is still far more than place_modules() needs for DomD's
 # kernel + DTB (27 MiB + 14 KiB), and the module LOAD addresses (0xa0000000 DTB,
@@ -258,8 +272,10 @@ fdt apply 0x2200000
 #
 # Dom0's bank[0] placement is NOT affected: shrinking bank0 only frees memory at
 # 0x68000000-0x80000000, which is above the 1 GiB lowmem_bitsize window
-# allocate_memory_11() searches. The low map (modules below 0x08000000, DomD bank1
-# 0x08000000-0x20000000, the free hole at 0x20000000) is untouched. NOT machine-
+# allocate_memory_11() searches. The low map (modules below 0x06000000, DomD bank1
+# 0x06000000-0x20000000, the free hole at 0x20000000) leaves the same two 128 MiB
+# candidates, 0x20000000 and 0x30000000, and bank[0] was read at 0x20000000 again
+# after bank1 moved down to 0x06000000 (2026-09-23). NOT machine-
 # checked: tools/check-rpi4-memory-map.py verifies the banks and the budget but
 # does not model allocate_memory_11(), so bank[0] at 0x20000000 rests on this
 # reasoning plus the hardware observation recorded above.
@@ -272,23 +288,37 @@ fdt apply 0x2200000
 #
 # tools/check-rpi4-memory-map.py re-derives this override for BOTH flavours and
 # fails if they differ, so keep the two boot.cmd files byte-identical in this block.
-# It also checks that the Venus sub-block grows only bank@0x40000000 and that what
-# DomD gains DomA gives up.
+# It also checks that the Venus sub-block grows only bank@0x40000000 and that DomA
+# gives up at least what DomD gains.
+setenv domd_cma cma=256M
 if test "${board_ram}" = "4g" ; then
-    echo "board_ram=4g: DomD 1024 MiB (bank2 dropped, bank0 640 MiB)"
-    fdt set /chosen/domD memory <0x0 0x100000>
-    fdt set /chosen/domD xen,static-mem <0x0 0x40000000 0x0 0x28000000 0x0 0x08000000 0x0 0x18000000>
+    echo "board_ram=4g: DomD 1056 MiB (bank2 dropped, bank0 640 MiB, bank1 416 MiB)"
+    fdt set /chosen/domD memory <0x0 0x108000>
+    fdt set /chosen/domD xen,static-mem <0x0 0x40000000 0x0 0x28000000 0x0 0x06000000 0x0 0x1a000000>
+    # bank1 starts at 0x06000000 on this SKU, 32 MiB lower than the 8 GiB map's
+    # 0x08000000, because that is where more CMA has to come from: the hardware
+    # decoder allocates from DomD's CMA, CMA must sit in bank1, and bank1 cannot grow
+    # up (Dom0's bank[0] is at 0x20000000). Below it stay the boot modules -- xen at
+    # 0x02000000, the overlay at 0x02200000 and the Dom0 image at 0x02400000, which in
+    # the linux flavour is a ~26 MiB Image (measured to 0x03dbe9ff) -- so 0x06000000
+    # leaves that image 60 MiB. DomD is told about the same window by the soc_bus
+    # dma-ranges in bcm2711-raspberrypi4-64-domd-vc4.dts; the two must agree.
+    # The 416 MiB are CMA 336 + a 16 MiB swiotlb + 64 MiB of ordinary ZONE_DMA
+    # (DomD bootargs below). Measured on the 4 GiB board 2026-09-23, 1080p60 with 13
+    # CAPTURE buffers: CmaFree >= 196 MB, no allocation failure. At cma=256M in a
+    # 384 MiB bank1 the same run had taken CmaFree to 17 MB and stalled DomD.
+    setenv domd_cma "cma=336M swiotlb=8192"
     # 4g + Venus: +384 MiB for the device model's pinned blob memory, taken from
-    # DomA (see the venus_lane block above). ONLY bank0 grows -- bank1 at
-    # 0x08000000+384 MiB must not move or shrink, it is the only VideoCore-visible
-    # window and it carries vc4's CMA and DomD's ZONE_DMA. bank0 ends at
-    # 0x80000000, exactly where the 8g map's dropped bank2 started,
-    # and far above the 1 GiB lowmem window allocate_memory_11() scans for Dom0's
-    # bank[0] at 0x20000000 -- so Dom0's placement, the module load addresses
-    # (0xa0000000 DTB, 0xa4000000 kernel) and the whole low map are unaffected.
+    # DomA (see the venus_lane block above). ONLY bank0 grows -- bank1 is the same
+    # 0x06000000+416 MiB in both lanes, it is the only VideoCore-visible window and
+    # it carries DomD's CMA and ZONE_DMA. bank0 ends at 0x80000000, where the 8g
+    # map's dropped bank2 started, and far above the 1 GiB lowmem window
+    # allocate_memory_11() scans for Dom0's bank[0] at 0x20000000 -- so Dom0's
+    # placement, the module load addresses (0xa0000000 DTB, 0xa4000000 kernel)
+    # and the whole low map are unaffected.
     # HARDWARE DECODE RIDES THIS SAME GATE, and that is deliberate. A 1024 MiB DomD
     # thrashes its page cache during 1080p playback (measured on the board), so the
-    # decode path needs the 1408 MiB this block gives. It is not gated separately
+    # decode path needs this block's 1440 MiB. It is not gated separately
     # because it cannot be: the guest's decoder is a virtio-media device, which only
     # the qemu 10.0.2 device model provides, and that is the venus lane. The board
     # yaml sets XT_DOMA_HWDEC from the same GPU parameter, and
@@ -296,9 +326,9 @@ if test "${board_ram}" = "4g" ; then
     # condition to cover a gl-lane hardware-decode build: it would hand the gl lane a
     # DT its device model does not match.
     if test "${venus_lane}" = "yes" ; then
-        echo "venus_lane=yes: DomD 1408 MiB (bank0 1024 MiB); DomA drops to 2176"
-        fdt set /chosen/domD memory <0x0 0x160000>
-        fdt set /chosen/domD xen,static-mem <0x0 0x40000000 0x0 0x40000000 0x0 0x08000000 0x0 0x18000000>
+        echo "venus_lane=yes: DomD 1440 MiB (bank0 1024 MiB); DomA drops to 2048"
+        fdt set /chosen/domD memory <0x0 0x168000>
+        fdt set /chosen/domD xen,static-mem <0x0 0x40000000 0x0 0x40000000 0x0 0x06000000 0x0 0x1a000000>
     fi
 fi
 
@@ -645,9 +675,12 @@ if fatload mmc 0 0xa4000000 Image ; then
     #                          once the vpl011 FIFO filled, and the PV console
     #                          ring overflowed the same way. `quiet loglevel=3`
     #                          keeps the early flood below both limits.
-    #   cma=256M               vc4's display buffers and the hardware H.264 decoder's
+    #   ${domd_cma}            cma=256M on the 8 GiB map; `cma=336M swiotlb=8192` on
+    #                          the 4 GiB map, whose bank1 is 416 MiB (see the
+    #                          board_ram block). vc4's display buffers and the
+    #                          hardware H.264 decoder's
     #                          (bcm2835-codec) buffers. DomD's ZONE_DMA is static-mem
-    #                          bank1 (0x08000000+384 MiB) because the partial DT's
+    #                          bank1 (0x08000000+384 MiB on 8 GiB) because the DT's
     #                          soc_bus/emmc2_bus dma-ranges cap
     #                          of_dma_get_max_cpu_address() at 0x20000000, so
     #                          dma_contiguous_reserve() lands CMA inside the
@@ -684,7 +717,7 @@ if fatload mmc 0 0xa4000000 Image ; then
     #                          domd-gpu-init.service. NOTE this makes DomD depend on
     #                          a working PV block frontend, i.e. on xenbus coming up
     #                          in DomD -- see README.md "Known limitations" for the RPi4 blocker.
-    fdt set /chosen/domD/module@0 bootargs "console=ttyAMA0 root=/dev/xvda rootwait rw clk_ignore_unused vhost_xen.nogrant=1 xen_privcmd.unrestricted=1 cma=256M net.ifnames=0 quiet loglevel=3"
+    fdt set /chosen/domD/module@0 bootargs "console=ttyAMA0 root=/dev/xvda rootwait rw clk_ignore_unused vhost_xen.nogrant=1 xen_privcmd.unrestricted=1 ${domd_cma} net.ifnames=0 quiet loglevel=3"
 
     fdt mknode /chosen/domD module@1
     fdt set /chosen/domD/module@1 compatible "multiboot,device-tree" "multiboot,module"

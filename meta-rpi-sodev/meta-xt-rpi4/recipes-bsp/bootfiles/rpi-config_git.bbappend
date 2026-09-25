@@ -150,6 +150,54 @@ RPI_EXTRA_CONFIG:append = "\n# --- EL3: TF-A BL31 (PSCI + GICv2) as the armstub 
 RPI_EXTRA_CONFIG:append = "\n# --- Xen console: mini UART on GPIO14/15; pl011 belongs to Bluetooth ---\nenable_uart=1\nforce_turbo=1\ngpio=30,33=a3,pu\ngpio=31,32=a3,pn\n"
 
 # -----------------------------------------------------------------------------
+# Pin the A72 clock in firmware, for the same reason the Pi 5 layer pins the A76.
+# -----------------------------------------------------------------------------
+# Xen/Arm disables cpufreq in EVERY guest, unconditionally, inside
+# xen_guest_init():
+#
+#   arch/arm/xen/enlighten.c:511-514  (arm64 shares this file via
+#                                      arch/arm64/xen/Makefile)
+#     /* Making sure board specific code will not set up ops for
+#      * cpu idle and cpu freq. */
+#     disable_cpuidle();
+#     disable_cpufreq();
+#
+# cpufreq_register_driver() then returns -ENODEV at its first check
+# (cpufreq_disabled()). DomD is not exempt -- the check asks "am I a Xen guest",
+# not "am I privileged" -- so no in-guest governor can ever raise the clock, and
+# the firmware's setting is the only layer that decides it. Measured on this
+# board: `cpufreq-dt cpufreq-dt: failed register driver: -19` at boot and no
+# /sys/devices/system/cpu/cpu0/cpufreq directory at all.
+#
+# THE CLOCK IS ALREADY AT MAXIMUM TODAY, and these two lines do not change it.
+# Measured on the board with the configuration above:
+#   /sys/kernel/debug/clk/fw-clk-arm/clk_rate     1500000000
+#   /sys/kernel/debug/clk/fw-clk-arm/clk_min_rate 1500000000
+#   /sys/kernel/debug/clk/fw-clk-arm/clk_max_rate 1500000000
+# i.e. pinned at this board's own maximum, at 34.5 C.
+#
+# What these lines buy is that the CPU clock stops being a SIDE EFFECT of a
+# setting chosen for the console. force_turbo=1 above is there for the mini
+# UART's parent clock; it also keeps the ARM clock at turbo regardless of load,
+# which is why the numbers above look right. But reverting the UART assignment is
+# a deliberately cheap operation here (drop force_turbo=1 and bring back
+# `dtoverlay=disable-bt`, whose .dtbo is still on the boot FAT), and doing that
+# would silently drop the CPU to arm_freq_min -- 600 MHz on a Pi 4B, 40% of
+# 1500 -- with no governor left to raise it again. Naming arm_freq explicitly
+# makes the two independent.
+#
+# 1500/1500 is the stock maximum, not an overclock: upstream's default arm_freq
+# for a Pi 4B R1.4+ is 1500 MHz. arm_boost=1 would raise it to 1800 MHz on that
+# revision and is deliberately NOT set -- it is a different operating point, with
+# its own thermal behaviour, and nothing here has been measured at it.
+#
+# CAUTION, the same one the Pi 5 layer records: with cpufreq disabled the kernel
+# cannot throttle the CPU at all, so the firmware's temp_limit (default 85 C) is
+# the effective thermal guard. Sustained full-load runs should record
+# temperature.
+RPI_EXTRA_CONFIG:append = "\n# A72 clock pinned in firmware: Xen/Arm disables cpufreq in every guest\n# (arch/arm/xen/enlighten.c disable_cpufreq()), so no governor can raise it from\n# arm_freq_min. 1500 is the stock maximum for a Pi 4B R1.4+, not an overclock.\narm_freq=1500\narm_freq_min=1500\n"
+
+# -----------------------------------------------------------------------------
 # Cancel meta-raspberrypi's own `dtoverlay=vc4-kms-v3d`.
 # -----------------------------------------------------------------------------
 # recipes-bsp/bootfiles/rpi-config_git.bb:217 writes it whenever MACHINE_FEATURES
@@ -207,7 +255,8 @@ RPI_EXTRA_CONFIG:append = "\n# --- DomD owns HDMI: keep the firmware out of the 
 # -----------------------------------------------------------------------------
 # The VideoCore carve-out is taken off the top of the first GiB, so it decides
 # where the low DRAM bank ends. boot.cmd's map — DomD static-mem bank1 at
-# 0x08000000 + 384 MiB and the Dom0 bank[0] hole at 0x20000000-0x30000000 —
+# 0x08000000 + 384 MiB (0x06000000 + 416 MiB on the 4 GiB SKU; both end at
+# 0x20000000) and the Dom0 bank[0] hole at 0x20000000-0x30000000 —
 # assumes the default gpu_mem=76, i.e. a low bank ending at 0x3b400000. Say it
 # out loud so a firmware default change cannot silently move that boundary.
 RPI_EXTRA_CONFIG:append = "\n# --- fix the VideoCore carve-out: low DRAM bank ends at 0x3b400000 ---\ngpu_mem=76\n"

@@ -4,8 +4,8 @@
 #
 # xt-xen-cfg-doma lives in meta-xt-common because DomA's xl configuration is
 # board-independent apart from its size, and this port keeps that layer's doma.cfg
-# byte-identical. Only the memory size, the virtio-gpu resolution and the
-# virtio-media backend's host-max-width change here.
+# byte-identical. Only the memory size, the virtio-gpu resolution, the
+# virtio-media backend's host-max-width and the HDMI audio card change here.
 #
 # WHY 2560 MiB
 # The 8 GiB Pi 4 has to fit four domains into what is left after the boot-time
@@ -25,13 +25,14 @@
 # numbers are the ones the sending environment booted all four domains with on real
 # hardware (2026-08-07); they have NOT been re-measured in this environment.
 #
-# The 4 GiB SKU cannot host DomA at all: its free pool is 2596 MiB (linux Dom0)
-# or 2724 MiB (zephyr Dom0) -- DomD 1024 + Dom0 128..256 + Xen 80 = 1232..1360 of
-# 3956 usable, per the BOARD_RAM note in rpi4-sodev.yaml -- which takes DomU
-# 1024, and takes DomA 2560 on its own, but not both (3584).
-# build.sh refuses `--ram=4g` only when DomU and DomA are asked for TOGETHER; a 4 GiB
-# image with DomA alone is allowed, and that is the configuration the Venus lane's
-# 2176 below is for.
+# On the 4 GiB SKU the free pool is 2692 MiB (zephyr Dom0) or 2564 MiB (linux Dom0)
+# in the gl lane -- 3956 usable minus DomD 1056, Dom0 128..256 and Xen 80 -- and
+# 2308 or 2180 MiB in the Venus lane, where DomD is 1440. That takes DomU 1024 or
+# DomA on its own, but not both; DomA's 2560 leaves only 4 MiB with the
+# linux Dom0 in the gl lane, which has not been booted, and build.sh warns
+# about it. build.sh refuses `--ram=4g` when DomU and DomA are asked for
+# TOGETHER, and with -z; a 4 GiB image with DomA alone is allowed, and that is
+# the configuration the Venus lane's 2048 below is for.
 #
 # MECHANISM
 # doma.cfg ships as `memory = DOMA_MEM_PLACEHOLDER` and xt-xen-cfg-doma's do_install
@@ -41,12 +42,25 @@
 # provides: a non-empty DOMA_MEM_MiB is used verbatim and the map is not consulted.
 # The recipe already has DOMA_MEM_MiB in do_install[vardeps], so switching boards
 # cannot reuse a doma.cfg from sstate carrying the other board's value.
-# 2176 rather than 2560 in the Venus lane on the 4 GiB SKU: 384 MiB moves to DomD
-# for the device model's pinned blob memory. The total is unchanged, the direction
-# is chosen because DomD running out kills both guests' device models while DomA at
-# 2176 is still 6% above the 2048 MiB AAOS is sized at upstream, and 128 MiB is
-# `hostmem`, the hard ceiling on what the device model can pin. DomD's side of the
-# transfer is in meta-xt-rpi4's xt-rpi-u-boot-scr bbappend, gated the same way.
+# 2048 rather than 2560 in the Venus lane on the 4 GiB SKU. 384 MiB of that moves to
+# DomD for the device model's pinned blob memory -- DomD running out kills both
+# guests' device models -- and DomD's side of it is in meta-xt-rpi4's
+# xt-rpi-u-boot-scr bbappend, gated the same way. `hostmem`, the hard ceiling on
+# what the device model can pin, was 128 MiB when this was sized and is 256 MiB now;
+# DomD kept ~505 MiB available with 126 MiB of the window in use (2026-09-24).
+# The other 128 MiB keep the guest in ONE memory zone. xenpvh maps the first
+# 2048 MiB of a guest at GUEST_RAM0 and the rest above 4 GiB (xg_dom_arm.c;
+# GUEST_RAM0 is 2 GiB because of this tree's
+# 0003-Adjust-guest-memory-map.patch, upstream Xen has 3 GiB), so at 2176 the
+# guest had a 1946 MB ZONE_DMA32 plus an 82 MB ZONE_NORMAL. AOSP's
+# /system/bin/extra_free_kbytes.sh pairs `grep "min" /proc/zoneinfo` lines with
+# zones -- the 6.x per-CPU `high_min:` lines match too -- and divides by
+# managed/10000, which is 2 for that small zone; it wrote watermark_scale_factor
+# 615 to 1777. kswapd then kept 734 MB free, re-read ~270 MB/s of evicted files
+# through the device model, and both DomD and DomA saturated (measured on the
+# board 2026-09-23: echo 10 into the sysctl took DomD from 200% to 32%). At 2048
+# the guest has DMA32 only and the script wrote 82. With 1080p30 playing, DomA
+# used 1420 MB and had ~570 MB available at 2048.
 # The 8 GiB SKU is untouched: DomD has 1920 MiB there and the delta is noise.
 #
 # VENUS_LANE is the same one-line idiom meta-xt-rpi4's xt-rpi-u-boot-scr.bbappend
@@ -62,7 +76,7 @@
 # string and rehashes this task on distro-feature changes that have nothing to do
 # with Venus, defeating the contains() tracking.
 VENUS_LANE = "${@bb.utils.contains('DISTRO_FEATURES', 'venus', 'yes', 'no', d)}"
-DOMA_MEM_MiB:raspberrypi4-64 = "${@'2176' if (d.getVar('BOARD_RAM') == '4g' and d.getVar('VENUS_LANE') == 'yes') else '2560'}"
+DOMA_MEM_MiB:raspberrypi4-64 = "${@'2048' if (d.getVar('BOARD_RAM') == '4g' and d.getVar('VENUS_LANE') == 'yes') else '2560'}"
 do_install[vardeps] += "BOARD_RAM VENUS_LANE"
 
 # DomA's display is 1280x720 on this board: the 1920x1080 Onlap1102I panel on
@@ -113,3 +127,38 @@ do_install[vardeps] += "RPI4_DOMA_GPU_RES_FROM RPI4_DOMA_GPU_RES"
 # not start, so this doma.cfg does not go onto a board without the qemu.
 RPI4_DOMA_HWDEC_MAX_W ?= "${@int(d.getVar('RPI4_DOMA_GPU_RES').split('xres=')[1].split(',')[0])}"
 XT_DOMA_HWDEC_DEVARG:append:raspberrypi4-64 = ",host-max-width=${RPI4_DOMA_HWDEC_MAX_W}"
+
+# DomA's HDMI audio card. doma.cfg's literal is out.dev=plughw:vc4hdmi1, HDMI-A-2;
+# on this board DomA and the panel are on HDMI-A-1, whose card is vc4hdmi0 (the
+# 440 Hz tone of 2026-09-23 reached the panel through vc4hdmi0). In the zephyr
+# flavour doma-pick-hdmi-audio corrects the literal at boot from the ELDs. In the
+# linux flavour it runs in Dom0, which has no HDMI card, finds nothing and leaves
+# the literal alone, so DomA would open the dead port and play nothing. Only the
+# '-audiodev' line is rewritten: doma.cfg's comments quote out.dev=plughw: too.
+do_install[postfuncs] += "rpi4_doma_hdmi_audio_card"
+
+RPI4_DOMA_AUDIO_DEV_FROM ?= "out.dev=plughw:vc4hdmi1,"
+RPI4_DOMA_AUDIO_DEV ?= "out.dev=plughw:vc4hdmi0,"
+
+rpi4_doma_hdmi_audio_card:raspberrypi4-64() {
+    cfg="${D}${sysconfdir}/xen/doma.cfg"
+    [ -f "$cfg" ] || bbfatal "xt-xen-cfg-doma.bbappend (rpi4): $cfg not installed"
+    n=$(grep "^[[:space:]]*'-audiodev'," "$cfg" | grep -cF -- "${RPI4_DOMA_AUDIO_DEV_FROM}" || true)
+    if [ "$n" != "1" ]; then
+        bbfatal "xt-xen-cfg-doma.bbappend (rpi4): expected one '-audiodev' line with '${RPI4_DOMA_AUDIO_DEV_FROM}' in $cfg, found $n"
+    fi
+    sed -i "/^[[:space:]]*'-audiodev',/s|${RPI4_DOMA_AUDIO_DEV_FROM}|${RPI4_DOMA_AUDIO_DEV}|" "$cfg"
+    n=$(grep "^[[:space:]]*'-audiodev'," "$cfg" | grep -cF -- "${RPI4_DOMA_AUDIO_DEV}" || true)
+    left=$(grep "^[[:space:]]*'-audiodev'," "$cfg" | grep -cF -- "${RPI4_DOMA_AUDIO_DEV_FROM}" || true)
+    if [ "$n" != "1" ] || [ "$left" != "0" ]; then
+        bbfatal "xt-xen-cfg-doma.bbappend (rpi4): the HDMI audio card rewrite did not apply cleanly to $cfg"
+    fi
+    bbnote "xt-xen-cfg-doma.bbappend (rpi4): DomA HDMI audio -> ${RPI4_DOMA_AUDIO_DEV}"
+}
+
+# Default is a no-op, as for rpi4_doma_gpu_720p above.
+rpi4_doma_hdmi_audio_card() {
+    :
+}
+
+do_install[vardeps] += "RPI4_DOMA_AUDIO_DEV_FROM RPI4_DOMA_AUDIO_DEV"

@@ -490,7 +490,8 @@ parameters:
                 - [XT_DOMA_HWDEC, "%{XT_DOMA_HWDEC}"]
                 # [V4H-style DomA gate] meta-xt-doma is always in `layers` (like the
                 # V4H prod-devel-rcar4 yaml); ENABLE_ANDROID=no masks ALL its recipes
-                # instead (%{XT_DOMA_BBMASK} = " meta-xt-common/meta-xt-doma/"), the
+                # instead (%{XT_DOMA_BBMASK} = " meta-xt-common/meta-xt-doma/" plus the
+                # board layer's bbappends on those recipes, see the parameter), the
                 # same mechanism as V4H's `BBMASK doma.bb*`. =yes expands to "".
                 - [BBMASK:append, "%{XT_DOMA_BBMASK}"]
                 # Required by the shared meta-xt-rpi4 linux-raspberrypi bbappend: its
@@ -642,12 +643,13 @@ parameters:
   # DomA 2560 + Xen 80 = 5712..5840 MiB). Dom0+DomD alone fits a 4 GiB board
   # unchanged, so 4g is not needed just to boot — it is what makes a guest fit and
   # what stops the build silently over-committing:
-  #   4g:  DomD 1024 (bank2 dropped, bank0 640) + Dom0 128..256 + Xen 80
-  #        = 1232..1360 MiB, leaving 2724 (zephyr) / 2596 (linux) for ONE guest
-  #        in the gl lane; in the default Venus lane DomD is 1408 (bank0 1024)
-  #        and DomA 2176, leaving 164 / 36 MiB spare. DomU 1024 fits; DomA fits
-  #        ALONE (2560 in the gl lane); the two together do not.
-  #        build.sh notes this and does not refuse -a with --ram=4g.
+  #   4g:  DomD 1056 (bank2 dropped, bank0 640, bank1 0x06000000+416) + Dom0
+  #        128..256 + Xen 80 = 1264..1392 MiB, leaving 2692 (zephyr) / 2564 (linux)
+  #        for ONE guest; in the default Venus lane DomD is 1440 and DomA 2048,
+  #        leaving 260 / 132 MiB spare. DomU 1024 fits; DomA fits ALONE (in
+  #        the gl lane with the linux Dom0 by 4 MiB, which has not been
+  #        booted: build.sh warns); the two together do not, and build.sh
+  #        refuses -u with -a, and -z, on --ram=4g.
   # Mechanism: this sets BOARD_RAM in the domd conf, and in the dom0 conf of the
   # linux flavour, whose Dom0 installs the doma.cfg `xl create` reads: DomA's size
   # follows the SKU as well (meta-xt-rpi4's xt-xen-cfg-doma bbappend). The boot
@@ -660,7 +662,7 @@ parameters:
   # (tools/check-memory-map.py) does not validate them: it has no rpi4 rows
   # (meta-xt-rpi4/README.md).
   BOARD_RAM:
-    desc: "Target Raspberry Pi 4 SKU: 8g (default; all four domains up together) or 4g (DomD 1408 MiB with GPU=vulkan, the default, or 1024 with gl; DomU or DomA, one at a time)"
+    desc: "Target Raspberry Pi 4 SKU: 8g (default; all four domains up together) or 4g (DomD 1440 MiB with GPU=vulkan, the default, or 1056 with gl; DomU or DomA, one at a time)"
     "8g":
       default: true
       overrides:
@@ -1178,10 +1180,13 @@ parameters:
   #     the emitted boot.cmd has `setenv board_ram 4g` and `setenv venus_lane yes`,
   #     no placeholder left, and mkimage turns it into a valid u-boot script image.
   #     That is DomD's half of the 384 MiB transfer (bank0 640 -> 1024 MiB).
-  #   - DomA's half is verified one step short of that: DOMA_MEM_MiB expands to
-  #     2176 in the default (vulkan) lane and 2560 with --gpu=gl (bitbake-getvar, both
-  #     lanes). do_install's substitution itself has not been run for cortexa72,
-  #     but it is the SAME code in
+  #   - DomA's half is verified one step short of that: DOMA_MEM_MiB expanded
+  #     to 2176 in the default (vulkan) lane, its value at the time, and to
+  #     2560 with --gpu=gl (bitbake-getvar, both lanes). The current 2048 has
+  #     not been read back that way; DomA booted at 2048 on the 4 GiB board
+  #     (2026-09-23).
+  #     do_install's substitution itself has not been run for cortexa72, but
+  #     it is the SAME code in
   #     meta-xt-doma, exercised in both lanes on the Pi 5, where the --gpu=gl
   #     lane's installed doma.cfg carries none of the Venus options.
   #
@@ -1373,19 +1378,24 @@ components:
         #   coherent_pool=64M : DMA coherent pool for non-cacheable maps
         #   iommu.passthrough=1 : skip IOMMU translation (RPi5/Xen has no
         #                 working IOMMU for guest DMA today)
-        # cma=192M (effective): contiguous pool for V3D dma-buf transit.
+        # cma= (effective): 256M on the 8 GiB map, `cma=336M swiotlb=8192` on the
+        # 4 GiB map -- contiguous pool for scanout and the hardware decoder.
         # CORRECTED(rpi4 2026-07-26): this block used to say "cma=128M" and "the
         # xen-troops dom0less DomD memory bank is 512 MiB". Both numbers were
         # wrong for this port. The real values, from the files themselves:
-        #   * cma=192M in BOTH meta-xt-rpi4 boot.cmd.xen.{linux,zephyr}-dom0.in;
+        #   * cma= in BOTH meta-xt-rpi4 boot.cmd.xen.{linux,zephyr}-dom0.in,
+        #     through their `domd_cma` variable (per SKU);
         #   * DomD memory = 1920 MiB, as `memory = <0x0 0x1e0000>` (KiB) in
         #     bcm2711-raspberrypi4-64-xen.dtso, backed by three static-mem banks
         #     (1 GiB @0x40000000 + 384 MiB @0x08000000 + 512 MiB @0x80000000).
-        # So the 192 MiB pool is ~10% of DomD memory, not 25%. Don't push higher
-        # without raising DomD memory or weston/qemu OOMs.
+        # So the pool is 13% of DomD memory on 8 GiB (256 of 1920) and, on
+        # 4 GiB, 23% in the Venus lane (336 of 1440) and 32% with GPU=gl
+        # (336 of 1056). Don't push higher without raising DomD memory or
+        # weston/qemu OOMs -- and on this board it can only grow with DomD's
+        # low bank, the one the VideoCore can reach.
         # NOTE: the effective DomD cmdline (incl. this cma= value) is hard-coded in
         # the STATIC boot.cmd template (meta-xt-rpi4 xt-rpi-u-boot-scr
-        # boot.cmd.xen.{zephyr,linux}-dom0.in, where cma=192M actually lives), NOT
+        # boot.cmd.xen.{zephyr,linux}-dom0.in, where the value actually lives), NOT
         # in the DOMD_BOOTARGS below -- which is inert here (see the
         # DOMD_ROOTFS_DEV note in the variables block). Edit the .in template to
         # change the real value. tools/check-rpi4-memory-map.py prints the

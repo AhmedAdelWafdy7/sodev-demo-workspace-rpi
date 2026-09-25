@@ -21,7 +21,8 @@ scripts, `xen,reg` and `domd.cfg`'s `iomem`.
 | | status |
 |---|---|
 | Build, both Dom0 flavours | `--board=rpi4 --dom0=linux` and `--dom0=zephyr` complete and assemble a `full.img`. |
-| Hardware, 4 GiB SKU | Booted in the environment this port came from (2026-08-07): Dom0 (Zephyr) + dom0less DomD + DomA. AAOS reaches `sys.boot_completed=1`, CarLauncher is on the panel, touch input reaches the guest, `adb` connects over tcp/5555, `xl console DomA` receives. Idle load 5.6 % CPU / 0 % GPU render; under continuous swiping DomD 67 % + DomA 78 % of one core and 40.7 % GPU render. 158 MiB of Xen free memory left. |
+| Hardware, 4 GiB SKU | Booted in the environment this port came from (2026-08-07): Dom0 (Zephyr) + dom0less DomD + DomA. AAOS reaches `sys.boot_completed=1`, CarLauncher is on the panel, touch input reaches the guest, `adb` connects over tcp/5555, `xl console DomA` receives. Idle load 5.6 % CPU / 0 % GPU render; under continuous swiping DomD 67 % + DomA 78 % of one core and 40.7 % GPU render. 158 MiB of Xen free memory left. All of this with the map of the time: DomD 1024 MiB, DomA 2560 MiB. |
+| Hardware, 4 GiB SKU, this map | Booted 2026-09-23 in the Venus lane with the Zephyr Dom0: DomD 1440 MiB, DomA 2048 MiB on 2 vCPUs (pcpu 2-3). `xl info` read 262 MiB of Xen free memory; DomD reserved its 336 MiB CMA at 0x0b000000, and 1080p60 with 13 CAPTURE buffers left CmaFree >= 196 MB. The gl lane's DomD 1056 / DomA 2560 has not been booted. |
 | Hardware, 8 GiB SKU | Not measured. The 8 GiB domain map is the one the boot scripts default to, but the four-domain configuration has only been reasoned about, not booted. |
 
 ## Board SKUs
@@ -40,30 +41,37 @@ overlay.
   cleanly, but if you have an 8 GiB board, treat the first boot as unverified and capture
   `(XEN) RAM:` / `(XEN) BANK[0]` from the log: the 8 GiB usable total is currently
   extrapolated, not measured.
-* **4g** — DomD 1024 MiB (bank2 dropped, bank0 down to 640 MiB). DomU and DomA each fit
+* **4g** — DomD 1056 MiB (bank2 dropped, bank0 down to 640 MiB, bank1 moved down to
+  0x06000000 + 416 MiB so DomD's CMA can be 336 MiB). DomU and DomA each fit
   alone; **they cannot run at the same time**, so `build.sh` REFUSES `-u` together with
-  `-a` on this SKU and names the three ways out (drop one guest, or `--ram=8g`). A
+  `-a` on this SKU and names the three ways out (drop one guest, or `--ram=8g`). It
+  also refuses `-z`: DomZ is not part of this SKU's configuration. A
   DomU-less DomA image is a first-class configuration: `ENABLE_DOMU_RESERVED` puts an
   empty 8 MiB partition where DomU's rootfs would be, so the DomA nested GPT still lands
   on p4, which is the partition `doma.cfg` opens.
 
   **The Vulkan lane redistributes this SKU**, because a host-visible blob window is
   device-model memory in DomD and none of it is reclaimable. With `--gpu=vulkan` (the
-  default), 384 MiB moves from DomA to DomD: **DomD 1408 MiB (bank0 1024 MiB) and DomA
-  2176 MiB**, total unchanged.
+  default), 384 MiB moves from DomA to DomD: **DomD 1440 MiB (bank0 1024 MiB) and DomA
+  2048 MiB**. DomA gives up 128 MiB more than DomD takes, so that its RAM stays in one
+  memory zone -- at 2176 the 82 MB ZONE_NORMAL made AOSP's `extra_free_kbytes.sh` write a
+  `watermark_scale_factor` of 615-1777 and kswapd saturated both domains (see
+  `xt-xen-cfg-doma_%.bbappend`).
   The direction follows from the asymmetry -- if DomD runs out, weston loses DRM master and
-  both guests' device models die with it, whereas AAOS at 2176 is still 6% above the
-  2048 MiB upstream sizes it at. Sized well above `hostmem` (the hard ceiling on what the
-  device model can pin, 128 MiB) rather than to the ~76-106 MiB estimate: the estimate's
+  both guests' device models die with it, whereas AAOS at 2048 is the size upstream
+  gives it. Sized at three times the 128 MiB `hostmem` of the time (the hard ceiling on
+  what the device model can pin) rather than to the ~76-106 MiB estimate: the estimate's
   biggest term is the one nobody has measured, and the board verification then showed the
   device model's own footprint under full-Vulkan AAOS needing the rest -- DomD's
-  MemAvailable bottomed at ~460 MiB with 1408. The 8 GiB SKU is untouched: DomD has 1920 MiB there
-  and the delta is noise. Both halves read the lane through the same two-valued
+  MemAvailable bottomed at ~460 MiB with 1408. `hostmem` is 256 MiB now; with a video
+  playing in a WebView and 126 MiB of the window in use, DomD kept ~505 MiB available
+  (2026-09-24). The 8 GiB SKU is untouched: DomD has 1920 MiB there and the delta is
+  noise. Both halves read the lane through the same two-valued
   `VENUS_LANE` variable -- `xt-rpi-u-boot-scr.bbappend` substitutes it into the boot
   script, `xt-xen-cfg-doma`'s bbappend tests it in `DOMA_MEM_MiB` -- and
   `tools/check-rpi4-memory-map.py` re-derives both lanes from those two files so the
-  numbers cannot drift apart (48 assertions, and it fails if the transfer stops summing to
-  zero or if the condition is ever inverted).
+  numbers cannot drift apart (it fails if DomA gives up less than DomD gains or if the
+  condition is ever inverted).
 
   `--gpu=vulkan` selects qemu 10.0.2-xt, which version-gates off the six 7.0.0-only
   device-model patches. `0111` (virtio-tablet `BTN_TOUCH`) is among them, and Android

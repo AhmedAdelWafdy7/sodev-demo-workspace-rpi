@@ -297,12 +297,12 @@
 
 /*
  * dma40 (/scb/dma@7e007b00, brcm,bcm2711-dma, GIC SPI 89-92): the 40-bit DMA
- * controller the DomD partial DT claims with xen,path. Hardware H.264 decode
- * needs it in DomD: vchiq refuses to probe without a brcm,bcm2711-dma node --
- * see the dma40 note in bcm2711-raspberrypi4-64-domd-vc4.dts. Unmarked it fails
- * exactly as vchiq above: SPI 89-92 go to the hardware domain first and DomD's
- * claim aborts domain construction. The shipped host DTB exports the node as the
- * label `dma40`.
+ * controller the DomD partial DT claims with xen,path. Two DomA features need it
+ * in DomD -- HDMI audio (both HDMI nodes' audio DREQs) and hardware H.264 decode
+ * (vchiq refuses to probe without a brcm,bcm2711-dma node) -- see the dma40 note
+ * in bcm2711-raspberrypi4-64-domd-vc4.dts. Unmarked it fails exactly as vchiq
+ * above: SPI 89-92 go to the hardware domain first and DomD's claim aborts domain
+ * construction. The shipped host DTB exports the node as the label `dma40`.
  */
 &dma40       { xen,passthrough; };
 

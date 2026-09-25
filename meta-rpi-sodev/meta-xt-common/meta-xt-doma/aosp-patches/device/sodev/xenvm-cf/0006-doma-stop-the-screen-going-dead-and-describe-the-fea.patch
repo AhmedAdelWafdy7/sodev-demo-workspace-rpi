@@ -1,0 +1,403 @@
+From 70a5d09421ed07cdedff035a53e3f7ac8929a886 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Fri, 25 Sep 2026 09:34:42 +0900
+Subject: [PATCH] doma: stop the screen going dead, and describe the features
+ in README
+
+def_screen_off_timeout goes from AOSP's 60 s to 30 min.
+
+This panel has no backlight, so the dim step of the screen-off sequence
+is applied as a near-black overlay -- DisplayPowerController takes
+brightness from 0.397 to 0.05 -- and the display simply looks dead
+rather than dim. Measured on the board 2026-09-16: after a menu had
+been left on screen for 112 s, every tap was consumed as a wake event,
+so not one button press reached the app underneath. The same dim made
+A2DP playback look like the screen going black several times.
+
+This default covers the whole UI -- Bluetooth audio, settings, the
+launcher -- and survives a userdata wipe, which a runtime
+`settings put` does not.
+
+It is a third value in the overlay that is already here.
+SettingsProvider keeps it in Settings.System rather than
+Settings.Global, so the overlay's comment now names both, says three
+values rather than two and gives the `settings put system` command for
+an existing /data. The product makefile's DEVICE_PACKAGE_OVERLAYS line
+moves below the hardware-decode block, next to the RRO that starts
+Bluetooth off, and its comment names all three values and both tables.
+
+The audio policy fork's third change raises bus0_media_out's gain
+ceiling from trout's 600 to 1200 (+12 dB). MEDIA routes to that bus and
+nothing else on the HDMI path adds gain: vc4-hdmi exposes no volume
+control and the qemu ALSA backend has none. trout's audio HAL scales
+the stream by 10^(gain_mB/2000), its own hard-coded range cancelling
+out, and the formula keeps going above 600, so the top of the range
+goes from about 2.0 (+6 dB) to about 4.0 (+12 dB). Measured on the
+board, the HAL scaled the stream by 1.58 (400 mB) and HDMI audio was
+too quiet. That is below what 600 allows, so the framework was not
+sending the ceiling at the time; the volume index then is not
+established, and the ratio with 1200 in place is not claimed. The
+product makefile's note on the fork now says it documents all three
+changes.
+
+The README's Contents table listed five files and this device has
+twenty-nine. Rewrite it, and add a section saying what each feature is
+for -- Vulkan compositing, the Wi-Fi shadow AP, Bluetooth A2DP and
+HFP, hardware decode -- so a reader can tell which files belong together
+without reading every one of them. The paragraph under the old table,
+about the build script that staged the files into the AOSP checkout,
+is dropped.
+
+The Vulkan note is longer than the others on purpose. Without all six
+of its settings the guest still composites with GL, and the failure
+mode when one is missing is not an error -- the numbers move by less
+than run-to-run noise. Anyone reading this repository to find out
+whether Vulkan is on needs the whole set named in one place, including
+why the APEX has to go.
+
+The note on what is expected to leave again says which part of the
+overlay leaves with the rc: the two animation values. The dialer name
+and the screen-off timeout stay, and so do the DomA feature files.
+
+The features section names the workspace repository
+(automotive-grade-linux/sodev-demo-workspace-rpi) and what each feature
+relies on outside this repository: the workspace's patches to
+packages/modules/Bluetooth, frameworks/base, packages/services/Car and
+external/v4l2_codec2, the guest kernel's mac80211_hwsim and
+virtio-media, and DomD.
+
+Status keeps the record of the build that verified the move, scoped to
+the files as they were then, and says what has and has not been done
+since: the feature files were measured on hardware in the workspace
+layer they came from, the boards differ in how far each feature was
+taken, and no build of this revision is claimed.
+
+README.md carries an SPDX identifier, as every file but LICENSE does.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending [automotive-grade-linux/Android_device_sodev_xenvm-cf]
+---
+ README.md                                     | 136 +++++++++++++-----
+ aosp_xenvm_trout_rpi4_arm64.mk                |  16 ++-
+ audio/audio_policy_configuration.xml          |  23 ++-
+ .../SettingsProvider/res/values/defaults.xml  |  25 +++-
+ 4 files changed, 146 insertions(+), 54 deletions(-)
+
+diff --git a/README.md b/README.md
+index 93b2786..61c8a54 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,4 @@
++<!-- SPDX-License-Identifier: Apache-2.0 -->
+ # Android_device_sodev_xenvm-cf
+ xenvm_cuttlefish AOSP device for SoDeV usecase
+ 
+@@ -27,15 +28,66 @@ reuse object files built for the other CPU.
+ | Path | What it is |
+ |---|---|
+ | `AndroidProducts.mk` | Declares the product and its lunch choices |
+-| `aosp_xenvm_trout_rpi4_arm64.mk` | The product: inherits the upstream one, overrides the identity, installs the two files below |
+-| `xenvm_trout_rpi4_arm64/BoardConfig.mk` | Includes the upstream board config and changes only the ISA baseline |
++| `aosp_xenvm_trout_rpi4_arm64.mk` | The product: inherits the upstream one, overrides the identity, drops the Vulkan APEX driver path, and installs the files below that go into the image (the sepolicy comes in through `BoardConfig.mk`) |
++| `xenvm_trout_rpi4_arm64/BoardConfig.mk` | Includes the upstream board config, changes the ISA baseline, names the Venus Vulkan driver to build, and adds the vendor sepolicy dir |
+ | `init.xenvm-buried-eth0.rc` | Starts cuttlefish's `rename_eth0`, which minradio's data call needs from Android 17 on. The whole argument, the boot timings and the measurements are in the file |
+-| `overlay/.../SettingsProvider/res/values/defaults.xml` | `Settings.Global` defaults for a fresh userdata: Bluetooth off, window/transition animations off |
+-
+-Everything here derives from the SoDeV Raspberry Pi workspace
+-(`automotive-grade-linux/sodev-demo-workspace-rpi`), where it was staged into the AOSP
+-checkout by a build script. Moving it into a repo-managed project is what removes that
+-staging step for this board.
++| `overlay/.../SettingsProvider/res/values/defaults.xml` | `Settings.Global` and `Settings.System` defaults for a fresh userdata: window/transition animations off, screen-off timeout at 30 min |
++| `DomaSettingsProviderRRO/` | Starts Bluetooth off on a fresh userdata. A product RRO above Car's, which turns it on |
++| `overlay/.../core/res/res/values/config.xml` | `framework-res` overlay naming the dialer this product actually ships, so an incoming Bluetooth call reaches a screen |
++| `DEFAULT-DIALER.md` | The measurement behind that one string, kept out of the XML because an XML comment cannot carry it |
++| `audio/audio_policy_configuration.xml` | Audio policy fork: names the Bluetooth audio module that exists in AOSP 17, references three XIncludes that the upstream file names but never installed and that the product makefile now installs, and raises bus0_media_out's gain ceiling from trout's 600 to 1200 mB |
++| `audio/bluetooth_audio_policy_configuration.xml` | The Bluetooth half of that policy: the A2DP output and the SCO/HFP ports in one place |
++| `sepolicy/` | Vendor policy: an exec type and a domain for the shadow-AP scripts, and the domain plus label for the V4L2 Codec2 HAL |
++| `xenvm_trout_rpi4_arm64/init.xenvm-hwsim.rc` | Starts the shadow-AP bring-up at `sys.boot_completed`, with a property that hands `wlan0` back to virt_wifi |
++| `xenvm_trout_rpi4_arm64/virtwifi.rc` | Empty on purpose: installed over trout's `virtwifi.rc`, which enabled Wi-Fi at every boot, so the Settings toggle starts off and keeps the user's choice |
++| `xenvm_trout_rpi4_arm64/doma-shadow-ap.sh` | The bring-up itself: simulated radios, the bridge, and hostapd |
++| `xenvm_trout_rpi4_arm64/doma-shadow-aps.conf` | Placeholder seed for the AP list. Never commit a real SSID or passphrase into it |
++| `xenvm_trout_rpi4_arm64/doma-wifi-relay.sh` | Keeps the AP list the shadow AP beacons in step with DomD's scan, and is the vendor half of the passphrase relay: reconfigures hostapd and forwards the passphrase to DomD |
++| `DomaWifiRelay/` | The framework half of that relay: a platform app that, while the Settings Wi-Fi toggle is on, reads the passphrase the user typed and asks the vendor half to use it |
++| `xenvm_trout_rpi4_arm64/media_codecs_c2.xml` | Describes the vendor C2 decoder to the media framework: decoders only, H.264 only, 1080p max |
++| `xenvm_trout_rpi4_arm64/codec2.vendor.ext.policy` | The extended seccomp policy the C2 service needs for its V4L2 ioctls |
++
++## What the DomA features are for
++
++Where an item relies on changes outside this repository, it says so. The SoDeV
++Raspberry Pi workspace that builds this product
++(`automotive-grade-linux/sodev-demo-workspace-rpi`) carries those changes as
++patches against other AOSP projects and the guest kernel, and applies them to
++the checkout.
++
++* **Vulkan compositing.** `BOARD_MESA3D_VULKAN_DRIVERS := virtio` builds the Venus ICD
++  and `PRODUCT_PACKAGES += vulkan.virtio` installs it (the board config only defines the
++  module; an unasked-for module is never installed),
++  `ro.hardware.vulkan=virtio` makes the loader look for it, and
++  `TARGET_VULKAN_SUPPORT := false` drops `com.google.cf.vulkan` -- whose `.rc` sets
++  `ro.vulkan.apex`, which confines the loader's search to that APEX's linker namespace
++  and would hide an ICD in `/vendor`. `debug.renderengine.backend=skiavkthreaded` and
++  `debug.hwui.renderer=skiavk` then move SurfaceFlinger and HWUI onto it. Without all
++  six the guest runs on the Venus device line and still composites with GL, and the
++  difference is only run-to-run noise -- which is what made the missing switch look like
++  Venus doing nothing.
++* **Wi-Fi, shadow AP.** The guest gets simulated radios that beacon the SSIDs
++  the host really sees, so the AAOS Wi-Fi screen lists real access points
++  instead of virt_wifi's single synthetic entry; `DomaWifiRelay` is what makes
++  an access point the seed file does not list connectable, because it is the
++  only component that can see the passphrase the user typed. The radios need
++  `mac80211_hwsim` in the guest kernel's module set, which the workspace adds,
++  and the scan results and the real association come from DomD.
++* **Bluetooth A2DP.** The audio policy fork names the Bluetooth audio module
++  that AOSP 17 actually ships, without which media routes "successfully" while
++  nothing comes out of the speaker. It also relies on the workspace's patch to
++  `packages/modules/Bluetooth` and on the HCI transport DomD provides.
++* **Bluetooth HFP.** Software-datapath SCO plus the dialer the product really
++  installs, without which an incoming call rings inside Telecom with no screen
++  and no ringtone. It also relies on the workspace's patches to
++  `packages/modules/Bluetooth`, `frameworks/base` and `packages/services/Car`.
++* **Hardware decode.** Behind `XT_DOMA_HWDEC=true`: the V4L2 Codec2 service over
++  the host's video decoder, reached through virtio-media, with the seccomp
++  policy it needs. The service's sepolicy, the `external/v4l2_codec2`
++  namespace and the SurfaceFlinger frame-rate property are in every build.
++  It also relies on the workspace's patch to
++  `external/v4l2_codec2`, on the virtio-media driver in the guest kernel, and on
++  a DomA device model that provides a virtio-media device.
+ 
+ ## How a build picks it up
+ 
+@@ -64,32 +116,34 @@ That same search fails with "Multiple board config files for TARGET_DEVICE" if t
+ configs claim one device name, which is why this variant has its own `PRODUCT_DEVICE`
+ rather than overriding the existing one.
+ 
+-## Two files that are expected to leave again
++## What is expected to leave again
+ 
+-`init.xenvm-buried-eth0.rc` and the overlay are not Raspberry Pi 4 properties: they are
+-properties of minradio and of trout's `ro.vendor.disable_rename_eth0`, and they apply to
+-any `xenvm-trout` guest on Android 17. They are carried here so that a Raspberry Pi 4
+-build needs nothing but this repository and the upstream manifest. A copy also lives in
+-the workspace for the Raspberry Pi 5 build.
++`init.xenvm-buried-eth0.rc` and the overlay's two animation-scale defaults are
++not Raspberry Pi 4 properties: the rc is about minradio and trout's
++`ro.vendor.disable_rename_eth0`, the animation values are about what animations
++cost through a virtio GPU, and both apply to any `xenvm-trout` guest on Android
++17. They are carried here so that a Raspberry Pi 4 build takes them from this
++repository, with the rest of its device files, rather than having them staged
++into the checkout. A copy also lives in the workspace for the Raspberry Pi 5
++build.
+ 
+-The fix belongs upstream in `android_device_epam_xenvm-trout`, as an opt-in gated on a
+-boot property. When it lands there, both copies -- this one and the workspace one --
+-are deleted, and this repository is left with the three board files that really are
+-board-specific.
++The fix belongs upstream in `android_device_epam_xenvm-trout`, the rc as an
++opt-in gated on a boot property. When it lands there, the rc and the two
++animation values are deleted from both copies -- this one and the workspace one.
++The rest of the overlay stays, because it belongs to this product: the dialer
++name in `framework-res` and the screen-off timeout. This repository then keeps
++the board files, that overlay and the DomA feature files.
+ 
+ ## Status
+ 
+-The device definition, the init rc and the overlay are the ones that produced the
+-Raspberry Pi 4 DomA images verified on hardware on 2026-08-18 (Dom0 Zephyr / Dom0 Linux,
+-four-domain and DomA-only configurations). `PRODUCT_NAME`, `PRODUCT_DEVICE`, the
+-installed vendor paths and the file contents are unchanged by the move, so a build from
+-this repository produces the same guest images; what changed is where the files come
+-from.
+-
+-The move itself -- the `notdefault,rpi4` project and the group flag -- was verified by a
+-build, on 2026-08-26. A clean clone of the SoDeV Raspberry Pi workspace, with a manifest
+-that names **this branch**, built `--board=rpi4 --dom0=zephyr -a --aaos=source` to rc=0
+-with zero errors and produced a 26.7 GB flashable image. Along the way:
++The move into this repository -- the `notdefault,rpi4` project and the group
++flag -- was verified by a build on 2026-08-26, with the device definition, the
++init rc and the overlay as they were at the move: the ones that produced the
++Raspberry Pi 4 DomA images verified on hardware on 2026-08-18 (Dom0 Zephyr /
++Dom0 Linux, four-domain and DomA-only configurations). A clean clone of the
++SoDeV Raspberry Pi workspace, with a manifest that named this repository at the
++move, built `--board=rpi4 --dom0=zephyr -a --aaos=source` to rc=0 with zero
++errors and produced a 26.7 GB flashable image. Along the way:
+ 
+ * `repo init -g default,rpi4` resolves 1087 projects and syncs this repository; the same
+   init without the group resolves 1086 and the project is absent, so no other board is
+@@ -102,18 +156,24 @@ with zero errors and produced a 26.7 GB flashable image. Along the way:
+   TARGET_DEVICE".
+ * AOSP finished `build completed successfully (01:23:48)`.
+ * `out/target/product/xenvm_trout_rpi4_arm64/vendor/etc/init/init.xenvm-buried-eth0.rc`
+-  exists and is md5-identical to the copy in this repository
+-  (`c06f8743e7b5789fc8de8690a82e9da1`), so `PRODUCT_COPY_FILES` installs what it names.
+-* `aapt2 dump resources` on the built `SettingsProvider.apk` reports
+-  `def_bluetooth_on = false` and both animation scales at `0.000000%`, so the
+-  `DEVICE_PACKAGE_OVERLAYS` entry takes effect too.
++  existed and was md5-identical to the copy this repository held then, so
++  `PRODUCT_COPY_FILES` installs what it names.
++* `aapt2 dump resources` on the built `SettingsProvider.apk` reported both
++  animation scales at `0.000000%`, so the `DEVICE_PACKAGE_OVERLAYS` entry takes
++  effect too.
+ * The upstream device declares neither this product name nor this device name, and does
+   not install this rc, so there is no collision and no double install.
+ 
+-Not run, and therefore not claimed: booting that image on a Raspberry Pi 4. The hardware
+-run in the paragraph above predates the move; what the move changes is where the files
+-come from, and that is what the build above checks.
++Not run, and therefore not claimed: booting that image on a Raspberry Pi 4. The
++2026-08-18 hardware run predates the move; what the move changes is where the
++files come from, and that is what the build above checks.
++
++The DomA feature files -- Vulkan compositing, the Wi-Fi shadow AP, Bluetooth
++A2DP and HFP, and hardware decode -- came after the move, and they change the
++product makefile, the board config and the overlay as well. They were measured
++on hardware from the workspace layer they came from, and not every item was
++reached on a Raspberry Pi 4. No build of this revision is claimed here.
+ 
+ ## License
+ 
+-Apache-2.0, see `LICENSE`. Each file carries an SPDX identifier.
++Apache-2.0, see `LICENSE`. Every other file carries an SPDX identifier.
+diff --git a/aosp_xenvm_trout_rpi4_arm64.mk b/aosp_xenvm_trout_rpi4_arm64.mk
+index 46fc236..981aaf7 100644
+--- a/aosp_xenvm_trout_rpi4_arm64.mk
++++ b/aosp_xenvm_trout_rpi4_arm64.mk
+@@ -35,8 +35,8 @@
+ # list wholesale. Four differences from trout's five entries:
+ #
+ #   * audio_policy_configuration.xml comes from this device dir instead of
+-#     device/google/trout/product_files/. It is a fork whose header documents both
+-#     changes; the short version is that trout includes
++#     device/google/trout/product_files/. It is a fork whose header documents all
++#     three changes; the short version of the first is that trout includes
+ #     a2dp_audio_policy_configuration.xml, whose module is named "a2dp", and
+ #     audio.a2dp.default does not exist anywhere in AOSP 17. The implementation is
+ #     audio.bluetooth.default now and its module name is "bluetooth". Left alone,
+@@ -193,11 +193,6 @@ PRODUCT_VENDOR_PROPERTIES += \
+ PRODUCT_COPY_FILES += \
+     device/sodev/xenvm-cf/init.xenvm-buried-eth0.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/init.xenvm-buried-eth0.rc
+ 
+-# Settings.Global defaults for a fresh userdata: window/transition animations off (the
+-# device model, not the GPU, pays for them). The overlay file carries the measurements
+-# and the runtime equivalents for an existing /data.
+-DEVICE_PACKAGE_OVERLAYS += device/sodev/xenvm-cf/overlay
+-
+ # Shadow-AP Wi-Fi: simulated radios in this guest beaconing the SSIDs DomD really
+ # sees, so the Settings Wi-Fi screen lists real access points instead of virt_wifi's
+ # single synthetic "VirtWifi".
+@@ -521,6 +516,13 @@ PRODUCT_PROPERTY_OVERRIDES += \
+ 
+ endif # XT_DOMA_HWDEC
+ 
++# Settings.Global and Settings.System defaults for a fresh userdata:
++# window/transition animations off, and screen_off_timeout at 30 min (a dimmed
++# HDMI panel has no backlight to dim, so it reads as a dead screen and swallows
++# the first tap). All three values, their measurements and the runtime
++# equivalents for an existing /data are in the overlay file itself.
++DEVICE_PACKAGE_OVERLAYS += device/sodev/xenvm-cf/overlay
++
+ # Bluetooth off on a fresh userdata. A runtime overlay, not the one above: Car's own RRO
+ # sets def_bluetooth_on=true and outranks any build-time overlay. The ordering that makes
+ # this one win is in its Android.bp.
+diff --git a/audio/audio_policy_configuration.xml b/audio/audio_policy_configuration.xml
+index 913bdce..dc66286 100644
+--- a/audio/audio_policy_configuration.xml
++++ b/audio/audio_policy_configuration.xml
+@@ -18,8 +18,9 @@
+      SPDX-License-Identifier: Apache-2.0
+ 
+      FORKED from device/google/trout/product_files/vendor/etc/audio_policy_configuration.emulator.xml
+-     for aosp_xenvm_trout_rpi4_arm64. Two changes, both load-bearing; everything
+-     else is byte-identical to trout's file and should stay that way.
++     for aosp_xenvm_trout_rpi4_arm64. Three changes, all load-bearing;
++     everything else is byte-identical to trout's file and should stay that
++     way.
+ 
+      1. The A2dp include is replaced by a "bluetooth" module.
+ 
+@@ -57,6 +58,22 @@
+         left to check on the board is the media volume slider on the HDMI bus
+         outputs.
+ 
++     3. bus0_media_out's gain ceiling is maxValueMB="1200" (+12 dB), not
++        trout's 600. MEDIA routes to that bus and nothing else on the HDMI
++        path adds gain: vc4-hdmi exposes no volume control and the qemu ALSA
++        backend has none. trout's audio HAL (device/generic/car/emulator/
++        audio/driver/audio_hw.c, adev_set_audio_port_config()) scales the
++        stream by 10^(gain_mB/2000), its own hard-coded range of -3200 to
++        600 cancelling out, and the formula keeps going above 600. So the
++        top of trout's range is 10^0.3, about 2.0 (+6 dB), and the top of
++        this one 10^0.6, about 4.0 (+12 dB).
++        Measured on this board: the HAL scaled the stream by 1.58, which is
++        400 mB, and HDMI audio was too quiet. That is below what 600 allows,
++        so the framework was not sending the ceiling at the time of that
++        measurement; the volume index then is not established, and the
++        ratio with 1200 in place is not claimed here. The Raspberry Pi 5
++        fork keeps 600; its HDMI level has not been measured.
++
+      Schema note: this document is version="1.0", so samplingRates lists are
+      COMMA separated. Do not pull in a *_7_0.xml include, because those use spaces
+      and mixing the two is a schema error.
+@@ -186,7 +203,7 @@
+                              samplingRates="48000" channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                     <gains>
+                         <gain name="" mode="AUDIO_GAIN_MODE_JOINT"
+-                              minValueMB="-3200" maxValueMB="600"
++                              minValueMB="-3200" maxValueMB="1200"
+                               defaultValueMB="0" stepValueMB="100"/>
+                     </gains>
+                 </devicePort>
+diff --git a/overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml b/overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml
+index 3b6dae6..9a46512 100644
+--- a/overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml
++++ b/overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml
+@@ -2,19 +2,21 @@
+ <!--
+   SPDX-License-Identifier: Apache-2.0
+ 
+-  Product overlay for SettingsProvider's Settings.Global defaults. Only the two
+-  values below are overridden; everything else keeps the AOSP default, because a
+-  DEVICE_PACKAGE_OVERLAYS resource file is merged per resource name rather than
+-  swapped in whole.
++  Product overlay for SettingsProvider's Settings.Global and Settings.System
++  defaults. Only the three values below are overridden; everything else keeps
++  the AOSP default, because a DEVICE_PACKAGE_OVERLAYS resource file is merged
++  per resource name rather than swapped in whole.
+ 
+   These defaults apply to a FRESH userdata only. SettingsProvider seeds
+-  Settings.Global once, on the first boot of an empty /data. On a board whose
+-  /data is already provisioned, set the same values live instead:
++  Settings.Global and Settings.System once, on the first boot of an empty
++  /data. On a board whose /data is already provisioned, set the same values
++  live instead:
+ 
+       settings put global window_animation_scale 0
+       settings put global transition_animation_scale 0
+       settings put global animator_duration_scale 0    (no resource default
+                                                         exists; runtime only)
++      settings put system screen_off_timeout 1800000
+ 
+   def_window_animation_scale / def_window_transition_scale = 0%
+     Window and transition animations are pure compositor work on a platform whose
+@@ -26,10 +28,21 @@
+     workload. Set them to 50% instead of 0% if the demo wants the motion back at
+     half the cost.
+ 
++  def_screen_off_timeout=1800000  (60 s to 30 min)
++    This panel has no backlight, so the dim step of the screen off sequence is
++    applied as a near black overlay (DisplayPowerController brightness 0.397 to
++    0.05) and the display simply looks dead. Measured on the board 2026-09-16:
++    after a menu had been left on screen for 112 s, every tap was consumed as a
++    wake event, so not one button press reached the app underneath. The same
++    dim made A2DP playback look like the screen going black several times. This
++    default covers the whole UI (Bluetooth audio, settings, the launcher) and
++    survives a userdata wipe, which a runtime `settings put` does not.
++
+   Note for editors: XML comments may not contain a double hyphen, which is why
+   this block uses none.
+ -->
+ <resources>
+     <fraction name="def_window_animation_scale">0%</fraction>
+     <fraction name="def_window_transition_scale">0%</fraction>
++    <integer name="def_screen_off_timeout">1800000</integer>
+ </resources>
