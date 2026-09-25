@@ -1,0 +1,258 @@
+From 3d63382929f6a0a3b691f59dc6ceb70c65eb240d Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 22 Sep 2026 17:09:15 +0900
+Subject: [PATCH] car-audio: bridge the HFP far-end voice onto the call bus
+
+When the head unit is the hands-free (HFP client) side of a call, the far-end
+voice arrives as an AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET input, and nothing
+in the platform routes an input to a speaker. CarAudioService now creates an
+audio patch from that input to the call bus -- USAGE_VOICE_COMMUNICATION,
+resolved through the car zone configuration -- when the device appears,
+releases it when the device goes away, and lets go of it when the service
+tears its callbacks down.
+
+The SCO input's runtime port carries no gain controller, so
+AudioManagerHelper.createAudioPatch() accepts a source without one when the
+requested gain is 0 and patches it at unity; a non-zero gain on such a source
+stays an error. releaseAudioPatch() also returns after a successful release
+instead of falling through to its "found no match" error.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ .../car/builtin/media/AudioManagerHelper.java |  43 ++++--
+ .../android/car/audio/CarAudioService.java    | 128 ++++++++++++++++++
+ 2 files changed, 163 insertions(+), 8 deletions(-)
+
+diff --git a/car-builtin-lib/src/android/car/builtin/media/AudioManagerHelper.java b/car-builtin-lib/src/android/car/builtin/media/AudioManagerHelper.java
+index aa4bc2671b..9c2e3323f1 100644
+--- a/car-builtin-lib/src/android/car/builtin/media/AudioManagerHelper.java
++++ b/car-builtin-lib/src/android/car/builtin/media/AudioManagerHelper.java
+@@ -185,17 +185,44 @@ public final class AudioManagerHelper {
+                 AudioFormat.CHANNEL_OUT_DEFAULT, AudioFormat.ENCODING_DEFAULT, null);
+         Slogf.d(TAG, "createAudioPatch sinkConfig: " + sinkConfig);
+ 
+-        // Configure the source port to match the output port except for a gain adjustment
+-        AudioGain audioGain = Objects.requireNonNull(getAudioGain(sourceDevice.getPort()),
+-                "Gain controller not available for source port");
+-
+-        // size of gain values is 1 in MODE_JOINT
+-        AudioGainConfig audioGainConfig = audioGain.buildConfig(AudioGain.MODE_JOINT,
+-                audioGain.channelMask(), new int[] { gainInMillibels }, 0);
++        // Configure the source port to match the output port except for a gain adjustment.
++        //
++        // A SOURCE WITHOUT A GAIN CONTROLLER IS ALLOWED. The HFP far-end voice reaches the
++        // call bus through exactly such a patch on this board. The SCO input port is created
++        // dynamically when the phone connects, and that runtime instance carries no gains even
++        // when the declared port has one (2026-09-19, dumpsys media.audio_policy: a JOINT gain
++        // declared on "BT SCO Headset Mic" was listed on the declared port, not on the attached
++        // instance), so this board's policy declares none. getAudioGain() therefore threw
++        // "Audio device must have gains defined", CarAudioService caught it and logged
++        // "Could not bridge HFP SCO input <mac> onto the call bus", and the call carried on
++        // with no audio route -- a permanent silent no-op. Measured 2026-09-19: the controller
++        // delivered 13030 SCO packets, 90.6% of the payload non-zero, while the HDMI stream
++        // carried real-time digital silence for the whole call.
++        //
++        // The native layer imposes no such requirement: AudioPolicyManager::createAudioPatch
++        // builds the software bridge whether or not the source has a gain controller
++        // (frameworks/av/services/audiopolicy/managerdefault/AudioPolicyManager.cpp:6058-6068).
++        // A non-zero gain still needs a controller, so that case stays an error rather than
++        // being silently ignored; CarAudioService passes 0 for the HFP bridge.
++        AudioDevicePort sourcePort = Preconditions.checkNotNull(sourceDevice.getPort(),
++                "Source device [%s] does not contain an audio port", sourceDevice);
++        AudioGainConfig audioGainConfig = null;
++        if (sourcePort.gains().length > 0) {
++            AudioGain audioGain = Objects.requireNonNull(getAudioGain(sourcePort),
++                    "Gain controller not available for source port");
++            // size of gain values is 1 in MODE_JOINT
++            audioGainConfig = audioGain.buildConfig(AudioGain.MODE_JOINT,
++                    audioGain.channelMask(), new int[] { gainInMillibels }, 0);
++        } else if (gainInMillibels != 0) {
++            throw new IllegalArgumentException("Source port has no gain controller, cannot"
++                    + " apply " + gainInMillibels + " mB: " + sourceDevice);
++        } else {
++            Slogf.d(TAG, "createAudioPatch: source has no gain controller, patching at unity");
++        }
+         // Construct an empty / default configuration excepts gain config here and it's up to the
+         // audio HAL how to interpret this configuration, which the audio HAL
+         // implementation should ignore.
+-        AudioPortConfig sourceConfig = sourceDevice.getPort().buildConfig(0,
++        AudioPortConfig sourceConfig = sourcePort.buildConfig(0,
+                 AudioFormat.CHANNEL_IN_DEFAULT, AudioFormat.ENCODING_DEFAULT, audioGainConfig);
+ 
+         // Create an audioPatch to connect the two ports
+diff --git a/service/src/com/android/car/audio/CarAudioService.java b/service/src/com/android/car/audio/CarAudioService.java
+index 2704eb1646..d365be0afa 100644
+--- a/service/src/com/android/car/audio/CarAudioService.java
++++ b/service/src/com/android/car/audio/CarAudioService.java
+@@ -240,6 +240,10 @@ public final class CarAudioService extends ICarAudio.Stub implements CarServiceB
+ 
+     private final LocalLog mServiceEventLogger = new LocalLog(EVENT_LOGGER_QUEUE_SIZE);
+ 
++    /** Patch that bridges the HFP far-end audio onto the call bus; see
++     * {@link #handleHfpScoInputAdded}. Null when no HFP call is routed. */
++    @GuardedBy("mImplLock")
++    private @Nullable CarAudioPatchHandle mHfpScoPatch;
+     @GuardedBy("mImplLock")
+     private boolean mInitCompleted;
+     @GuardedBy("mImplLock")
+@@ -790,6 +794,7 @@ public final class CarAudioService extends ICarAudio.Stub implements CarServiceB
+         releaseAudioPlaybackMonitorLocked();
+         releasePowerListenerLocked();
+         releaseAudioDeviceInfoCallbackLocked();
++        releaseHfpScoPatchLocked(isAudioServerDown);
+         releaseHalAudioModuleChangeCallbackLocked();
+         CarOccupantZoneService occupantZoneService = getCarOccupantZoneService();
+         occupantZoneService.unregisterCallback(mOccupantZoneCallback);
+@@ -2756,6 +2761,10 @@ public final class CarAudioService extends ICarAudio.Stub implements CarServiceB
+ 
+         if (mAudioManagerWrapper.releaseAudioPatch(getAudioPatchInfo(carPatch))) {
+             Slogf.d(TAG, "releaseAudioPatch %s successfully", carPatch);
++            // Without this return the error below also prints after
++            // every successful release, and handleHfpScoInputRemoved()
++            // releases a patch at the end of every HFP call.
++            return;
+         }
+         // If we didn't find a match, then something went awry, but it's probably not fatal...
+         Slogf.e(TAG, "releaseAudioPatch found no match for %s", carPatch);
+@@ -4381,6 +4390,11 @@ public final class CarAudioService extends ICarAudio.Stub implements CarServiceB
+             }
+         }
+         Slogf.d(TAG, "Added audio devices " + Arrays.toString(addedDevices));
++        // Must run BEFORE the filterBusDevices() result is checked: filterBusDevices() is a pure
++        // function and does not touch addedDevices, but it drops every source (input) device, so
++        // on this product -- which has no non-BUS output devices -- the list is usually empty and
++        // the early return below would skip this entirely.
++        handleHfpScoInputAdded(addedDevices);
+         List<AudioDeviceInfo> devices = filterBusDevices(addedDevices);
+ 
+         if (devices.isEmpty()) {
+@@ -4421,6 +4435,8 @@ public final class CarAudioService extends ICarAudio.Stub implements CarServiceB
+             }
+         }
+         Slogf.d(TAG, "Removed audio devices " + Arrays.toString(removedDevices));
++        // Same ordering note as in audioDevicesAdded(): the early return below would skip this.
++        handleHfpScoInputRemoved(removedDevices);
+         List<AudioDeviceInfo> devices = filterBusDevices(removedDevices);
+ 
+         if (devices.isEmpty()) {
+@@ -4492,6 +4508,118 @@ public final class CarAudioService extends ICarAudio.Stub implements CarServiceB
+         mConfigsCallbacks.finishBroadcast();
+     }
+ 
++    /**
++     * Bridge the HFP far-end audio (the remote party's voice) onto the call bus.
++     *
++     * WHY THIS EXISTS. When the head unit is the hands-free unit (HFP client), the remote
++     * party's voice arrives as an INPUT device, AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET, and
++     * nothing in the platform moves it to a speaker:
++     *  - AudioPolicyManager does have an automatic call bridge
++     *    (AudioPolicyManager.cpp:774 updateCallRouting -> :892 connectTelephonyRxAudioSource)
++     *    but its source is hard-coded to AUDIO_DEVICE_IN_TELEPHONY_RX (:922-925), and this
++     *    product declares no TELEPHONY port at all, so it never applies.
++     *  - The BT audio HAL's input stream is reader-driven: audio_bluetooth_hw's in_read()
++     *    is what eventually makes the Bluetooth stack activate the HFP decode session, so
++     *    with no reader the far-end PCM is dropped inside the stack.
++     * So a patch has to be created explicitly, and it has to be created HERE rather than
++     * with HwAudioSource/AudioSystem.startAudioSource: those resolve their sink through the
++     * default audio policy engine, whose phone strategy cannot pick an AUDIO_DEVICE_OUT_BUS
++     * at all, so they would land on the media bus. createAudioPatchLocked() resolves the
++     * sink through getOutputDeviceForAudioAttributeLocked(), i.e. through the CAR zone
++     * configuration, which maps USAGE_VOICE_COMMUNICATION -> CALL context -> the call bus.
++     *
++     * WHY THE INTERNAL CALL IS ALLOWED. createAudioPatchLocked() itself performs no
++     * enforcement; the public createAudioPatch() is what calls enforceCanUseAudioPatchAPI(),
++     * so the ro.android.car.audio.enableaudiopatch gate stays untouched for external
++     * callers and does not need to be turned on for this. The permission check inside
++     * getOutputDeviceForAudioAttributeLocked() uses checkCallingOrSelfPermission(), and
++     * car service runs with sharedUserId android.uid.system, which
++     * ActivityManager.canAccessUnexportedComponents() grants unconditionally.
++     *
++     * Failures are logged and swallowed on purpose: a call that cannot be bridged must not
++     * take the audio device callback -- and with it every zone update -- down with it.
++     */
++    private void handleHfpScoInputAdded(AudioDeviceInfo[] addedDevices) {
++        AudioDeviceInfo scoMic = findHfpScoInput(addedDevices);
++        if (scoMic == null) {
++            return;
++        }
++        synchronized (mImplLock) {
++            if (mHfpScoPatch != null) {
++                Slogf.i(TAG, "HFP SCO input already bridged, leaving %s alone", mHfpScoPatch);
++                return;
++            }
++            try {
++                mHfpScoPatch = createAudioPatchLocked(scoMic.getAddress(),
++                        AudioAttributes.USAGE_VOICE_COMMUNICATION, /* gainInMillibels= */ 0);
++                Slogf.i(TAG, "Bridged HFP SCO input %s onto the call bus: %s",
++                        scoMic.getAddress(), mHfpScoPatch);
++            } catch (RuntimeException e) {
++                Slogf.e(TAG, e, "Could not bridge HFP SCO input %s onto the call bus",
++                        scoMic.getAddress());
++                mHfpScoPatch = null;
++            }
++        }
++    }
++
++    /** Undo {@link #handleHfpScoInputAdded}; leaving the patch would double up on the next call. */
++    private void handleHfpScoInputRemoved(AudioDeviceInfo[] removedDevices) {
++        if (findHfpScoInput(removedDevices) == null) {
++            return;
++        }
++        synchronized (mImplLock) {
++            if (mHfpScoPatch == null) {
++                return;
++            }
++            try {
++                releaseAudioPatchLocked(mHfpScoPatch);
++                Slogf.i(TAG, "Released the HFP SCO bridge");
++            } catch (RuntimeException e) {
++                Slogf.e(TAG, e, "Could not release the HFP SCO bridge");
++            }
++            mHfpScoPatch = null;
++        }
++    }
++
++    /**
++     * Drop the HFP bridge when car audio service tears its callbacks down.
++     *
++     * Without this the handle survives an audio server restart and permanently blocks the
++     * bridge: audioDevicesRemoved() returns early while mIsAudioServerDown is set, so the
++     * release never runs, and on recovery AudioManager re-delivers every current device to
++     * onAudioDevicesAdded() -- where handleHfpScoInputAdded() would find mHfpScoPatch still
++     * set and log "already bridged, leaving alone" for every call from then on.
++     *
++     * When the audio server is down the patch is already gone with it, so only the handle is
++     * cleared; otherwise it is released properly first.
++     */
++    @GuardedBy("mImplLock")
++    private void releaseHfpScoPatchLocked(boolean isAudioServerDown) {
++        if (mHfpScoPatch == null) {
++            return;
++        }
++        if (!isAudioServerDown) {
++            try {
++                releaseAudioPatchLocked(mHfpScoPatch);
++            } catch (RuntimeException e) {
++                Slogf.e(TAG, e, "Could not release the HFP SCO bridge while tearing down");
++            }
++        } else {
++            Slogf.i(TAG, "Audio server is down, dropping the HFP SCO bridge handle");
++        }
++        mHfpScoPatch = null;
++    }
++
++    @Nullable
++    private static AudioDeviceInfo findHfpScoInput(AudioDeviceInfo[] devices) {
++        for (AudioDeviceInfo info : devices) {
++            if (info.isSource() && info.getType() == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
++                return info;
++            }
++        }
++        return null;
++    }
++
+     private static List<AudioDeviceInfo> filterBusDevices(AudioDeviceInfo[] infos) {
+         List<AudioDeviceInfo> devices = new ArrayList<>();
+         for (int c = 0; c < infos.length; c++) {

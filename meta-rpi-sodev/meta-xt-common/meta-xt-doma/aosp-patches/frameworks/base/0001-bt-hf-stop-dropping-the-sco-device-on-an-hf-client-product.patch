@@ -1,0 +1,59 @@
+From 4ffa3997508101cdc9cfa30756639a8d50d4895f Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Tue, 22 Sep 2026 17:09:15 +0900
+Subject: [PATCH] audio: stop dropping the SCO device on an HF-client product
+
+On a product that runs only the HFP client role
+(bluetooth.profile.hfp.hf.enabled=true) the AG BluetoothHeadset proxy never
+connects, so isProfileProxyConnected(HEADSET) is false and AudioDeviceBroker
+drops the SCO active-device message that HeadsetClientStateMachine sends
+("MSG_L_SET_BT_ACTIVE_DEVICE received with null profile proxy"). The bt_sco
+input device then never reaches AudioPolicy, the car audio service has
+nothing to bridge onto the call bus, and the call is silent.
+isProfileProxyConnected() now also answers true for HEADSET on such a
+product.
+
+Assisted-by: Claude Code:claude-opus-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ .../java/com/android/server/audio/BtHelper.java  | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/services/core/java/com/android/server/audio/BtHelper.java b/services/core/java/com/android/server/audio/BtHelper.java
+index b104fc01ce985..8dbae27435f21 100644
+--- a/services/core/java/com/android/server/audio/BtHelper.java
++++ b/services/core/java/com/android/server/audio/BtHelper.java
+@@ -58,6 +58,7 @@ import android.media.BluetoothProfileConnectionInfo;
+ import android.os.Binder;
+ import android.os.Bundle;
+ import android.os.Process;
++import android.os.SystemProperties;
+ import android.os.UserHandle;
+ import android.text.TextUtils;
+ import android.util.IntArray;
+@@ -1275,10 +1276,23 @@ public class BtHelper {
+         mDeviceBroker.postBluetoothActiveDevice(info, 0 /* delay */);
+     }
+ 
++    /** True on HFP client-role (HF) products, where the AG HEADSET proxy is never bound. */
++    private static final boolean sHfClientRole =
++            SystemProperties.getBoolean("bluetooth.profile.hfp.hf.enabled", false);
++
+     /*package*/ synchronized boolean isProfileProxyConnected(int profile) {
+         switch (profile) {
+             case BluetoothProfile.HEADSET:
+-                return mBluetoothHeadset != null;
++                // Measured on the board 2026-09-15: HF-client products
++                // (bluetooth.profile.hfp.hf.enabled=true) run the HFP client role only,
++                // so the AG BluetoothHeadset proxy never connects, yet
++                // HeadsetClientStateMachine.notifyAudioFrameworkScoActiveDevice still
++                // announces the SCO device. handleBtScoActiveDeviceChange() only needs
++                // mDeviceBroker.handleDeviceConnection(), never the AG proxy, so treat
++                // the HF role like the unmanaged profiles below and let it through;
++                // otherwise the bt_sco IN device never reaches AudioPolicy and the
++                // CarAudioService scoMic->bus4_call_out bridge never fires (silent call).
++                return mBluetoothHeadset != null || sHfClientRole;
+             case BluetoothProfile.A2DP:
+                 return mA2dp != null;
+             case BluetoothProfile.HEARING_AID:

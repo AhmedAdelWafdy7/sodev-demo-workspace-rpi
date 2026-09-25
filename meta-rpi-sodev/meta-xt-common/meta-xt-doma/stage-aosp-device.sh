@@ -86,6 +86,16 @@ rpi4)
 	# default for every value it sets, so say so here where it is cheap to notice.
 	[ -f "$OVERLAY_XML" ] || { echo "ERROR: $OVERLAY_XML is missing." >&2; exit 1; }
 	check_overlay_xml "$OVERLAY_XML"
+	# Every XML under the overlay root, as for rpi5 below: it also carries
+	# framework-res values (config_defaultDialer), and aapt2 names neither a line
+	# nor the overlay when one of them is malformed. The same `for` form, for the
+	# same subshell reason.
+	for x in $(find "$DEV/overlay" -name '*.xml'); do
+		check_overlay_xml "$x"
+	done
+	DIALER_XML="$DEV/overlay/frameworks/base/core/res/res/values/config.xml"
+	# Named explicitly for the same reason as on rpi5: a MISSING file is silent.
+	[ -f "$DIALER_XML" ] || { echo "ERROR: $DIALER_XML is missing." >&2; exit 1; }
 	# The device installs DomaWifiRelay and DomaSettingsProviderRRO from its own
 	# copies. A checkout that was staged for rpi5 still has device/agl/doma-common
 	# with the same module names, and soong rejects a duplicate module name.
@@ -122,7 +132,24 @@ rpi5)
 	OVERLAY_XML="$ROOT/device/agl/common/overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml"
 	[ -f "$OVERLAY_XML" ] || {
 		echo "ERROR: device/agl/common/overlay SettingsProvider defaults not staged." >&2; exit 1; }
-	check_overlay_xml "$OVERLAY_XML"
+	# Every XML under the overlay root, not just that one file: the root now also
+	# carries framework-res values (config_defaultDialer), and aapt2's diagnostic for
+	# a malformed overlay names neither a line nor which overlay it came from, so an
+	# unchecked file would cost the same ~2.5 minutes of build to find.
+	# `for` over a substitution, NOT `find | while read`: a pipeline runs the loop in
+	# a subshell, so the `exit 1` inside check_overlay_xml would leave that subshell
+	# and the script would carry on and stage a broken overlay. The paths are this
+	# layer's own and contain no whitespace.
+	for x in $(find "$ROOT/device/agl/common/overlay" -name '*.xml'); do
+		check_overlay_xml "$x"
+	done
+	DIALER_XML="$ROOT/device/agl/common/overlay/frameworks/base/core/res/res/values/config.xml"
+	# Named explicitly rather than left to the find above: a MISSING file is the
+	# failure mode here, and it is silent. Without it the DIALER role has no holder,
+	# Telecom binds no InCallService, and an incoming HFP call produces no screen and
+	# no ringtone -- which reads as a Bluetooth fault. See common/DEFAULT-DIALER.md.
+	[ -f "$DIALER_XML" ] || {
+		echo "ERROR: device/agl/common/overlay framework-res config.xml not staged." >&2; exit 1; }
 
 	# device/agl/doma-common holds the modules the product installs by
 	# MODULE name (DomaWifiRelay, DomaSettingsProviderRRO). soong rejects a

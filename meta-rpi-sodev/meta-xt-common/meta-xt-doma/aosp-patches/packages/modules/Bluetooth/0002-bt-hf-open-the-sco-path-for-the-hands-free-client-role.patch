@@ -1,0 +1,760 @@
+From ef98b0093acfebabad0ba8d4d60d86e4e26be224 Mon Sep 17 00:00:00 2001
+From: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Date: Wed, 23 Sep 2026 20:28:56 +0900
+Subject: [PATCH] bt-hf: open the SCO path for the hands-free client role
+
+Incoming-call audio never arrived. The audio HAL client gated the receive path on the
+handset role, so nothing fed the SCO stream while this device is the hands-free client;
+the state machine and the SCO setup needed the matching adjustments.
+
+The dialer half of this is a product overlay -- config_defaultDialer pointed at a dialer
+the product does not install, so no InCallService was bound and neither the call screen
+nor the ringtone appeared. This patch only covers the stack.
+
+What the state machine and the audio HAL client changes do not do on their own is start
+the HF role's software SCO data path, so with only them the SCO stream still has nothing
+at either end. The rest of the stack half:
+
+ - bta_hf_client_main.cc: acquire the HFP software SCO endpoints when the HF role is
+   enabled and release them when it is disabled, mirroring the AG role. Without it
+   bta_hf_client_sco_datapath_active() never becomes true and every HF branch below it
+   is dead code.
+ - bta_hf_client_sco.cc: ask for the HCI SCO path through
+   hfp_hal_interface::get_offload_enabled() instead of hard-coding offload in the seven
+   esco_parameters_for_codec() calls, and stop both sessions when SCO closes.
+ - stack/btm/btm_sco_hci.cc: hand the HCI SCO reads and writes to the HF client when its
+   data path is active, instead of always to the AG.
+ - audio_bluetooth_hw/device_port_proxy.cc: map the SCO output and input devices onto
+   HFP_SOFTWARE_ENCODING_DATAPATH / HFP_SOFTWARE_DECODING_DATAPATH. Without it the
+   Bluetooth audio HAL refuses the stream ("adev_open_output_stream: cannot init HAL")
+   and the policy manager finds no input for the SCO headset.
+
+Measured on the Raspberry Pi 4 board: with the complete set the phone's in-band ringtone
+and the call voice both reach the speakers (2026-09-19). Without these four pieces
+(2026-09-23) the HAL refuses the SCO stream and Telecom routes the call to the bus
+speaker with nothing on it.
+
+Assisted-by: Claude Code:claude-opus-5-5
+Signed-off-by: Yuichi Kusakabe <yuichi_kusakabe@jp.honda>
+Upstream-Status: Pending
+---
+ .../hfpclient/HeadsetClientStateMachine.java  |  63 +++++
+ .../audio_bluetooth_hw/device_port_proxy.cc   |  54 ++++
+ .../aidl/client_interface_aidl.cc             |   3 +-
+ .../aidl/hfp_client_interface_aidl.cc         |  58 ++++
+ system/bta/hf_client/bta_hf_client_int.h      |  19 ++
+ system/bta/hf_client/bta_hf_client_main.cc    |  12 +
+ system/bta/hf_client/bta_hf_client_sco.cc     | 267 +++++++++++++++++-
+ system/stack/btm/btm_sco_hci.cc               |  29 +-
+ 8 files changed, 495 insertions(+), 10 deletions(-)
+
+diff --git a/android/app/src/com/android/bluetooth/hfpclient/HeadsetClientStateMachine.java b/android/app/src/com/android/bluetooth/hfpclient/HeadsetClientStateMachine.java
+index 1567a9b..343bbce 100644
+--- a/android/app/src/com/android/bluetooth/hfpclient/HeadsetClientStateMachine.java
++++ b/android/app/src/com/android/bluetooth/hfpclient/HeadsetClientStateMachine.java
+@@ -54,6 +54,7 @@ import android.content.Intent;
+ import android.media.AudioAttributes;
+ import android.media.AudioFocusRequest;
+ import android.media.AudioManager;
++import android.media.BluetoothProfileConnectionInfo;
+ import android.os.Bundle;
+ import android.os.Looper;
+ import android.os.Message;
+@@ -934,12 +935,74 @@ public class HeadsetClientStateMachine extends StateMachine {
+         debug("hfp_enable=" + enable);
+         if (enable && !sAudioIsRouted) {
+             mAudioManager.setHfpEnabled(true);
++            notifyAudioFrameworkScoActiveDevice(mDevice, null);
+         } else if (!enable) {
+             mAudioManager.setHfpEnabled(false);
++            notifyAudioFrameworkScoActiveDevice(null, mDevice);
+         }
+         sAudioIsRouted = enable;
+     }
+ 
++    /**
++     * Tell the audio framework which device owns the SCO link, the way the AG role already does
++     * (HeadsetService.java:1113-1120 and :1199-1205).
++     *
++     * WHY THIS IS NEEDED. setHfpEnabled() above is only
++     * AudioSystem.setParameters("hfp_enable=...") (AudioManager.java:4075-4077) -- a string to
++     * the audio HAL. It registers no device. Without a registration the SCO ports declared in
++     * bluetooth_audio_policy_configuration.xml never become available, so nothing can open the
++     * `hfp input` stream, so audio_bluetooth_hw/stream_apis.cc:1064 in_read() never runs, so
++     * BluetoothAudioPortAidl::Start (device_port_proxy.cc:516) never calls StartStream (:528),
++     * so HfpTransport::StartRequest() is never reached -- and the far-end PCM is dropped by
++     * audio_hal_interface/hfp_client_interface.cc:200-205, which returns len as if it had
++     * written everything. The whole chain is reader-driven; this call is its first link.
++     * Measured on the board 2026-09-13 across the three SCO stages.
++     *
++     * WHY THE AG API IS THE RIGHT ONE FOR THE HF ROLE.
++     *  - createHfpInfo() reports BluetoothProfile.HEADSET
++     *    (BluetoothProfileConnectionInfo.java:188-191), and that is exactly the profile
++     *    AudioService.handleBluetoothActiveDeviceChanged accepts while isScoManagedByAudio()
++     *    is true (AudioService.java:9659-9666). HEADSET_CLIENT would be rejected there.
++     *  - AudioDeviceInventory.java:1067-1076 then calls
++     *    AudioDeviceBroker.onSetBtScoActiveDevice() WITHOUT needing the AG profile proxy, and
++     *    BtHelper.java:1403 / :1426 register the SCO output and the SCO INPUT
++     *    (DEVICE_IN_BLUETOOTH_SCO_HEADSET -- the only place in the tree that does).
++     *  - BLUETOOTH_STACK is required (AudioManager.java:7420-7422) and this app already holds
++     *    it (android/app/AndroidManifest.xml:38); hfp/ and hfpclient/ are the same app.
++     *
++     * WHY IT IS SAFE WITH THE AG PROFILE DISABLED (this product: no
++     * bluetooth.profile.hfp.ag.enabled, so HeadsetService.isEnabled() is false):
++     * BtHelper.mScoHelper is only created in onHeadsetProfileConnected (BtHelper.java:1305) and
++     * therefore stays null, and both BtHelper.startBluetoothSco (:749-757) and
++     * stopBluetoothSco (:759-767) null-check it and return false. Under
++     * bluetooth.sco.managed_by_audio the AmScoHelper would not establish SCO anyway -- its own
++     * class comment says start/stop "doesn't actually start or stop SCO" -- so the HF stack
++     * keeps owning SCO establishment and nothing here fights it.
++     *
++     * Repeated calls are harmless: BtHelper.onSetBtScoActiveDevice returns early when the
++     * device is unchanged (BtHelper.java:1451-1453).
++     */
++    private void notifyAudioFrameworkScoActiveDevice(
++            BluetoothDevice newDevice, BluetoothDevice previousDevice) {
++        // Guard the flagged API the same way the AG role does
++        // (hfp/HeadsetSystemInterface.java:389-397): AudioManager.isScoManagedByAudio() is
++        // @FlaggedApi(FLAG_AMSCO_AVAILABLE_API) (AudioManager.java:10421), so it disappears from
++        // the stubs in a build where that flag is off and referencing it unguarded breaks the
++        // build there.
++        // TODO(b/437953494) Replace with an SDK check when the flag is fully rolled out.
++        if (!android.media.audio.Flags.amscoAvailableApi()) {
++            debug("notifyAudioFrameworkScoActiveDevice: amsco api not available, skipping");
++            return;
++        }
++        if (!mAudioManager.isScoManagedByAudio()) {
++            debug("notifyAudioFrameworkScoActiveDevice: sco not managed by audio, skipping");
++            return;
++        }
++        debug("notifyAudioFrameworkScoActiveDevice: " + previousDevice + " -> " + newDevice);
++        mAudioManager.handleBluetoothActiveDeviceChanged(
++                newDevice, previousDevice, BluetoothProfileConnectionInfo.createHfpInfo());
++    }
++
+     private AudioFocusRequest requestAudioFocus() {
+         AudioAttributes streamAttributes =
+                 new AudioAttributes.Builder()
+diff --git a/system/audio_bluetooth_hw/device_port_proxy.cc b/system/audio_bluetooth_hw/device_port_proxy.cc
+index 57c205e..f9d5f57 100644
+--- a/system/audio_bluetooth_hw/device_port_proxy.cc
++++ b/system/audio_bluetooth_hw/device_port_proxy.cc
+@@ -202,6 +202,54 @@ bool BluetoothAudioPortAidl::init_session_type(audio_devices_t device) {
+                    << StringPrintf("%#x", device) << ")";
+       session_type_ = SessionType::A2DP_SOFTWARE_ENCODING_DATAPATH;
+       break;
++    case AUDIO_DEVICE_OUT_BLUETOOTH_SCO:
++    case AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET:
++    case AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT:
++      /* HFP. Upstream this module has no SCO mapping at all, so the HF-role
++       * software data path in bta/hf_client (measured on the board
++       * 2026-08-27) would have no consumer on the audio side: the stack
++       * could put PCM into an HFP_SOFTWARE_* session, but nothing here
++       * would ever ask for one.
++       *
++       * Everything else in the chain already existed, verified rather than
++       * assumed:
++       *   - SessionType::HFP_SOFTWARE_{ENCODING,DECODING}_DATAPATH are in
++       *     hardware/interfaces/bluetooth/audio/aidl/.../SessionType.aidl:74-80
++       *   - the AIDL default provider implements them:
++       *     aidl/default/HfpSoftwareAudioProvider.{h,cc}, dispatched from
++       *     BluetoothAudioProviderFactory.cpp:88-91
++       *   - bta/hf_client uses exactly these two session types
++       *     (hfp_client_interface.cc:265,434)
++       *
++       * ENCODING for output / DECODING for input, matching the LE Audio cases
++       * below and the stack's own direction convention: the stack READS from
++       * the encode interface to get PCM it will transmit, and WRITES received
++       * PCM into the decode interface.
++       *
++       * NOTE THE AIDL-ONLY CONSTRAINT. stream_apis.cc:737 and :1223 pick
++       * BluetoothAudioPortAidl only when
++       * BluetoothAudioSession::IsAidlAvailable() -- i.e. when the AIDL
++       * IBluetoothAudioProviderFactory/default is running -- and otherwise fall
++       * back to BluetoothAudioPortHidl. HIDL 2.1 has NO HFP session type
++       * (checked: zero HFP/SCO hits in
++       * hardware/interfaces/bluetooth/audio/2.1/types.hal), so SCO can only
++       * work on the AIDL path. The products this is built for install
++       * android.hardware.bluetooth.audio-impl (the AIDL provider), so the
++       * AIDL path is the one taken.
++       * No matching change is made to device_port_proxy_hidl.cc because there
++       * is no session type there to map to.
++       *
++       * Sample rate / format need no special casing: LoadAudioConfig() takes
++       * both from the session's PcmConfiguration, and HFP is 16-bit
++       * (BitsPerSampleToAudioFormat()'s case 16), 8/16/32 kHz mono depending on
++       * the negotiated codec (CVSD/mSBC/LC3). The audio policy XML must declare
++       * matching mix ports -- the product's bluetooth_audio_policy_configuration.xml
++       * does that, and this change alone does not make audio flow.
++       */
++      LOG(VERBOSE) << __func__ << ": device=AUDIO_DEVICE_OUT_BLUETOOTH_SCO (HEADSET/CARKIT) ("
++                   << StringPrintf("%#x", device) << ")";
++      session_type_ = SessionType::HFP_SOFTWARE_ENCODING_DATAPATH;
++      break;
+     case AUDIO_DEVICE_OUT_HEARING_AID:
+       LOG(VERBOSE) << __func__ << ": device=AUDIO_DEVICE_OUT_HEARING_AID (MEDIA/VOICE) ("
+                    << StringPrintf("%#x", device) << ")";
+@@ -217,6 +265,12 @@ bool BluetoothAudioPortAidl::init_session_type(audio_devices_t device) {
+                    << StringPrintf("%#x", device) << ")";
+       session_type_ = SessionType::LE_AUDIO_SOFTWARE_ENCODING_DATAPATH;
+       break;
++    case AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET:
++      /* HFP capture. See the OUT_BLUETOOTH_SCO comment above. */
++      LOG(VERBOSE) << __func__ << ": device=AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET (VOICE) ("
++                   << StringPrintf("%#x", device) << ")";
++      session_type_ = SessionType::HFP_SOFTWARE_DECODING_DATAPATH;
++      break;
+     case AUDIO_DEVICE_IN_BLE_HEADSET:
+       LOG(VERBOSE) << __func__ << ": device=AUDIO_DEVICE_IN_BLE_HEADSET (VOICE) ("
+                    << StringPrintf("%#x", device) << ")";
+diff --git a/system/audio_hal_interface/aidl/client_interface_aidl.cc b/system/audio_hal_interface/aidl/client_interface_aidl.cc
+index 8f79bd4..9e6af99 100644
+--- a/system/audio_hal_interface/aidl/client_interface_aidl.cc
++++ b/system/audio_hal_interface/aidl/client_interface_aidl.cc
+@@ -29,6 +29,7 @@
+ #include <vector>
+ 
+ #include "bta/ag/bta_ag_int.h"
++#include "bta/hf_client/bta_hf_client_int.h"
+ #include "hfp_client_interface_aidl.h"
+ 
+ const uint8_t kFetchAudioProviderRetryNumber = 3;
+@@ -267,7 +268,7 @@ bool BluetoothAudioClientInterface::UpdateAudioConfig(const AudioConfiguration&
+                    SessionType::LE_AUDIO_BROADCAST_SOFTWARE_ENCODING_DATAPATH ||
+            transport_->GetSessionType() ==
+                    SessionType::LE_AUDIO_BROADCAST_SOFTWARE_DECODING_DATAPATH ||
+-           (bta_ag_is_sco_managed_by_audio() &&
++           ((bta_ag_is_sco_managed_by_audio() || bta_hf_client_sco_datapath_active()) &&
+             (transport_->GetSessionType() == SessionType::HFP_SOFTWARE_ENCODING_DATAPATH ||
+              transport_->GetSessionType() == SessionType::HFP_SOFTWARE_DECODING_DATAPATH)));
+   bool is_a2dp_offload_session =
+diff --git a/system/audio_hal_interface/aidl/hfp_client_interface_aidl.cc b/system/audio_hal_interface/aidl/hfp_client_interface_aidl.cc
+index 088a8cb..493bb64 100644
+--- a/system/audio_hal_interface/aidl/hfp_client_interface_aidl.cc
++++ b/system/audio_hal_interface/aidl/hfp_client_interface_aidl.cc
+@@ -28,6 +28,7 @@
+ #include "aidl/transport_instance.h"
+ #include "bt_status.h"
+ #include "bta/ag/bta_ag_int.h"
++#include "bta/hf_client/bta_hf_client_int.h"
+ #include "btif/include/btif_hf.h"
+ #include "btif_status.h"
+ #include "hardware/bluetooth.h"
+@@ -111,6 +112,50 @@ HfpTransport::HfpTransport() {
+ }
+ 
+ BluetoothAudioCtrlAck HfpTransport::StartRequest() {
++  /* HF ROLE (this product).  Everything below this block is written for the AG
++   * role: it needs bta_ag_get_active_device(), it asks the stack to bring SCO up
++   * with headset::ConnectAudio(), and it reports progress through
++   * hfp_pending_cmd_.  None of that applies when we are the hands-free unit:
++   *   - the HF role has no active-device concept at all (zero hits for
++   *     active_device under bta/hf_client), so get_hfp_active_device_control_block()
++   *     below returns nullptr and the AG code after this block answers FAILURE;
++   *   - SCO is established by the PEER (the phone), not by us, so there is nothing
++   *     to "connect" here.  By the time the host starts the stream the link is
++   *     already up: the audio framework only learns about the SCO device after
++   *     HeadsetClientStateMachine.routeHfpAudio() reports it, which happens on
++   *     AUDIO_STATE_CONNECTED.
++   * So for HF we only have to answer "yes, a link is up" and activate the stream.
++   * Returning SUCCESS_FINISHED synchronously (like the bta_ag_sco_is_open() path
++   * below) also keeps hfp_pending_cmd_ at HFP_CTRL_CMD_NONE, which is what
++   * HfpClientInterface::Decode::ConfirmStreamingRequest() expects to never see a
++   * dangling START for.
++   *
++   * Without this branch the stream stays inactive and
++   * HfpClientInterface::Decode::Write() drops every far-end packet while
++   * returning len, i.e. silence with no error anywhere.  Measured on the
++   * board 2026-09-13 (HF-client role, SCO open).
++   *
++   * Gated on bta_hf_client_sco_datapath_active() so an AG-only build keeps the
++   * original path untouched.  Note that once that predicate is true this branch
++   * ANSWERS for both outcomes -- it does NOT fall through to the AG code when no HF
++   * link is open, it returns FAILURE.  That is deliberate but only safe because the
++   * predicate cannot be true while the AG owns the software datapath: the singleton
++   * interfaces are taken by whoever initialises first, so if the AG has them
++   * hfp_software_datapath_enabled stays false here (see
++   * bta_hf_client_init_hfp_client_interface in bta/hf_client/bta_hf_client_sco.cc),
++   * and if we have them the AG's software datapath is already inoperative. */
++  if (bta_hf_client_sco_datapath_active()) {
++    RawAddress hf_addr;
++    if (bta_hf_client_sco_get_active_device(&hf_addr)) {
++      log::info("HF role: SCO link is up, activating the decode/encode streams");
++      is_stream_active = true;
++      LogMetricHfpStartStream(hf_addr);
++      return BluetoothAudioCtrlAck::SUCCESS_FINISHED;
++    }
++    log::warn("HF role: no SCO link open yet, not starting the stream");
++    return BluetoothAudioCtrlAck::FAILURE;
++  }
++
+   auto cb = get_hfp_active_device_control_block();
+   if (cb == nullptr) {
+     return BluetoothAudioCtrlAck::FAILURE;
+@@ -159,6 +204,19 @@ void HfpTransport::StopRequest() {
+ 
+   is_stream_active = false;
+ 
++  /* HF ROLE: do NOT tear the link down here.  The AG path below calls
++   * headset::DisconnectAudio(), which is right when WE brought SCO up, but in the
++   * HF role the link belongs to the call: the host merely stopped reading the
++   * stream (e.g. the reader closed), and dropping SCO would cut the call audio.
++   * Deactivating the stream above is the whole job; the peer or
++   * HeadsetClientStateMachine tears SCO down when the call ends, and that path
++   * already reports it through routeHfpAudio(false). */
++  if (bta_hf_client_sco_datapath_active()) {
++    log::info("HF role: stream deactivated, leaving the SCO link to the call");
++    hfp_pending_cmd_ = HFP_CTRL_CMD_NONE;
++    return;
++  }
++
+   RawAddress addr = bta_ag_get_active_device();
+   if (addr.IsEmpty()) {
+     log::error("No active device found");
+diff --git a/system/bta/hf_client/bta_hf_client_int.h b/system/bta/hf_client/bta_hf_client_int.h
+index 53702e3..ba944a2 100644
+--- a/system/bta/hf_client/bta_hf_client_int.h
++++ b/system/bta/hf_client/bta_hf_client_int.h
+@@ -267,6 +267,25 @@ void bta_hf_client_sco_conn_close(tBTA_HF_CLIENT_DATA* p_data);
+ void bta_hf_client_sco_open(tBTA_HF_CLIENT_DATA* p_data);
+ void bta_hf_client_sco_close(tBTA_HF_CLIENT_DATA* p_data);
+ void bta_hf_client_sco_shutdown(tBTA_HF_CLIENT_CB* client_cb);
++
++/* HFP software (over-HCI) SCO data path for the HF role. Mirrors the AG entry
++ * points in bta/ag/bta_ag_int.h. See the long comment at the top of
++ * bta_hf_client_sco.cc for why the HF role needs its own copy and how it is gated.
++ *
++ * bta_hf_client_sco_datapath_active() is the dispatch predicate used by
++ * stack/btm/btm_sco_hci.cc. It must NOT be inferred from a zero return of
++ * bta_hf_client_sco_read(): zero also means "no data right now".  */
++bool bta_hf_client_sco_datapath_active();
++/* True when an HF-role SCO link is up; fills `addr` with that peer.  The AIDL HFP
++ * transport needs this because its AG counterpart (bta_ag_get_active_device) is
++ * empty in the HF role -- the HF role has no active-device concept at all, so
++ * without an HF-specific probe HfpTransport::StartRequest() always fails and the
++ * far-end PCM is dropped.  See hfp_client_interface_aidl.cc. */
++bool bta_hf_client_sco_get_active_device(RawAddress* addr);
++void bta_hf_client_init_hfp_client_interface();
++void bta_hf_client_release_hfp_client_interface();
++size_t bta_hf_client_sco_read(uint8_t* p_buf, uint32_t len);
++size_t bta_hf_client_sco_write(const uint8_t* p_buf, uint32_t len);
+ void bta_hf_client_cback_sco(tBTA_HF_CLIENT_CB* client_cb, uint8_t event);
+ 
+ /* AT command functions */
+diff --git a/system/bta/hf_client/bta_hf_client_main.cc b/system/bta/hf_client/bta_hf_client_main.cc
+index 4a19682..532952b 100644
+--- a/system/bta/hf_client/bta_hf_client_main.cc
++++ b/system/bta/hf_client/bta_hf_client_main.cc
+@@ -419,6 +419,13 @@ tBTA_STATUS bta_hf_client_api_enable(tBTA_HF_CLIENT_CBACK* p_cback, tBTA_HF_CLIE
+   /* set same setting as AG does */
+   get_btm_client_interface().sco.BTM_WriteVoiceSettings(AG_VOICE_SETTINGS);
+ 
++  /* Acquire the HFP software SCO endpoints, mirroring where AG does it
++   * (bta_ag_init_hfp_client_interface(), called from bta_ag_api_enable()). This is
++   * a no-op unless BOTH bluetooth.sco.managed_by_audio and
++   * bluetooth.hfp.software_datapath.enabled are set -- see the comment block at the
++   * top of bta_hf_client_sco.cc. */
++  bta_hf_client_init_hfp_client_interface();
++
+   bta_sys_collision_register(BTA_ID_HS, bta_hf_client_collision_cback);
+ 
+   /* Set the Audio service class bit */
+@@ -642,6 +649,11 @@ void bta_hf_client_api_disable() {
+     }
+   }
+ 
++  /* Release the HFP software SCO endpoints before deregistering, so the singleton
++   * goes back to the pool for the AG role (or a later HF enable) to take. Mirrors
++   * bta_ag_release_hfp_client_interface() in bta_ag_api_disable(). */
++  bta_hf_client_release_hfp_client_interface();
++
+   /* De-register with BTA system manager */
+   bta_sys_deregister(BTA_ID_HS);
+ }
+diff --git a/system/bta/hf_client/bta_hf_client_sco.cc b/system/bta/hf_client/bta_hf_client_sco.cc
+index 8ae7f0b..bc4b680 100644
+--- a/system/bta/hf_client/bta_hf_client_sco.cc
++++ b/system/bta/hf_client/bta_hf_client_sco.cc
+@@ -23,16 +23,20 @@
+ #include <cstdint>
+ #include <cstring>
+ 
++#include "audio_hal_interface/hfp_client_interface.h"
+ #include "bta/hf_client/bta_hf_client_int.h"
+ #include "bta_hf_client_api.h"
+ #include "bta_sys.h"
+ #include "device/include/esco_parameters.h"
+ #include "osi/include/allocator.h"
++#include "osi/include/properties.h"
++#include "stack/btm/btm_sco_hfp_hal.h"
+ #include "stack/include/bt_hdr.h"
+ #include "stack/include/btm_api_types.h"
+ #include "stack/include/btm_client_interface.h"
+ #include "stack/include/btm_status.h"
+ #include "stack/include/hci_error_code.h"
++#include "stack/include/main_thread.h"
+ 
+ #define BTA_HF_CLIENT_NO_EDR_ESCO                                                               \
+   (ESCO_PKT_TYPES_MASK_NO_2_EV3 | ESCO_PKT_TYPES_MASK_NO_3_EV3 | ESCO_PKT_TYPES_MASK_NO_2_EV5 | \
+@@ -40,6 +44,183 @@
+ 
+ using namespace bluetooth;
+ 
++/* ---------------------------------------------------------------------------
++ * HFP software (in-band / over-HCI) SCO data path for the HF CLIENT role.
++ *
++ * WHY THIS EXISTS
++ * AOSP implements the software data path for the AG role only. bta/ag/bta_ag_sco.cc
++ * owns the HfpClientInterface endpoints, and stack/btm/btm_sco_hci.cc calls
++ * bta_ag_sco_read/write unconditionally. AAOS runs the HF role and not the AG --
++ * measured on the built image rather than taken from a parent makefile:
++ * bluetooth.profile.hfp.hf.enabled=true is in system/build.prop (from
++ * car_product/properties/bluetooth.prop:41 via car_system.mk's TARGET_SYSTEM_PROP),
++ * while bluetooth.profile.hfp.ag.enabled is UNSET and HeadsetService.java:290 reads
++ * it as BluetoothProperties.isProfileHfpAgEnabled().orElse(false), so AG is off by
++ * default. This product does NOT inherit
++ * device/google_car/common/post_google_car.mk, which is where an explicit
++ * hfp.ag.enabled=false would otherwise come from.
++ * So on this product the SCO PCM has nowhere to go: HeadsetClientStateMachine.java even says
++ * "Bluetooth SCO connection from the HF role is not entirely supported for routing
++ * and volume purposes". This block mirrors the AG implementation for HF.
++ *
++ * HOW IT IS GATED -- and why not the same way as AG
++ * AG gates on bta_ag_is_sco_managed_by_audio(), a bool pushed down from Java
++ * (HeadsetService -> BTA_AgSetScoManagedByAudio -> bta_ag_api.cc). There is no HF
++ * equivalent of that plumbing, so instead the two underlying sysprops are read
++ * directly here:
++ *
++ *   bluetooth.sco.managed_by_audio            -- the vendor overlay switch that
++ *       AudioDeviceBroker.java itself ANDs with the android.media.audio
++ *       sco_managed_by_audio aconfig flag (AudioDeviceBroker.java:225-226). Both
++ *       aconfig flags involved (sco_managed_by_audio, amsco_available_api) are
++ *       ENABLED in trunk_staging, so this property is the only remaining switch.
++ *   bluetooth.hfp.software_datapath.enabled   -- the same property AG reads to pick
++ *       software over offload.
++ *
++ * BOTH default false, so with neither set the behaviour of this file is unchanged
++ * byte for byte, and bta_hf_client_sco_datapath_active() returns false.
++ *
++ * SESSION LIFETIME differs from AG on purpose. AG starts the session when the
++ * active device is set and stops it when cleared (bta_ag_api_set_active_device()).
++ * The HF role has NO active-device concept at all (zero hits for active_device in
++ * bta/hf_client/), so the session is bound to SCO connection open/close instead.
++ * StartSession() is self-contained -- it builds a default PCM config and needs
++ * neither a peer address nor codec state -- so hanging it off conn_open is safe.
++ *
++ * LAYERING CAVEAT: ::hfp::pcm_config and the HfpClientInterface header live under
++ * bta/include/bta_ag_api.h and bta/ag/bta_ag_int.h, i.e. the HF role here takes a
++ * dependency on AG headers. That is not upstreamable as-is; it is carried as a
++ * fork. Measured on the board 2026-08-27.
++ * ------------------------------------------------------------------------- */
++using HfpInterface = bluetooth::audio::hfp::HfpClientInterface;
++
++static bool hfp_software_datapath_enabled = false;
++static HfpInterface* hfp_client_interface = nullptr;
++static HfpInterface::Encode* hfp_encode_interface = nullptr;
++static HfpInterface::Decode* hfp_decode_interface = nullptr;
++
++/* Mirrors codec_uuid_to_sample_rate() in bta/ag/bta_ag_sco.cc, but keyed on the
++ * HF role's own codec constants (BTM_SCO_CODEC_*, stack/include/btm_api_types.h)
++ * rather than the AG's tBTA_AG_UUID_CODEC enum. Same three rates. */
++static int bta_hf_client_codec_to_sample_rate(tBTM_SCO_CODEC_TYPE codec) {
++  switch (codec) {
++    case BTM_SCO_CODEC_LC3:
++      return 32000;
++    case BTM_SCO_CODEC_MSBC:
++      return 16000;
++    case BTM_SCO_CODEC_CVSD:
++    default:
++      return 8000;
++  }
++}
++
++bool bta_hf_client_sco_datapath_active() {
++  return hfp_software_datapath_enabled && hfp_encode_interface != nullptr &&
++         hfp_decode_interface != nullptr;
++}
++
++bool bta_hf_client_sco_get_active_device(RawAddress* addr) {
++  /* Same iteration idiom as bta_hf_client_find_cb_by_bda()
++   * (bta_hf_client_main.cc:488-496): walk the fixed control-block array and skip
++   * the blocks that are not allocated.  Only BTA_HF_CLIENT_SCO_OPEN_ST counts --
++   * OPENING is not enough, because the AIDL transport activates the stream on the
++   * strength of this answer and a not-yet-open link would start feeding a queue
++   * that has no SCO behind it. */
++  if (addr == nullptr) {
++    return false;
++  }
++  for (int i = 0; i < HF_CLIENT_MAX_DEVICES; i++) {
++    const tBTA_HF_CLIENT_CB* client_cb = &bta_hf_client_cb_arr.cb[i];
++    if (client_cb->is_allocated && client_cb->sco_state == BTA_HF_CLIENT_SCO_OPEN_ST) {
++      *addr = client_cb->peer_addr;
++      return true;
++    }
++  }
++  return false;
++}
++
++void bta_hf_client_init_hfp_client_interface() {
++  /* Read both switches, not just one. bluetooth.sco.managed_by_audio is what makes
++   * the audio framework -- not the Bluetooth stack -- own SCO activation and
++   * routing; without it AudioService keeps doing legacy setParameters("hfp_enable")
++   * and the HAL sessions started below would have no consumer. */
++  const bool sco_managed_by_audio =
++          osi_property_get_bool("bluetooth.sco.managed_by_audio", false);
++  const bool software_datapath =
++          osi_property_get_bool("bluetooth.hfp.software_datapath.enabled", false);
++
++  log::info("sco_managed_by_audio={} software_datapath={}", sco_managed_by_audio,
++            software_datapath);
++
++  if (!sco_managed_by_audio || !software_datapath) {
++    hfp_software_datapath_enabled = false;
++    return;
++  }
++
++  if (!hfp_client_interface) {
++    hfp_client_interface = HfpInterface::Get();
++  }
++  if (!hfp_client_interface) {
++    log::error("could not acquire the HFP audio client interface");
++    return;
++  }
++
++  /* GetEncode/GetDecode mean "hand it over if nobody holds it yet" -- the interface
++   * is a singleton shared with the AG role. On this product AG is disabled so there
++   * is no contention, but if AG ever grabs them first this must fail loudly rather
++   * than silently run with a half-open data path. */
++  if (!hfp_encode_interface && !hfp_decode_interface) {
++    hfp_encode_interface = hfp_client_interface->GetEncode(get_main_thread());
++    if (!hfp_encode_interface) {
++      log::error("could not get the HFP SW encoding interface (already held by AG?)");
++      return;
++    }
++    hfp_decode_interface = hfp_client_interface->GetDecode(get_main_thread());
++    if (!hfp_decode_interface) {
++      log::error("could not get the HFP SW decoding interface (already held by AG?)");
++      hfp_client_interface->ReleaseEncode(hfp_encode_interface);
++      hfp_encode_interface = nullptr;
++      return;
++    }
++  }
++
++  hfp_software_datapath_enabled = true;
++  log::info("HF role software SCO data path is active");
++}
++
++void bta_hf_client_release_hfp_client_interface() {
++  hfp_software_datapath_enabled = false;
++  if (!hfp_client_interface) {
++    return;
++  }
++  if (hfp_encode_interface) {
++    hfp_client_interface->ReleaseEncode(hfp_encode_interface);
++    hfp_encode_interface = nullptr;
++  }
++  if (hfp_decode_interface) {
++    hfp_client_interface->ReleaseDecode(hfp_decode_interface);
++    hfp_decode_interface = nullptr;
++  }
++  hfp_client_interface = nullptr;
++}
++
++/* Counterparts of bta_ag_sco_read/write (bta/ag/bta_ag_sco.cc). Called from
++ * stack/btm/btm_sco_hci.cc, which dispatches on
++ * bta_hf_client_sco_datapath_active(). */
++size_t bta_hf_client_sco_read(uint8_t* p_buf, uint32_t len) {
++  if (hfp_software_datapath_enabled && hfp_encode_interface) {
++    return hfp_encode_interface->Read(p_buf, len);
++  }
++  return 0;
++}
++
++size_t bta_hf_client_sco_write(const uint8_t* p_buf, uint32_t len) {
++  if (hfp_software_datapath_enabled && hfp_decode_interface) {
++    return hfp_decode_interface->Write(p_buf, len);
++  }
++  return 0;
++}
++
+ enum {
+   BTA_HF_CLIENT_SCO_LISTEN_E,
+   BTA_HF_CLIENT_SCO_OPEN_E,       /* open request */
+@@ -116,22 +297,46 @@ static void bta_hf_client_sco_conn_rsp(tBTA_HF_CLIENT_CB* client_cb,
+ 
+   log::verbose("");
+ 
++  /*
++   * Data path: offload (SCO over the controller's PCM/I2S pins) or in-band
++   * (SCO over HCI). esco_parameters_for_codec()'s second argument picks it --
++   * true keeps default_esco_parameters[]' ESCO_DATA_PATH_PCM, false rewrites both
++   * paths to ESCO_DATA_PATH_HCI (device/src/esco_parameters.cc:361-400, :396).
++   *
++   * Upstream passes a hardcoded `true` at these call sites, which makes the HF
++   * role offload-only: unlike bta/ag/bta_ag_sco.cc:493, which passes
++   * hfp_hal_interface::get_offload_enabled(), nothing here can ask for the HCI
++   * path. That is fine on a phone wired to a codec, and impossible in a guest
++   * that has no PCM/I2S at all -- our case, where the controller reaches the SoC
++   * only over a UART. See also HeadsetClientStateMachine.java, which notes that
++   * "Bluetooth SCO connection from the HF role is not entirely supported".
++   *
++   * get_offload_enabled() is !bluetooth.hfp.software_datapath.enabled
++   * (stack/btm/btm_sco_hfp_hal.cc:41-44), so with the property unset this is
++   * exactly upstream's `true` and behaviour is unchanged. Setting the property
++   * to true selects SCO over HCI; the in-band read/write path
++   * (stack/btm/btm_sco_hci.cc) and the HFP session in audio_bluetooth_hw
++   * (device_port_proxy.cc), both changed by this patch, carry the PCM from
++   * there.
++   */
++  const bool offload = hfp_hal_interface::get_offload_enabled();
++
+   if (client_cb->sco_state == BTA_HF_CLIENT_SCO_LISTEN_ST) {
+     if (p_data->link_type == BTM_LINK_TYPE_SCO) {
+       // SCO
+-      resp = esco_parameters_for_codec(SCO_CODEC_CVSD_D1, true);
++      resp = esco_parameters_for_codec(SCO_CODEC_CVSD_D1, offload);
+     } else if (client_cb->negotiated_codec == BTM_SCO_CODEC_LC3) {
+       // eSCO LC3, HFP 1.9
+-      resp = esco_parameters_for_codec(ESCO_CODEC_LC3_T2, true);
++      resp = esco_parameters_for_codec(ESCO_CODEC_LC3_T2, offload);
+     } else if (client_cb->negotiated_codec == BTM_SCO_CODEC_MSBC) {
+       // eSCO mSBC
+-      resp = esco_parameters_for_codec(ESCO_CODEC_MSBC_T2, true);
++      resp = esco_parameters_for_codec(ESCO_CODEC_MSBC_T2, offload);
+     } else if (bta_hf_client_cb_arr.features & BTA_HF_CLIENT_FEAT_ESCO_S4) {
+       // eSCO CVSD, HFP 1.7 requires S4
+-      resp = esco_parameters_for_codec(ESCO_CODEC_CVSD_S4, true);
++      resp = esco_parameters_for_codec(ESCO_CODEC_CVSD_S4, offload);
+     } else {
+       // eSCO CVSD, S3 is preferred by default(before HFP 1.7)
+-      resp = esco_parameters_for_codec(ESCO_CODEC_CVSD_S3, true);
++      resp = esco_parameters_for_codec(ESCO_CODEC_CVSD_S3, offload);
+     }
+ 
+     /* tell sys to stop av if any */
+@@ -248,13 +453,16 @@ static void bta_hf_client_sco_create(tBTA_HF_CLIENT_CB* client_cb, bool is_orig)
+   // Since HF device is not expected to receive AT+BAC send +BCS command,
+   // codec support of the connected AG device will be unknown,
+   // so HF device will always establish only CVSD connection.
++  // See bta_hf_client_sco_conn_rsp() for why this is a property and not a
++  // hardcoded `true`. Unset property == offload == upstream's behaviour.
++  const bool offload = hfp_hal_interface::get_offload_enabled();
+   if ((bta_hf_client_cb_arr.features & BTA_HF_CLIENT_FEAT_ESCO_S4) &&
+       (client_cb->peer_features & BTA_HF_CLIENT_PEER_ESCO_S4)) {
+     // eSCO CVSD, HFP 1.7 requires S4
+-    params = esco_parameters_for_codec(ESCO_CODEC_CVSD_S4, true);
++    params = esco_parameters_for_codec(ESCO_CODEC_CVSD_S4, offload);
+   } else {
+     // eSCO CVSD, S3 is preferred by default(before HFP 1.7)
+-    params = esco_parameters_for_codec(ESCO_CODEC_CVSD_S3, true);
++    params = esco_parameters_for_codec(ESCO_CODEC_CVSD_S3, offload);
+   }
+ 
+   /* if initiating set current scb and peer bd addr */
+@@ -571,6 +779,40 @@ void bta_hf_client_sco_conn_open(tBTA_HF_CLIENT_DATA* p_data) {
+ 
+   bta_sys_sco_open(BTA_ID_HS, 1, client_cb->peer_addr);
+ 
++  /* Start the software SCO session BEFORE the app callback below, mirroring the
++   * ordering bta_ag_sco_conn_open() uses ("ConfirmStreamingRequest before sends
++   * callback to java layer"): the Java layer reacts to AUDIO_*_OPEN_EVT by
++   * requesting audio focus, and the HAL session has to exist by then.
++   *
++   * Unlike AG this is where the session STARTS, not just where the config is
++   * pushed -- the HF role has no active-device transition to hang it off. */
++  if (bta_hf_client_sco_datapath_active()) {
++    const int sample_rate = bta_hf_client_codec_to_sample_rate(client_cb->negotiated_codec);
++    hfp::pcm_config config{.sample_rate_hz = sample_rate};
++    log::info("starting HF software SCO session, codec=0x{:04x} sample_rate={}",
++              client_cb->negotiated_codec, sample_rate);
++    /* ORDER IS LOAD-BEARING, and it is the opposite of what reads naturally.
++     * StartSession() does NOT keep whatever config was pushed before it: it pushes
++     * get_default_pcm_configuration() itself, which is hard-coded to 8000 Hz
++     * (audio_hal_interface/hfp_client_interface.cc:60-68, used at :149-150 of
++     * Decode::StartSession and the Encode equivalent).  So a config pushed first is
++     * simply discarded, and an mSBC (16 kHz) or LC3 (32 kHz) call would run the HAL
++     * session at 8 kHz.
++     * The AG role gets this right only because its two calls live in different
++     * callbacks and happen to run in this order: StartSession() from
++     * bta_ag_api_set_active_device (bta/ag/bta_ag_sco.cc:1757-1758, at connection
++     * time) and UpdateAudioConfigToHal() from bta_ag_sco_conn_open (:1506-1507, when
++     * SCO comes up with the negotiated codec).  The HF role has no active-device
++     * transition to hang the session start off, so both happen here and the order has
++     * to be spelled out.  Measured on the board. */
++    hfp_encode_interface->StartSession();
++    hfp_decode_interface->StartSession();
++    hfp_encode_interface->UpdateAudioConfigToHal(config);
++    hfp_decode_interface->UpdateAudioConfigToHal(config);
++    hfp_encode_interface->ConfirmStreamingRequest();
++    hfp_decode_interface->ConfirmStreamingRequest();
++  }
++
+   if (client_cb->negotiated_codec == BTM_SCO_CODEC_LC3) {
+     bta_hf_client_cback_sco(client_cb, BTA_HF_CLIENT_AUDIO_LC3_OPEN_EVT);
+   } else if (client_cb->negotiated_codec == BTM_SCO_CODEC_MSBC) {
+@@ -608,6 +850,17 @@ void bta_hf_client_sco_conn_close(tBTA_HF_CLIENT_DATA* p_data) {
+ 
+   bta_sys_sco_unuse(BTA_ID_HS, 1, client_cb->peer_addr);
+ 
++  /* Stop the software SCO session. The endpoints are NOT released here -- they are
++   * held for the lifetime of the HF service (see
++   * bta_hf_client_release_hfp_client_interface(), called from
++   * bta_hf_client_api_disable()) so that a second call reuses them instead of
++   * racing the AG role for the singleton. */
++  if (bta_hf_client_sco_datapath_active()) {
++    log::info("stopping HF software SCO session");
++    hfp_encode_interface->StopSession();
++    hfp_decode_interface->StopSession();
++  }
++
+   /* call app callback */
+   bta_hf_client_cback_sco(client_cb, BTA_HF_CLIENT_AUDIO_CLOSE_EVT);
+ 
+diff --git a/system/stack/btm/btm_sco_hci.cc b/system/stack/btm/btm_sco_hci.cc
+index a09fc1d..afe8fec 100644
+--- a/system/stack/btm/btm_sco_hci.cc
++++ b/system/stack/btm/btm_sco_hci.cc
+@@ -25,6 +25,7 @@
+ #include <cfloat>
+ 
+ #include "bta/ag/bta_ag_int.h"
++#include "bta/hf_client/bta_hf_client_int.h"
+ #include "btif/include/core_callbacks.h"
+ #include "btif/include/stack_manager_t.h"
+ #include "osi/include/allocator.h"
+@@ -147,9 +148,33 @@ size_t write(const uint8_t* p_buf, uint32_t len) {
+ void open() {}
+ void cleanup() {}
+ 
+-size_t read(uint8_t* p_buf, uint32_t len) { return bta_ag_sco_read(p_buf, len); }
++/* Route the in-band SCO PCM to whichever role owns the software data path.
++ *
++ * Upstream calls the AG unconditionally, so the HF role has no in-band path at
++ * all. The choice is made by an explicit predicate rather than by
++ * "call AG and fall through if it returns 0": bta_ag_sco_read() returns 0 both when
++ * the AG data path is disabled AND when there is simply no data yet, so a
++ * fall-through would silently interleave the two roles.
++ *
++ * When the HF path is inactive -- which is the default, since it needs both
++ * bluetooth.sco.managed_by_audio and bluetooth.hfp.software_datapath.enabled --
++ * these functions behave exactly as upstream. The AG role is off on this
++ * product -- bluetooth.profile.hfp.ag.enabled is unset and
++ * HeadsetService.java:290 defaults it to false -- so the two never contend
++ * here. */
++size_t read(uint8_t* p_buf, uint32_t len) {
++  if (bta_hf_client_sco_datapath_active()) {
++    return bta_hf_client_sco_read(p_buf, len);
++  }
++  return bta_ag_sco_read(p_buf, len);
++}
+ 
+-size_t write(const uint8_t* p_buf, uint32_t len) { return bta_ag_sco_write(p_buf, len); }
++size_t write(const uint8_t* p_buf, uint32_t len) {
++  if (bta_hf_client_sco_datapath_active()) {
++    return bta_hf_client_sco_write(p_buf, len);
++  }
++  return bta_ag_sco_write(p_buf, len);
++}
+ #endif
+ 
+ enum decode_buf_state {

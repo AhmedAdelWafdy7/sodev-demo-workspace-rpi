@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     SPDX-License-Identifier: Apache-2.0
+
+     Static overlay on framework-res: name the dialer this product actually ships.
+
+     AOSP leaves config_defaultDialer at com.android.dialer, a package no automotive
+     build installs, and PermissionController resolves the android.app.role.DIALER
+     default holder from this string. The role therefore ends up with no holder,
+     Telecom binds no InCallService, and an incoming HFP call rings inside Telecom
+     while the screen stays dark and silent. car_product ships no overlay for it.
+
+     Measured, diagnosed and fixed on the RPi5 board 2026-09-21. Full evidence,
+     including the Telecom log lines and the runtime experiment that confirmed it, is
+     in device/agl/common/DEFAULT-DIALER.md.
+
+     This file is board independent, so it lives in device/agl/common/overlay, which
+     the Raspberry Pi 5 product names; the Raspberry Pi 4 device carries the same value
+     in its own overlay.
+
+     Keep this comment free of double hyphens: XML forbids them inside a comment and
+     aapt2 rejects the file with "xml parser error: not well-formed (invalid token)"
+     at line 0, which names no useful location. That is why the evidence lives in the
+     Markdown file beside this directory rather than here.
+-->
+<resources>
+    <string name="config_defaultDialer" translatable="false">com.android.car.dialer</string>
+</resources>
