@@ -65,3 +65,19 @@ SRC_URI += "file://0001-impeller-trim-thread-local-pool-caches-in-RenderToTarget
 # follow one MSAA policy; --gpu=gl, which leaves this layer out, keeps
 # meta-flutter's 4x.
 SRC_URI += "file://0002-impeller-do-not-request-4x-MSAA-for-the-onscreen-swapchain.patch"
+
+# Skip unsupported JDK and Fuchsia downloads on ARM64 hosts.
+python () {
+    import ast
+
+    if d.getVar("BUILD_ARCH") != "aarch64":
+        return
+
+    custom_vars = ast.literal_eval(d.getVar("GN_CUSTOM_VARS") or "{}")
+    custom_vars["download_fuchsia_deps"] = False
+    d.setVar("GN_CUSTOM_VARS", repr(custom_vars))
+
+    custom_deps = ast.literal_eval(d.getVar("GN_CUSTOM_DEPS") or "{}")
+    custom_deps["engine/src/flutter/third_party/java/openjdk"] = None
+    d.setVar("GN_CUSTOM_DEPS", repr(custom_deps))
+}
